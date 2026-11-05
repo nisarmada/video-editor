@@ -46,7 +46,7 @@ scripts/    pipeline code
 - Print clear progress messages and readable errors.
 
 ## Current milestone
-Milestone 1: done (probe, cut, join). Next: Milestone 2 — transcripts with faster-whisper.
+Milestone 2: transcripts with faster-whisper (`scripts/transcribe.py`). Next: caching, batch mode, language flag.
 
 ## Later ideas (don't build yet)
 Style profile from reference creators, beat-synced cuts, music, captions
