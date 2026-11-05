@@ -5,7 +5,9 @@ Shared FFmpeg helpers: probe metadata, cut, join, and render timeline plans.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 TARGET_W, TARGET_H, FPS = 1080, 1920, 30
@@ -242,6 +244,140 @@ def build_timeline_filter_graph(
     parts.append(f"{''.join(vlabels)}concat=n={n}:v=1:a=0[vout]")
     parts.append(f"{''.join(alabels)}concat=n={n}:v=0:a=1[aout]")
     return ";".join(parts), ffmpeg_inputs
+
+
+def _ffmpeg_supports_filter(name: str) -> bool:
+    result = subprocess.run(
+        ["ffmpeg", "-filters"],
+        capture_output=True,
+        text=True,
+    )
+    return name in result.stdout
+
+
+def burn_captions(
+    input_video: Path,
+    output_path: Path,
+    caption_events: list[dict],
+    ass_path: Path | None = None,
+) -> None:
+    """
+    Burn captions onto video. Uses libass subtitles when available, else PNG overlays.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if ass_path and ass_path.is_file() and _ffmpeg_supports_filter("subtitles"):
+        tmp = Path(tempfile.mkstemp(suffix=".ass")[1])
+        try:
+            shutil.copy2(ass_path, tmp)
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(input_video),
+                "-vf",
+                f"subtitles={tmp}",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-c:a",
+                "copy",
+                str(output_path),
+            ]
+            run_ffmpeg(cmd)
+            return
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    _burn_captions_png_overlay(input_video, output_path, caption_events)
+
+
+def _burn_captions_png_overlay(
+    input_video: Path,
+    output_path: Path,
+    events: list[dict],
+) -> None:
+    """Fallback when ffmpeg lacks libass/drawtext (common on minimal Homebrew builds)."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    from captions import FONT_SIZE, HIGHLIGHT_COLOUR, MARGIN_V, PLAY_RES_X, PLAY_RES_Y, PRIMARY_COLOUR  # noqa: WPS433
+
+    if not events:
+        shutil.copy2(input_video, output_path)
+        return
+
+    font_path = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
+    font = ImageFont.truetype(font_path, FONT_SIZE)
+
+    def ass_bgr_to_rgb(ass_hex: str) -> tuple[int, int, int]:
+        hex_clean = ass_hex.replace("&H", "").replace("&", "")[:6]
+        b = int(hex_clean[0:2], 16)
+        g = int(hex_clean[2:4], 16)
+        r = int(hex_clean[4:6], 16)
+        return (r, g, b)
+
+    primary = ass_bgr_to_rgb(PRIMARY_COLOUR)
+    highlight = ass_bgr_to_rgb(HIGHLIGHT_COLOUR)
+
+    tmp_dir = Path(tempfile.mkdtemp())
+    png_paths: list[Path] = []
+    try:
+        for i, event in enumerate(events):
+            img = Image.new("RGBA", (PLAY_RES_X, PLAY_RES_Y), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(img)
+            chunk = event["chunk"]
+            active = event["active"]
+            pieces = [(w["word"], w is active) for w in chunk]
+            total_w = sum(
+                draw.textlength(word + " ", font=font) for word, _ in pieces
+            )
+            x = (PLAY_RES_X - total_w) / 2
+            y = PLAY_RES_Y - MARGIN_V
+            for word, is_active in pieces:
+                color = highlight if is_active else primary
+                draw.text((x, y), word + " ", font=font, fill=(*color, 255))
+                x += draw.textlength(word + " ", font=font)
+            png = tmp_dir / f"cap_{i:04d}.png"
+            img.save(png)
+            png_paths.append(png)
+
+        video_duration = clip_metadata(input_video)[0]
+        cmd = ["ffmpeg", "-y", "-i", str(input_video)]
+        for png in png_paths:
+            cmd.extend(
+                ["-loop", "1", "-t", f"{video_duration:.3f}", "-i", str(png)]
+            )
+        parts: list[str] = []
+        last = "[0:v]"
+        for i, event in enumerate(events):
+            out = f"[v{i + 1}]"
+            t0 = event["start"]
+            t1 = event["end"]
+            parts.append(
+                f"{last}[{i + 1}:v]overlay=0:0:enable='between(t,{t0:.3f},{t1:.3f})'{out}"
+            )
+            last = out
+        filter_complex = ";".join(parts)
+        cmd.extend(
+            [
+                "-filter_complex",
+                filter_complex,
+                "-map",
+                last,
+                "-map",
+                "0:a?",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-c:a",
+                "copy",
+                str(output_path),
+            ]
+        )
+        run_ffmpeg(cmd)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def render_timeline(segments: list[tuple[Path, float, float]], output_path: Path) -> None:
