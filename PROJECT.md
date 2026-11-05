@@ -33,7 +33,7 @@ editing style.
 
 Convert: `python scripts/convert_v1_to_v2.py plans/old.json plans/new_v2.json`
 
-The AI planner still outputs v1 today; validate and render accept both.
+`plan.py` asks Claude for v1 segments, validates, then saves schema v2 (`created_by: ai`, one `group_id` per run). Validate and render accept both v1 and v2 files.
 
 ## Folder structure
 footage/    original clips (NEVER modify or delete)

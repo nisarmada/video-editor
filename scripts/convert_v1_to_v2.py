@@ -21,7 +21,19 @@ def segment_duration(seg: dict) -> float:
     return float(seg["end"]) - float(seg["start"])
 
 
-def convert(data: dict | list) -> dict:
+def convert(
+    data: dict | list,
+    *,
+    created_by: str | None = None,
+    group_id: str | None = None,
+) -> dict:
+    """
+    Build a v2 timeline from v1 segments.
+
+    If created_by is set, every clip uses it (otherwise ai when segment has
+    reason, else user). If group_id is set, every clip gets that group unless
+    the segment already has group_id.
+    """
     segments = v1_segments_from_data(data)
     meta = data if isinstance(data, dict) else {}
 
@@ -31,8 +43,11 @@ def convert(data: dict | list) -> dict:
 
     for seg in segments:
         dur = segment_duration(seg)
-        created = "ai" if seg.get("reason") else "user"
-        group = seg.get("group_id")
+        if created_by is not None:
+            created = created_by
+        else:
+            created = "ai" if seg.get("reason") else "user"
+        group = seg.get("group_id") if seg.get("group_id") else group_id
         clip_id = str(uuid.uuid4())
 
         video_clips.append(

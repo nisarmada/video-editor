@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sys
+import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -17,8 +18,10 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
+from convert_v1_to_v2 import convert as v1_to_v2  # noqa: E402
 from index_cache import load_json, merged_index_path  # noqa: E402
-from validate_plan import validate_segments  # noqa: E402
+from timeline_format import get_track, is_v2  # noqa: E402
+from validate_plan import validate_plan_data, validate_segments  # noqa: E402
 
 DEFAULT_MODEL = "claude-sonnet-4-5-20250514"
 # User-facing default name; override with ANTHROPIC_PLAN_MODEL (e.g. claude-sonnet-5-5)
@@ -212,7 +215,46 @@ def print_usage(usage: object, model: str) -> None:
     print(f"Tokens ({model}): input={inp} output={out}  (~${est:.4f} estimated)")
 
 
+def finalize_v2_plan(v1_plan: dict, brief: str, run_group_id: str) -> dict:
+    """Validate v1 segments from Claude, then convert to schema v2."""
+    v1_plan.setdefault("brief", brief)
+    target_hint = parse_target_seconds(brief)
+    if target_hint is not None:
+        v1_plan.setdefault("target_length_seconds", target_hint)
+
+    target = v1_plan.get("target_length_seconds")
+    target = float(target) if isinstance(target, (int, float)) else None
+
+    errors = validate_segments(v1_plan.get("segments") or [], target)
+    if errors:
+        raise ValueError(errors)
+
+    v2 = v1_to_v2(v1_plan, created_by="ai", group_id=run_group_id)
+    v2_errors = validate_plan_data(v2, target)
+    if v2_errors:
+        raise ValueError(v2_errors)
+    return v2
+
+
 def print_summary(plan: dict) -> None:
+    if is_v2(plan):
+        video = get_track(plan, "video") or {}
+        clips = sorted(
+            video.get("clips") or [],
+            key=lambda c: float(c["timeline_start"]),
+        )
+        total = sum(
+            float(c["source_out"]) - float(c["source_in"]) for c in clips
+        )
+        print(f"\nPlan summary: {len(clips)} clips, {total:.2f}s source span")
+        for i, clip in enumerate(clips):
+            reason = clip.get("caption") or "(no reason)"
+            src = Path(clip.get("source", "?")).name
+            start = clip.get("source_in")
+            end = clip.get("source_out")
+            print(f"  {i + 1}. {src} [{start}-{end}s] — {reason}")
+        return
+
     segments = plan.get("segments") or []
     total = sum(
         float(s["end"]) - float(s["start"])
@@ -279,6 +321,7 @@ def main() -> None:
         print(f"Error parsing plan JSON: {e}", file=sys.stderr)
         sys.exit(1)
 
+    run_group_id = str(uuid.uuid4())
     target = parse_target_seconds(args.brief) or plan.get("target_length_seconds")
     target = float(target) if isinstance(target, (int, float)) else None
 
@@ -313,13 +356,19 @@ def main() -> None:
             for err in errors:
                 print(f"  - {err}", file=sys.stderr)
             sys.exit(1)
-    plan.setdefault("brief", args.brief)
-    if parse_target_seconds(args.brief):
-        plan.setdefault("target_length_seconds", parse_target_seconds(args.brief))
+
+    try:
+        plan_v2 = finalize_v2_plan(plan, args.brief, run_group_id)
+    except ValueError as e:
+        errs = e.args[0] if e.args and isinstance(e.args[0], list) else [str(e)]
+        print("Plan failed v2 conversion/validation:", file=sys.stderr)
+        for err in errs:
+            print(f"  - {err}", file=sys.stderr)
+        sys.exit(1)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(plan, indent=2, ensure_ascii=False) + "\n")
-    print(f"Saved: {args.out}")
+    args.out.write_text(json.dumps(plan_v2, indent=2, ensure_ascii=False) + "\n")
+    print(f"Saved v2 plan: {args.out}  (group_id={run_group_id})")
 
     if total_usage["input_tokens"] or total_usage["output_tokens"]:
 
@@ -332,7 +381,7 @@ def main() -> None:
         print("\nTotal API usage this run:")
         print_usage(u, model_used)
 
-    print_summary(plan)
+    print_summary(plan_v2)
 
 
 if __name__ == "__main__":

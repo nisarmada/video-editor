@@ -93,6 +93,8 @@ python scripts/validate_plan.py plans/draft1.json --max-length 32
 python scripts/render.py plans/draft1.json output/draft1.mp4 --captions
 ```
 
+`plan.py` saves **schema v2** (Claude still returns v1 segments; conversion runs after validation). Hand-written v1 plans: `convert_v1_to_v2.py`.
+
 Set `ANTHROPIC_PLAN_MODEL` in `.env` (default `claude-sonnet-5-5`).
 
 ## Cursor as planner (manual test)
