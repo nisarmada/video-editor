@@ -76,7 +76,17 @@ python scripts/validate_plan.py plans/my_clip_tight.json --max-length 30
 
 `render.py` validates automatically before encoding.
 
-## Cursor as planner (before Milestone 5 API)
+## Milestone 5 — AI plan from brief
+
+```bash
+python scripts/plan.py --brief "30s reel, hook in first 2 seconds, casual vibe" --out plans/draft1.json
+python scripts/validate_plan.py plans/draft1.json --max-length 32
+python scripts/render.py plans/draft1.json output/draft1.mp4 --captions
+```
+
+Set `ANTHROPIC_PLAN_MODEL` in `.env` (default `claude-sonnet-5-5`).
+
+## Cursor as planner (manual test)
 
 1. Index a few clips with `index_clip.py`.
 2. Ask Cursor: read `index/*.json`, write `plans/manual_test.json` (same segment format as tighten plans).

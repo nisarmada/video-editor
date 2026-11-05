@@ -46,7 +46,7 @@ scripts/    pipeline code
 - Print clear progress messages and readable errors.
 
 ## Current milestone
-Milestone 4: done (indexing + Claude frame captions). Milestone 5: Claude timeline planning next.
+Milestone 5: Claude timeline planning (`scripts/plan.py`). Next: render + review loop.
 
 ## Later ideas (don't build yet)
 Style profile from reference creators, beat-synced cuts, music, captions

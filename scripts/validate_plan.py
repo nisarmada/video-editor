@@ -36,16 +36,11 @@ def resolve_source(raw: str) -> Path:
     return path
 
 
-def validate_plan(
-    plan_path: Path,
+def validate_segments(
+    segments: list[dict],
     max_length: float | None = None,
 ) -> list[str]:
     errors: list[str] = []
-    try:
-        segments = load_segments(plan_path)
-    except (json.JSONDecodeError, ValueError) as e:
-        return [str(e)]
-
     if not segments:
         errors.append("Plan has no segments.")
         return errors
@@ -97,6 +92,17 @@ def validate_plan(
         )
 
     return errors
+
+
+def validate_plan(
+    plan_path: Path,
+    max_length: float | None = None,
+) -> list[str]:
+    try:
+        segments = load_segments(plan_path)
+    except (json.JSONDecodeError, ValueError) as e:
+        return [str(e)]
+    return validate_segments(segments, max_length)
 
 
 def main() -> None:
