@@ -46,7 +46,7 @@ scripts/    pipeline code
 - Print clear progress messages and readable errors.
 
 ## Current milestone
-Milestone 4: indexing (shots, keyframes, merged index; AI frame captions optional). Milestone 5: Claude planning next.
+Milestone 4: done (indexing + Claude frame captions). Milestone 5: Claude timeline planning next.
 
 ## Later ideas (don't build yet)
 Style profile from reference creators, beat-synced cuts, music, captions

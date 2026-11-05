@@ -88,10 +88,12 @@ def main() -> None:
 
     save_json(out_path, payload)
     print(f"Wrote merged index: {out_path}")
+    cap_count = len(captions.get("frames", [])) if captions else 0
     print(
         f"  transcript segments: {len(transcript.get('segments', []))}  |  "
         f"shots: {len(payload['shots'])}  |  "
-        f"keyframes: {len(payload['keyframes'])}"
+        f"keyframes: {len(payload['keyframes'])}  |  "
+        f"AI frame captions: {cap_count}"
     )
 
 

@@ -3,3 +3,5 @@ av>=12.0.0,<13.0.0
 scenedetect>=0.6.4
 opencv-python-headless>=4.8.0
 Pillow>=10.0.0
+anthropic>=0.40.0
+python-dotenv>=1.0.0

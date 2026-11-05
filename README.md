@@ -48,7 +48,14 @@ python scripts/keyframes.py footage/my_clip.mp4
 python scripts/index_clip.py footage/my_clip.mp4
 ```
 
-Merged file: `index/my_clip.json` (AI `index/<clip>_captions.json` is optional).
+AI descriptions of keyframe images (requires `ANTHROPIC_API_KEY` in `.env`):
+
+```bash
+python scripts/caption_frames.py footage/my_clip.mp4
+python scripts/index_clip.py footage/my_clip.mp4 --force
+```
+
+Merged file: `index/my_clip.json` includes transcript, shots, keyframes, and frame captions when present.
 
 ## Captions on rendered edits
 
