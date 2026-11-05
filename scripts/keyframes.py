@@ -64,7 +64,7 @@ def main() -> None:
         return
 
     shots_doc = load_json(shots_path(video_path))
-    if not shots_doc or not shots_doc.get("shots"):
+    if not shots_doc:
         print(
             f"Error: run shots.py first (missing {shots_path(video_path)})",
             file=sys.stderr,
@@ -72,10 +72,16 @@ def main() -> None:
         sys.exit(1)
 
     duration = video_duration_seconds(video_path)
+    shots = shots_doc.get("shots") or []
+    if not shots:
+        # Static clip (no cuts detected): one keyframe at the middle
+        print("No shot cuts detected; using one keyframe at mid-clip.")
+        shots = [{"start": 0.0, "end": duration}]
+
     frame_dir = keyframes_dir(video_path)
     keyframes: list[dict] = []
 
-    for i, shot in enumerate(shots_doc["shots"]):
+    for i, shot in enumerate(shots):
         start = float(shot["start"])
         end = float(shot["end"])
         mid = min(max((start + end) / 2, 0.0), duration - 0.01)
