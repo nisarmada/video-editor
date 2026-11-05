@@ -1,0 +1,19 @@
+# AI Video Editor — agent rules
+
+Read PROJECT.md for goals, folder layout, pipeline stages, and the current milestone.
+
+## Who this is for
+- The user is a beginner programmer using Cursor.
+- Explain non-obvious code in short comments; prefer clear names over clever abstractions.
+
+## Hard rules
+- Never modify, delete, or overwrite files in `footage/` (originals are read-only).
+- Build only the **current milestone** in PROJECT.md; do not implement later pipeline stages unless asked.
+- Keep changes small and simple; one script per stage; files + JSON, no database or web framework.
+- Never hard-code API keys; use `.env` when APIs are needed.
+- Cache expensive work (transcripts, AI captions); do not redo it unnecessarily.
+- Print clear progress messages and readable errors.
+
+## Tech
+- Python 3.12+ in `.venv`; FFmpeg/ffprobe for video.
+- Test with short clips; outputs go in `output/`, analysis JSON in `index/`, timelines in `plans/`.

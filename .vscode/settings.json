@@ -1,0 +1,8 @@
+{
+  "explorer.excludeGitIgnore": false,
+  "workbench.editorAssociations": {
+    "*.mp4": "vscode.videoPreview",
+    "*.mov": "vscode.videoPreview",
+    "*.m4v": "vscode.videoPreview"
+  }
+}
