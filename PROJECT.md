@@ -46,7 +46,7 @@ scripts/    pipeline code
 - Print clear progress messages and readable errors.
 
 ## Current milestone
-Milestone 4: indexing (shot detection, keyframes, AI captions). Milestone 3 (auto tighten) is done.
+Milestone 4: indexing (shots, keyframes, merged index; AI frame captions optional). Milestone 5: Claude planning next.
 
 ## Later ideas (don't build yet)
 Style profile from reference creators, beat-synced cuts, music, captions
