@@ -325,6 +325,7 @@ def _burn_captions_png_overlay(
         for i, event in enumerate(events):
             img = Image.new("RGBA", (PLAY_RES_X, PLAY_RES_Y), (0, 0, 0, 0))
             draw = ImageDraw.Draw(img)
+            # chunk is already trimmed to spoken-so-far (see captions.visible_words)
             chunk = event["chunk"]
             active = event["active"]
             pieces = [(w["word"], w is active) for w in chunk]

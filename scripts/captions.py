@@ -30,12 +30,13 @@ WORDS_PER_LINE = 3
 
 
 def load_segments(plan_path: Path) -> list[dict]:
-    data = json.loads(plan_path.read_text())
-    if isinstance(data, dict) and "segments" in data:
-        return data["segments"]
-    if isinstance(data, list):
-        return data
-    raise ValueError("Plan must contain segments")
+    _SCRIPTS = Path(__file__).resolve().parent
+    if str(_SCRIPTS) not in sys.path:
+        sys.path.insert(0, str(_SCRIPTS))
+    from timeline_format import load_plan_file, v1_segments_from_data
+
+    data = load_plan_file(plan_path)
+    return v1_segments_from_data(data)
 
 
 def source_stem(source: str) -> str:
@@ -56,10 +57,17 @@ def words_for_clip(stem: str) -> list[dict]:
     return words
 
 
+def word_in_segment(ws: float, we: float, seg_start: float, seg_end: float) -> bool:
+    """True if any part of the word falls inside the kept segment."""
+    return ws < seg_end - 0.001 and we > seg_start + 0.001
+
+
 def remap_words(plan_segments: list[dict]) -> list[dict]:
     """Map transcript words onto the edited timeline."""
     remapped: list[dict] = []
     output_cursor = 0.0
+    # Avoid duplicate words when the plan reuses overlapping source ranges
+    seen_source_words: set[tuple[str, float, float]] = set()
 
     for seg in plan_segments:
         src = seg["source"]
@@ -71,18 +79,30 @@ def remap_words(plan_segments: list[dict]) -> list[dict]:
         for w in words_for_clip(stem):
             ws = float(w["start"])
             we = float(w["end"])
-            mid = (ws + we) / 2
-            if mid < seg_start or mid > seg_end:
+            if not word_in_segment(ws, we, seg_start, seg_end):
                 continue
+
+            dedupe_key = (stem, round(ws, 3), round(we, 3))
+            if dedupe_key in seen_source_words:
+                continue
+            seen_source_words.add(dedupe_key)
+
+            # Clip word times to this segment so cut-away audio never gets captions
+            clip_start = max(ws, seg_start)
+            clip_end = min(we, seg_end)
+            if clip_end - clip_start < 0.03:
+                continue
+
             remapped.append(
                 {
                     "word": w.get("word", "").strip(),
-                    "start": round(output_cursor + (ws - seg_start), 3),
-                    "end": round(output_cursor + (we - seg_start), 3),
+                    "start": round(output_cursor + (clip_start - seg_start), 3),
+                    "end": round(output_cursor + (clip_end - seg_start), 3),
                 }
             )
         output_cursor += seg_len
 
+    remapped.sort(key=lambda x: (x["start"], x["end"]))
     return remapped
 
 
@@ -104,6 +124,15 @@ def chunk_words(words: list[dict], size: int) -> list[list[dict]]:
     return chunks
 
 
+def visible_words(chunk: list[dict], active: dict) -> list[dict]:
+    """Words to draw while `active` is highlighted (no future words in the chunk)."""
+    try:
+        idx = chunk.index(active)
+    except ValueError:
+        return [active]
+    return chunk[: idx + 1]
+
+
 def caption_events(words: list[dict]) -> list[dict]:
     """Timed caption events for ASS or PNG overlay rendering."""
     events: list[dict] = []
@@ -117,7 +146,7 @@ def caption_events(words: list[dict]) -> list[dict]:
                 {
                     "start": t_start,
                     "end": t_end,
-                    "chunk": chunk,
+                    "chunk": visible_words(chunk, active),
                     "active": active,
                 }
             )

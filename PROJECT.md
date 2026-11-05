@@ -27,9 +27,13 @@ editing style.
 5. review: extract frames from the draft, Claude critiques, optional revision
 
 ## Timeline format (the central contract)
-A JSON list of clips: {source, start, end, caption, zoom, transition}
-plus global settings (resolution, music, target length).
-The AI only ever produces this JSON, never raw FFmpeg commands.
+**v1:** a JSON list (or object with `segments`): `{source, start, end, caption?, zoom?, ...}` — concatenated in order.
+
+**v2 (editor):** multi-track `{schema_version: 2, tracks: [{type: video|audio|caption, clips: [...]}]}` — see `docs/timeline_v2.md`.
+
+Convert: `python scripts/convert_v1_to_v2.py plans/old.json plans/new_v2.json`
+
+The AI planner still outputs v1 today; validate and render accept both.
 
 ## Folder structure
 footage/    original clips (NEVER modify or delete)

@@ -68,6 +68,15 @@ python scripts/render.py plans/my_clip_tight.json output/my_clip_tight.mp4 --cap
 
 Edit look-and-feel in constants at the top of `scripts/captions.py`.
 
+## Timeline v2 (CapCut-style, no UI yet)
+
+See `docs/timeline_v2.md`. Convert v1 → v2:
+
+```bash
+python scripts/convert_v1_to_v2.py plans/draft1.json plans/draft1_v2.json
+python scripts/render.py plans/draft1_v2.json output/draft1_v2.mp4
+```
+
 ## Plan validation
 
 ```bash

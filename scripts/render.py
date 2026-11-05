@@ -5,7 +5,6 @@ Usage: python scripts/render.py plans/<name>.json output/<name>.mp4 [--captions 
 """
 
 import argparse
-import json
 import sys
 import tempfile
 from pathlib import Path
@@ -16,6 +15,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 from captions import build_ass, caption_events, load_segments, remap_words  # noqa: E402
 from media import burn_captions, render_timeline  # noqa: E402
+from timeline_format import is_v2, load_plan_file, v1_segments_from_data  # noqa: E402
 from validate_plan import validate_plan  # noqa: E402
 
 
@@ -39,12 +39,8 @@ def parse_segments(segments_raw: list[dict]) -> list[tuple[Path, float, float]]:
 
 
 def load_timeline(plan_path: Path) -> list[dict]:
-    data = json.loads(plan_path.read_text())
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict) and "segments" in data:
-        return data["segments"]
-    raise ValueError("Plan JSON must be a list or an object with 'segments'")
+    data = load_plan_file(plan_path)
+    return v1_segments_from_data(data)
 
 
 def main() -> None:
@@ -80,15 +76,19 @@ def main() -> None:
             print(f"  - {err}", file=sys.stderr)
         sys.exit(1)
 
+    plan_data = load_plan_file(plan_path)
     try:
-        segments_raw = load_timeline(plan_path)
-    except (json.JSONDecodeError, ValueError) as e:
+        segments_raw = v1_segments_from_data(plan_data)
+    except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
     if not segments_raw:
-        print("Error: plan has no segments", file=sys.stderr)
+        print("Error: plan has no video segments", file=sys.stderr)
         sys.exit(1)
+
+    if is_v2(plan_data):
+        print("Timeline schema v2 (rendering video track; gaps not filled yet).")
 
     try:
         segments = parse_segments(segments_raw)

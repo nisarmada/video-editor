@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Validate a timeline plan JSON before rendering.
+Validate a timeline plan JSON before rendering (v1 or v2).
 Usage: python scripts/validate_plan.py plans/<plan>.json [--max-length SEC]
 """
 
@@ -14,17 +14,14 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from media import video_duration_seconds  # noqa: E402
+from timeline_format import (  # noqa: E402
+    is_v2,
+    load_plan_file,
+    validate_v2_data,
+    v1_segments_from_data,
+)
 
 MIN_SEGMENT_SECONDS = 0.3
-
-
-def load_segments(plan_path: Path) -> list[dict]:
-    data = json.loads(plan_path.read_text())
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict) and "segments" in data:
-        return data["segments"]
-    raise ValueError("Plan must be a list or object with 'segments'")
 
 
 def resolve_source(raw: str) -> Path:
@@ -34,6 +31,12 @@ def resolve_source(raw: str) -> Path:
     if not path.is_file():
         raise FileNotFoundError(raw)
     return path
+
+
+def load_segments(plan_path: Path) -> list[dict]:
+    """v1 segment list (flattened); used by plan.py and captions."""
+    data = load_plan_file(plan_path)
+    return v1_segments_from_data(data)
 
 
 def validate_segments(
@@ -94,15 +97,29 @@ def validate_segments(
     return errors
 
 
+def validate_plan_data(
+    data: dict | list,
+    max_length: float | None = None,
+) -> list[str]:
+    if isinstance(data, dict) and is_v2(data):
+        return validate_v2_data(
+            data,
+            max_length,
+            resolve_source,
+            video_duration_seconds,
+        )
+    return validate_segments(v1_segments_from_data(data), max_length)
+
+
 def validate_plan(
     plan_path: Path,
     max_length: float | None = None,
 ) -> list[str]:
     try:
-        segments = load_segments(plan_path)
-    except (json.JSONDecodeError, ValueError) as e:
+        data = load_plan_file(plan_path)
+    except json.JSONDecodeError as e:
         return [str(e)]
-    return validate_segments(segments, max_length)
+    return validate_plan_data(data, max_length)
 
 
 def main() -> None:
@@ -128,7 +145,9 @@ def main() -> None:
             print(f"  - {err}")
         sys.exit(1)
 
-    print(f"Plan OK: {plan_path}")
+    data = load_plan_file(plan_path)
+    version = "v2" if isinstance(data, dict) and is_v2(data) else "v1"
+    print(f"Plan OK ({version}): {plan_path}")
 
 
 if __name__ == "__main__":
