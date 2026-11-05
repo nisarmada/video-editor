@@ -8,3 +8,7 @@ __pycache__/
 *.pyc
 .DS_Store
 node_modules/
+index/*
+!index/.gitkeep
+plans/*
+!plans/.gitkeep

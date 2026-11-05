@@ -46,7 +46,7 @@ scripts/    pipeline code
 - Print clear progress messages and readable errors.
 
 ## Current milestone
-Milestone 2: transcripts with faster-whisper (`scripts/transcribe.py`). Next: caching, batch mode, language flag.
+Milestone 4: indexing (shot detection, keyframes, AI captions). Milestone 3 (auto tighten) is done.
 
 ## Later ideas (don't build yet)
 Style profile from reference creators, beat-synced cuts, music, captions

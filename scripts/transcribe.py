@@ -4,7 +4,7 @@ Transcribe speech in a video clip with faster-whisper.
 Usage: python scripts/transcribe.py <video_path>
 """
 
-import json
+import argparse
 import subprocess
 import sys
 import tempfile
@@ -14,6 +14,7 @@ from pathlib import Path
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
+from index_cache import cache_hit, save_json, transcript_path  # noqa: E402
 from probe import get_video_info  # noqa: E402
 
 
@@ -97,29 +98,32 @@ def transcribe_wav(wav_path: Path) -> tuple[list[dict], str, float]:
     return segments, language, duration
 
 
-def output_json_path(video_path: Path) -> Path:
-    """index/<clip_stem>_transcript.json next to the project root (cwd)."""
-    index_dir = Path.cwd() / "index"
-    index_dir.mkdir(parents=True, exist_ok=True)
-    return index_dir / f"{video_path.stem}_transcript.json"
-
-
-def save_result(path: Path, payload: dict) -> None:
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
-
-
 def main() -> None:
-    if len(sys.argv) != 2:
-        print("Usage: python scripts/transcribe.py <video_path>", file=sys.stderr)
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Transcribe a video clip")
+    parser.add_argument("video_path")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-transcribe even if index JSON already exists",
+    )
+    args = parser.parse_args()
 
-    video_path = Path(sys.argv[1])
+    video_path = Path(args.video_path)
     if not video_path.is_file():
         print(f"Error: file not found: {video_path}", file=sys.stderr)
         sys.exit(1)
 
     duration = video_duration_seconds(video_path)
-    out_path = output_json_path(video_path)
+    out_path = transcript_path(video_path)
+
+    if cache_hit(out_path, args.force):
+        print(f"Using cached transcript: {out_path}")
+        import json
+
+        data = json.loads(out_path.read_text())
+        for seg in data.get("segments") or []:
+            print(f"[{seg['start']:.2f} -> {seg['end']:.2f}] {seg['text']}")
+        return
 
     if not has_audio_track(video_path):
         payload = {
@@ -128,7 +132,7 @@ def main() -> None:
             "duration_seconds": round(duration, 3),
             "segments": [],
         }
-        save_result(out_path, payload)
+        save_json(out_path, payload)
         print(f"No audio track in {video_path.name}; saved empty transcript to {out_path}")
         sys.exit(0)
 
@@ -156,7 +160,7 @@ def main() -> None:
             "duration_seconds": round(total_duration, 3),
             "segments": [],
         }
-        save_result(out_path, payload)
+        save_json(out_path, payload)
         print(f"No speech detected in {video_path.name}; saved empty transcript to {out_path}")
         sys.exit(0)
 
@@ -166,7 +170,7 @@ def main() -> None:
         "duration_seconds": round(total_duration, 3),
         "segments": segments,
     }
-    save_result(out_path, payload)
+    save_json(out_path, payload)
 
     print(f"\nLanguage: {language}  |  Saved: {out_path}\n")
     for seg in segments:

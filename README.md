@@ -1,12 +1,13 @@
 # AI Video Editor
 
-Local Python tools for probing, cutting, and joining raw footage (Milestone 1).
+Local Python tools for probing, cutting, joining, transcribing, and tightening raw footage.
 
 ## Setup
 
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
+pip install -r requirements.txt
 python --version   # should be 3.12.x
 ```
 
@@ -16,11 +17,9 @@ Put original clips in `footage/` (video files are gitignored; the folder stays i
 
 Requires [FFmpeg](https://ffmpeg.org/) (`ffmpeg` and `ffprobe` on your PATH).
 
-## Scripts
+## Milestone 1 — probe, cut, join
 
 ### Probe a clip
-
-Prints duration, resolution, fps, and whether audio is present.
 
 ```bash
 python scripts/probe.py footage/my_clip.mov
@@ -28,18 +27,46 @@ python scripts/probe.py footage/my_clip.mov
 
 ### Cut a segment
 
-Re-encodes the segment (frame-accurate, H.264 + AAC). Output cannot go inside `footage/`.
-
 ```bash
 python scripts/cut.py footage/my_clip.mov 2 7 output/test_cut.mp4
 ```
 
 ### Join clips
 
-Normalizes each input to 1080×1920 vertical at 30 fps (letterboxed, not stretched), then concatenates.
-
 ```bash
 python scripts/join.py output/reel.mp4 footage/clip_a.mov footage/clip_b.mov
+```
+
+## Milestone 2 — transcribe
+
+```bash
+python scripts/transcribe.py footage/my_clip.mp4
+# Re-run: python scripts/transcribe.py footage/my_clip.mp4 --force
+```
+
+Writes `index/<clip>_transcript.json` (cached; use `--force` to refresh).
+
+## Milestone 3 — tighten (remove dead air)
+
+Step by step:
+
+```bash
+python scripts/silences.py footage/my_clip.mp4
+# Noisy background? Try: --noise -25
+# If ffmpeg still finds no silences, tighten_plan uses pauses from the transcript word timestamps.
+
+python scripts/tighten_plan.py footage/my_clip.mp4
+# Optional filler removal: --remove-fillers
+
+python scripts/render.py plans/my_clip_tight.json output/my_clip_tight.mp4
+```
+
+One command (transcribe + silences + plan + render, uses cached index files when present):
+
+```bash
+python scripts/tighten.py footage/my_clip.mp4
+python scripts/tighten.py footage/my_clip.mp4 --remove-fillers
+python scripts/tighten.py footage/my_clip.mp4 --force-index
 ```
 
 See `PROJECT.md` for the full pipeline plan.

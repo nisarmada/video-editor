@@ -4,26 +4,14 @@ Cut a segment from a video and save as a new file (re-encoded for accuracy).
 Usage: python scripts/cut.py <input> <start_seconds> <end_seconds> <output>
 """
 
-import subprocess
 import sys
 from pathlib import Path
 
-# Reuse ffprobe helper from probe.py in the same folder
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
-from probe import get_video_info  # noqa: E402
 
-
-def duration_seconds(path: Path) -> float:
-    data = get_video_info(path)
-    fmt = data.get("format") or {}
-    if fmt.get("duration"):
-        return float(fmt["duration"])
-    for stream in data.get("streams", []):
-        if stream.get("codec_type") == "video" and stream.get("duration"):
-            return float(stream["duration"])
-    raise RuntimeError("Could not determine video duration")
+from media import cut_segment, video_duration_seconds  # noqa: E402
 
 
 def output_in_footage(output: Path) -> bool:
@@ -71,7 +59,7 @@ def main() -> None:
         sys.exit(1)
 
     try:
-        total = duration_seconds(input_path)
+        total = video_duration_seconds(input_path)
     except RuntimeError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
@@ -83,34 +71,10 @@ def main() -> None:
         )
         sys.exit(1)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Re-encode for frame-accurate cuts that play everywhere
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(input_path),
-        "-ss",
-        str(start),
-        "-to",
-        str(end),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "medium",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        str(output_path),
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(
-            result.stderr.strip() or "ffmpeg failed",
-            file=sys.stderr,
-        )
+    try:
+        cut_segment(input_path, start, end, output_path)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
     print(f"Wrote {output_path}")
