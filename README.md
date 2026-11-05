@@ -13,6 +13,15 @@ python --version   # should be 3.12.x
 
 Put original clips in `footage/`. Run scripts from the project root with the venv activated.
 
+## API server (FastAPI)
+
+```bash
+python scripts/make_proxies.py          # optional: pre-cache 540p proxies
+uvicorn backend.main:app --reload --app-dir .
+```
+
+See `backend/README.md` for endpoints (footage, timelines, edit ops, planner, render).
+
 Requires [FFmpeg](https://ffmpeg.org/) (`ffmpeg` and `ffprobe` on your PATH).  
 **Captions:** Homebrew’s minimal `ffmpeg` often lacks `libass`/`drawtext`. The renderer falls back to PNG overlays automatically. For native ASS burn-in, install a build with libass.
 

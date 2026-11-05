@@ -10,6 +10,7 @@ from timeline_ops import (
     add_clip,
     apply_undo,
     delete_clip,
+    dispatch_operation,
     merge_clips,
     move_clip,
     set_clip_property,
@@ -203,6 +204,11 @@ def test_set_clip_property_undo():
     c2 = video_clips(back["timeline"])[0]
     assert c2["zoom"] == 1.1
     assert c2["group_id"] == "g1"
+
+
+def test_dispatch_operation_unknown():
+    with pytest.raises(ValueError, match="Unknown operation"):
+        dispatch_operation(sample_timeline(), "nope", {})
 
 
 def test_split_rejects_exterior_time():

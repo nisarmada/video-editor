@@ -416,3 +416,27 @@ def apply_undo(timeline: dict, undo: dict) -> TimelineOpResult:
             },
         }
     raise ValueError(f"Unknown undo op: {op!r}.")
+
+
+OPERATIONS = {
+    "split_clip": split_clip,
+    "trim_clip": trim_clip,
+    "move_clip": move_clip,
+    "delete_clip": delete_clip,
+    "add_clip": add_clip,
+    "merge_clips": merge_clips,
+    "set_clip_property": set_clip_property,
+}
+
+
+def dispatch_operation(
+    timeline: dict,
+    operation: str,
+    arguments: dict[str, Any] | None = None,
+) -> TimelineOpResult:
+    """Run a named timeline op (for API / editor)."""
+    fn = OPERATIONS.get(operation)
+    if fn is None:
+        known = ", ".join(sorted(OPERATIONS))
+        raise ValueError(f"Unknown operation {operation!r}. Known: {known}.")
+    return fn(timeline, **(arguments or {}))

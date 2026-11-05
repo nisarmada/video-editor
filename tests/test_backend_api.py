@@ -1,0 +1,147 @@
+"""FastAPI backend (mock heavy pipeline steps)."""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from backend.main import app  # noqa: E402
+from backend.paths import ProjectPaths, reset_paths, set_paths  # noqa: E402
+
+
+@pytest.fixture
+def client(tmp_path: Path):
+    (tmp_path / "footage").mkdir()
+    (tmp_path / "plans").mkdir()
+    (tmp_path / "output").mkdir()
+    (tmp_path / "footage" / "clip.mp4").write_bytes(b"fake")
+    set_paths(ProjectPaths(tmp_path))
+    yield TestClient(app)
+    reset_paths()
+
+
+def _minimal_v2() -> dict:
+    return {
+        "schema_version": 2,
+        "name": "test",
+        "tracks": [
+            {
+                "id": "track-video-main",
+                "type": "video",
+                "clips": [
+                    {
+                        "id": "c1",
+                        "source": "footage/clip.mp4",
+                        "source_in": 0.0,
+                        "source_out": 1.0,
+                        "timeline_start": 0.0,
+                        "created_by": "user",
+                    }
+                ],
+            },
+            {"id": "track-audio-main", "type": "audio", "clips": []},
+            {"id": "track-caption-main", "type": "caption", "clips": []},
+        ],
+    }
+
+
+def test_health(client: TestClient):
+    r = client.get("/api/health")
+    assert r.status_code == 200
+    assert r.json()["status"] == "ok"
+
+
+def test_list_footage(client: TestClient, monkeypatch):
+    monkeypatch.setattr(
+        "proxy_media.video_duration_seconds",
+        lambda p: 10.0,
+    )
+    r = client.get("/api/footage")
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data["clips"]) == 1
+    assert data["clips"][0]["name"] == "clip.mp4"
+
+
+def test_apply_timeline_op(client: TestClient):
+    tl = _minimal_v2()
+    r = client.post(
+        "/api/timeline/apply-op",
+        json={
+            "timeline": tl,
+            "operation": "set_clip_property",
+            "arguments": {
+                "clip_id": "c1",
+                "properties": {"zoom": 1.2},
+            },
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["timeline"]["tracks"][0]["clips"][0]["zoom"] == 1.2
+    assert body["undo"]["op"] == "set_clip_property"
+
+
+def test_save_and_load_plan(client: TestClient, monkeypatch):
+    monkeypatch.setattr("backend.main.validate_plan_data", lambda data, ml: [])
+
+    tl = _minimal_v2()
+    save = client.put("/api/plans/myedit", json={"timeline": tl})
+    assert save.status_code == 200
+
+    load = client.get("/api/plans/myedit")
+    assert load.status_code == 200
+    assert load.json()["schema_version"] == 2
+
+
+def test_serve_proxy_mock(client: TestClient, monkeypatch, tmp_path: Path):
+    proxy_file = tmp_path / "index" / "proxies" / "clip_540p.mp4"
+    proxy_file.parent.mkdir(parents=True)
+    proxy_file.write_bytes(b"not-really-mp4")
+
+    def fake_ensure(root, clip, **kwargs):
+        return proxy_file
+
+    monkeypatch.setattr("backend.main.ensure_proxy", fake_ensure)
+    r = client.get("/api/footage/clip.mp4/proxy")
+    assert r.status_code == 200
+
+
+def test_planner_run_mock(client: TestClient, monkeypatch):
+    tl = _minimal_v2()
+
+    def fake_plan(brief: str):
+        return tl, "group-1", {"input_tokens": 1, "output_tokens": 2}
+
+    monkeypatch.setattr("backend.main.generate_plan", fake_plan)
+    r = client.post(
+        "/api/planner/run",
+        json={"brief": "10s test", "save_as": "auto"},
+    )
+    assert r.status_code == 200
+    assert r.json()["group_id"] == "group-1"
+    assert r.json()["plan_name"] == "auto.json"
+
+
+def test_render_mock(client: TestClient, monkeypatch):
+    called = {}
+
+    def fake_render(plan_path, output_path, **kwargs):
+        called["plan"] = plan_path
+        output_path.write_bytes(b"mp4")
+
+    monkeypatch.setattr("backend.main.render_plan_file", fake_render)
+    r = client.post(
+        "/api/render",
+        json={"plan_name": "myedit", "output": "out.mp4"},
+    )
+    assert r.status_code == 200
+    assert "output/out.mp4" in r.json()["output"]

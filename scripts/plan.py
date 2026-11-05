@@ -192,8 +192,7 @@ def call_claude(
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        print("Error: ANTHROPIC_API_KEY not set in .env", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError("ANTHROPIC_API_KEY not set in .env")
 
     client = anthropic.Anthropic(api_key=api_key)
     response = client.messages.create(
@@ -234,6 +233,83 @@ def finalize_v2_plan(v1_plan: dict, brief: str, run_group_id: str) -> dict:
     if v2_errors:
         raise ValueError(v2_errors)
     return v2
+
+
+def generate_plan(brief: str) -> tuple[dict, str, dict]:
+    """
+    Call Claude, validate, return v2 plan, group_id, and token usage tallies.
+    Requires cwd = project root (footage/, index/).
+    """
+    load_dotenv()
+
+    indexes = load_indexes()
+    if not indexes:
+        raise RuntimeError(
+            "No merged indexes found. Add clips to footage/ and run index_clip.py."
+        )
+
+    summaries = [summarize_clip(clip, data) for clip, data in indexes]
+    user_prompt = build_user_prompt(brief, summaries)
+
+    requested = os.environ.get("ANTHROPIC_PLAN_MODEL", DEFAULT_MODEL_ENV)
+    model_candidates = [requested]
+    if requested == DEFAULT_MODEL_ENV and DEFAULT_MODEL not in model_candidates:
+        model_candidates.append(DEFAULT_MODEL)
+
+    total_usage = {"input_tokens": 0, "output_tokens": 0}
+    text: str | None = None
+    model_used = requested
+
+    for i, current_model in enumerate(model_candidates):
+        try:
+            text, usage = call_claude(current_model, SYSTEM_PROMPT, user_prompt)
+            model_used = current_model
+            break
+        except Exception as e:
+            if i < len(model_candidates) - 1:
+                continue
+            raise RuntimeError(f"Planner API error: {e}") from e
+
+    assert text is not None
+    if usage:
+        total_usage["input_tokens"] += getattr(usage, "input_tokens", 0) or 0
+        total_usage["output_tokens"] += getattr(usage, "output_tokens", 0) or 0
+
+    try:
+        plan = parse_plan_json(text)
+    except (json.JSONDecodeError, ValueError) as e:
+        raise ValueError(f"Invalid plan JSON from model: {e}") from e
+
+    run_group_id = str(uuid.uuid4())
+    target = parse_target_seconds(brief) or plan.get("target_length_seconds")
+    target = float(target) if isinstance(target, (int, float)) else None
+
+    errors = validate_segments(plan.get("segments") or [], target)
+    if errors:
+        fix_prompt = (
+            user_prompt
+            + "\n\nYour previous JSON failed validation:\n"
+            + "\n".join(f"- {e}" for e in errors)
+            + "\n\nReturn a corrected JSON object only."
+        )
+        try:
+            text, usage2 = call_claude(model_used, SYSTEM_PROMPT, fix_prompt)
+        except Exception as e:
+            raise RuntimeError(f"Planner API error on fix pass: {e}") from e
+        if usage2:
+            total_usage["input_tokens"] += getattr(usage2, "input_tokens", 0) or 0
+            total_usage["output_tokens"] += getattr(usage2, "output_tokens", 0) or 0
+        try:
+            plan = parse_plan_json(text)
+        except (json.JSONDecodeError, ValueError) as e:
+            raise ValueError(f"Invalid fixed plan JSON: {e}") from e
+        errors = validate_segments(plan.get("segments") or [], target)
+        if errors:
+            raise ValueError(errors)
+
+    plan_v2 = finalize_v2_plan(plan, brief, run_group_id)
+    total_usage["model"] = model_used
+    return plan_v2, run_group_id, total_usage
 
 
 def print_summary(plan: dict) -> None:
@@ -278,90 +354,14 @@ def main() -> None:
     parser.add_argument("--out", required=True, type=Path, help="Output plan JSON path")
     args = parser.parse_args()
 
-    indexes = load_indexes()
-    if not indexes:
-        print(
-            "Error: no merged indexes found. Add clips to footage/ and run index_clip.py.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    summaries = [summarize_clip(clip, data) for clip, data in indexes]
-    user_prompt = build_user_prompt(args.brief, summaries)
-
-    requested = os.environ.get("ANTHROPIC_PLAN_MODEL", DEFAULT_MODEL_ENV)
-    model_candidates = [requested]
-    if requested == DEFAULT_MODEL_ENV and DEFAULT_MODEL not in model_candidates:
-        model_candidates.append(DEFAULT_MODEL)
-
-    total_usage = {"input_tokens": 0, "output_tokens": 0}
-    text: str | None = None
-    model_used = requested
-
-    for i, current_model in enumerate(model_candidates):
-        try:
-            text, usage = call_claude(current_model, SYSTEM_PROMPT, user_prompt)
-            model_used = current_model
-            break
-        except Exception as e:
-            if i < len(model_candidates) - 1:
-                print(f"Model {current_model} failed ({e}); trying fallback...", file=sys.stderr)
-                continue
-            print(f"API error: {e}", file=sys.stderr)
-            sys.exit(1)
-
-    assert text is not None
-    if usage:
-        total_usage["input_tokens"] += getattr(usage, "input_tokens", 0) or 0
-        total_usage["output_tokens"] += getattr(usage, "output_tokens", 0) or 0
-
     try:
-        plan = parse_plan_json(text)
-    except (json.JSONDecodeError, ValueError) as e:
-        print(f"Error parsing plan JSON: {e}", file=sys.stderr)
+        plan_v2, run_group_id, total_usage = generate_plan(args.brief)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
-
-    run_group_id = str(uuid.uuid4())
-    target = parse_target_seconds(args.brief) or plan.get("target_length_seconds")
-    target = float(target) if isinstance(target, (int, float)) else None
-
-    errors = validate_segments(plan.get("segments") or [], target)
-    if errors:
-        print("Validation failed; asking Claude to fix the plan once...")
-        for err in errors:
-            print(f"  - {err}")
-        fix_prompt = (
-            user_prompt
-            + "\n\nYour previous JSON failed validation:\n"
-            + "\n".join(f"- {e}" for e in errors)
-            + "\n\nReturn a corrected JSON object only."
-        )
-        try:
-            text, usage2 = call_claude(model_used, SYSTEM_PROMPT, fix_prompt)
-        except Exception as e:
-            print(f"API error on fix pass: {e}", file=sys.stderr)
-            sys.exit(1)
-        if usage2:
-            total_usage["input_tokens"] += getattr(usage2, "input_tokens", 0) or 0
-            total_usage["output_tokens"] += getattr(usage2, "output_tokens", 0) or 0
-            print_usage(usage2, model_used)
-        try:
-            plan = parse_plan_json(text)
-        except (json.JSONDecodeError, ValueError) as e:
-            print(f"Error parsing fixed plan: {e}", file=sys.stderr)
-            sys.exit(1)
-        errors = validate_segments(plan.get("segments") or [], target)
-        if errors:
-            print("Plan still invalid after fix pass:", file=sys.stderr)
-            for err in errors:
-                print(f"  - {err}", file=sys.stderr)
-            sys.exit(1)
-
-    try:
-        plan_v2 = finalize_v2_plan(plan, args.brief, run_group_id)
     except ValueError as e:
         errs = e.args[0] if e.args and isinstance(e.args[0], list) else [str(e)]
-        print("Plan failed v2 conversion/validation:", file=sys.stderr)
+        print("Plan validation failed:", file=sys.stderr)
         for err in errs:
             print(f"  - {err}", file=sys.stderr)
         sys.exit(1)
@@ -370,16 +370,16 @@ def main() -> None:
     args.out.write_text(json.dumps(plan_v2, indent=2, ensure_ascii=False) + "\n")
     print(f"Saved v2 plan: {args.out}  (group_id={run_group_id})")
 
-    if total_usage["input_tokens"] or total_usage["output_tokens"]:
+    if total_usage.get("input_tokens") or total_usage.get("output_tokens"):
 
         class U:
             pass
 
         u = U()
-        u.input_tokens = total_usage["input_tokens"]
-        u.output_tokens = total_usage["output_tokens"]
+        u.input_tokens = total_usage.get("input_tokens", 0)
+        u.output_tokens = total_usage.get("output_tokens", 0)
         print("\nTotal API usage this run:")
-        print_usage(u, model_used)
+        print_usage(u, total_usage.get("model", DEFAULT_MODEL_ENV))
 
     print_summary(plan_v2)
 

@@ -50,7 +50,7 @@ scripts/    pipeline code
 - Print clear progress messages and readable errors.
 
 ## Current milestone
-Milestone 5: Claude timeline planning (`scripts/plan.py`). Next: render + review loop.
+Milestone 5: Claude timeline planning (`scripts/plan.py`). Local API: `backend/` (FastAPI). Next: render + review loop.
 
 ## Later ideas (don't build yet)
 Style profile from reference creators, beat-synced cuts, music, captions
