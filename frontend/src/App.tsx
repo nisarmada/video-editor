@@ -7,6 +7,11 @@ import "./App.css";
 
 export default function App() {
   const currentPlanName = useTimelineStore((s) => s.currentPlanName);
+  const availablePlans = useTimelineStore((s) => s.availablePlans);
+  const plansListError = useTimelineStore((s) => s.plansListError);
+  const initSession = useTimelineStore((s) => s.initSession);
+  const loadPlan = useTimelineStore((s) => s.loadPlan);
+  const createNewPlan = useTimelineStore((s) => s.createNewPlan);
   const timeline = useTimelineStore((s) => s.timeline);
   const timelineLoading = useTimelineStore((s) => s.timelineLoading);
   const isDirty = useTimelineStore((s) => s.isDirty);
@@ -24,14 +29,24 @@ export default function App() {
   const selectedClipId = useTimelineStore((s) => s.selectedClipId);
 
   const saving = saveStatus === "saving";
-  const canSave = Boolean(timeline) && isDirty && !saving && !timelineLoading;
+  const canSave =
+    Boolean(timeline && currentPlanName) && isDirty && !saving && !timelineLoading;
   const rendering = renderStatus === "rendering";
   const canExport =
-    Boolean(timeline) &&
+    Boolean(timeline && currentPlanName) &&
     !timelineLoading &&
     !rendering &&
     !saving &&
     !applyOperationInProgress;
+
+  useEffect(() => {
+    void initSession();
+  }, [initSession]);
+
+  const selectPlanValue =
+    currentPlanName && availablePlans.includes(currentPlanName)
+      ? currentPlanName
+      : "";
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -73,7 +88,37 @@ export default function App() {
     <div className="app">
       <header className="app-bar">
         <span className="app-bar__title">Video Editor</span>
-        <span className="app-bar__plan">Plan: {currentPlanName}.json</span>
+        {plansListError && (
+          <span className="app-bar__plan">{plansListError}</span>
+        )}
+        <select
+          className="app-bar__btn"
+          aria-label="Open plan"
+          value={selectPlanValue}
+          disabled={timelineLoading || availablePlans.length === 0}
+          onChange={(e) => {
+            const v = e.target.value;
+            if (v) void loadPlan(v);
+          }}
+        >
+          {availablePlans.length === 0 ? (
+            <option value="">No plans</option>
+          ) : (
+            availablePlans.map((stem) => (
+              <option key={stem} value={stem}>
+                {stem}.json
+              </option>
+            ))
+          )}
+        </select>
+        <button
+          type="button"
+          className="app-bar__btn"
+          disabled={timelineLoading}
+          onClick={() => void createNewPlan()}
+        >
+          New plan
+        </button>
         <div className="app-bar__actions">
           <button
             type="button"

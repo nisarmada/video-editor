@@ -10,6 +10,7 @@ import {
   MIN_PX_PER_SEC,
   useTimelineStore,
 } from "../store/timelineStore";
+import { canMutateTimeline } from "../store/timelineMutation";
 import { formatTimecode } from "../utils/timeFormat";
 
 const LABEL_WIDTH = 88;
@@ -29,17 +30,59 @@ export default function TimelinePanel() {
   const error = useTimelineStore((s) => s.timelineError);
   const playhead = useTimelineStore((s) => s.playheadSeconds);
   const pxPerSecond = useTimelineStore((s) => s.pxPerSecond);
-  const loadTimeline = useTimelineStore((s) => s.loadTimeline);
+  const loadPlan = useTimelineStore((s) => s.loadPlan);
   const setPlayhead = useTimelineStore((s) => s.setPlayheadSeconds);
   const setPxPerSecond = useTimelineStore((s) => s.setPxPerSecond);
   const setTimelinePlaying = useTimelineStore((s) => s.setTimelinePlaying);
-  const planName = useTimelineStore((s) => s.planName);
+  const currentPlanName = useTimelineStore((s) => s.currentPlanName);
+
+  const selectedClipId = useTimelineStore((s) => s.selectedClipId);
+  const setSelectedClipId = useTimelineStore((s) => s.setSelectedClipId);
+  const undoStack = useTimelineStore((s) => s.undoStack);
+  const redoStack = useTimelineStore((s) => s.redoStack);
+  const applyInProgress = useTimelineStore((s) => s.applyOperationInProgress);
+  const dragInProgress = useTimelineStore((s) => s.dragInProgress);
+  const opErrorMessage = useTimelineStore((s) => s.opErrorMessage);
+  const clearOpError = useTimelineStore((s) => s.clearOpError);
+  const undo = useTimelineStore((s) => s.undo);
+  const redo = useTimelineStore((s) => s.redo);
+  const splitAtPlayhead = useTimelineStore((s) => s.splitAtPlayhead);
+  const deleteSelectedClip = useTimelineStore((s) => s.deleteSelectedClip);
 
   const rulerRef = useRef<HTMLDivElement>(null);
 
+  const canUndo = undoStack.length > 0;
+  const canRedo = redoStack.length > 0;
+  const busy = !canMutateTimeline({
+    applyOperationInProgress: applyInProgress,
+    dragInProgress,
+  });
+
+
   useEffect(() => {
-    void loadTimeline();
-  }, [loadTimeline]);
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.metaKey || e.key.toLowerCase() !== "z") return;
+      const t = e.target as HTMLElement | null;
+      if (
+        t &&
+        (t.tagName === "INPUT" ||
+          t.tagName === "TEXTAREA" ||
+          t.tagName === "SELECT" ||
+          t.isContentEditable)
+      ) {
+        return;
+      }
+      e.preventDefault();
+      if (busy) return;
+      if (e.shiftKey) {
+        void redo();
+      } else {
+        void undo();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [busy, undo, redo]);
 
   const duration = useMemo(
     () => (timeline ? timelineEnd(timeline) : 0),
@@ -72,14 +115,60 @@ export default function TimelinePanel() {
     [pxPerSecond, setPlayhead, duration, setTimelinePlaying],
   );
 
+  const onClipClick = useCallback(
+    (e: React.MouseEvent, clipId: string) => {
+      e.stopPropagation();
+      setSelectedClipId(clipId);
+    },
+    [setSelectedClipId],
+  );
+
   const playheadLeft = LABEL_WIDTH + playhead * pxPerSecond;
 
   return (
     <div className="lower-workspace">
       <div className="timeline-toolbar" aria-label="Timeline view">
         <span className="timeline-toolbar__plan">
-          Timeline: {planName}.json (read-only)
+          Timeline: {currentPlanName}.json
         </span>
+        <button
+          type="button"
+          className="timeline-toolbar__tool timeline-toolbar__tool--text"
+          disabled={busy || !canUndo}
+          onClick={() => void undo()}
+          title="Undo (⌘Z)"
+        >
+          Undo
+        </button>
+        <button
+          type="button"
+          className="timeline-toolbar__tool timeline-toolbar__tool--text"
+          disabled={busy || !canRedo}
+          onClick={() => void redo()}
+          title="Redo (⌘⇧Z)"
+        >
+          Redo
+        </button>
+        <div className="timeline-toolbar__sep" />
+        <button
+          type="button"
+          className="timeline-toolbar__tool timeline-toolbar__tool--text"
+          disabled={busy || !selectedClipId}
+          onClick={() => void splitAtPlayhead().catch(() => {})}
+          title="Split at playhead"
+        >
+          Split
+        </button>
+        <button
+          type="button"
+          className="timeline-toolbar__tool timeline-toolbar__tool--text"
+          disabled={busy || !selectedClipId}
+          onClick={() => void deleteSelectedClip().catch(() => {})}
+          title="Delete selected clip"
+        >
+          Del
+        </button>
+        <div className="timeline-toolbar__sep" />
         <div className="timeline-toolbar__zoom">
           <span className="timeline-toolbar__zoom-label">Zoom</span>
           <input
@@ -99,6 +188,15 @@ export default function TimelinePanel() {
         </span>
       </div>
 
+      {opErrorMessage && (
+        <div className="timeline-op-error" role="alert">
+          <span>{opErrorMessage}</span>
+          <button type="button" className="link-btn" onClick={clearOpError}>
+            Dismiss
+          </button>
+        </div>
+      )}
+
       <div className="timeline-area timeline-area--loaded">
         {loading && <p className="panel-message">Loading timeline…</p>}
         {error && (
@@ -107,14 +205,18 @@ export default function TimelinePanel() {
             <button
               type="button"
               className="link-btn"
-              onClick={() => void loadTimeline()}
+              onClick={() => void loadPlan()}
             >
               Retry
             </button>
           </p>
         )}
         {!loading && !error && timeline && (
-          <div className="timeline-viewport">
+          <div
+            className="timeline-viewport"
+            onClick={() => setSelectedClipId(null)}
+            role="presentation"
+          >
             <div
               className="timeline-canvas"
               style={{ width: totalWidth, minHeight: "100%" }}
@@ -172,12 +274,25 @@ export default function TimelinePanel() {
                       const dur = clipTimelineDuration(clip, track.type);
                       const left = start * pxPerSecond;
                       const width = Math.max(dur * pxPerSecond, 4);
+                      const selected = clip.id === selectedClipId;
                       return (
                         <div
                           key={clip.id}
-                          className={trackClipClass(track.type)}
+                          role="button"
+                          tabIndex={0}
+                          className={
+                            trackClipClass(track.type) +
+                            (selected ? " tl-clip--selected" : "")
+                          }
                           style={{ left, width }}
                           title={clipDisplayName(clip, track.type)}
+                          onClick={(e) => onClipClick(e, clip.id)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              setSelectedClipId(clip.id);
+                            }
+                          }}
                         >
                           {clipDisplayName(clip, track.type)}
                         </div>

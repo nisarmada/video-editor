@@ -1,7 +1,12 @@
 import { create } from "zustand";
-import { fetchPlan, savePlan as savePlanToServer } from "../api/plans";
+import {
+  fetchPlan,
+  fetchPlanList,
+  savePlan as savePlanToServer,
+} from "../api/plans";
 import { renderPlan as requestRender } from "../api/render";
 import { applyTimelineOperation } from "../api/timelineOps";
+import { LAST_OPENED_PLAN_KEY, normalizePlanStem, validatePlanStem } from "../utils/planStem";
 import {
   canMutateTimeline,
   parseApplyOpErrorMessage,
@@ -14,6 +19,33 @@ export const DEFAULT_PLAN_NAME = "draft1_v2";
 export const MIN_PX_PER_SEC = 24;
 export const MAX_PX_PER_SEC = 160;
 export const DEFAULT_PX_PER_SEC = 48;
+
+/** One clip on video + empty audio/caption; passes validate_v2_data (scripts/timeline_format.py). */
+export function newEmptyTimelineV2(): TimelineV2 {
+  return {
+    schema_version: 2,
+    tracks: [
+      {
+        id: "track-video-main",
+        type: "video",
+        label: "Video",
+        clips: [
+          {
+            id: crypto.randomUUID(),
+            source: "footage/test_a.mp4",
+            source_in: 0,
+            source_out: 1,
+            timeline_start: 0,
+            created_by: "user",
+          },
+        ],
+      },
+      { id: "track-audio-main", type: "audio", label: "Audio", clips: [] },
+      { id: "track-caption-main", type: "caption", label: "Captions", clips: [] },
+    ],
+    settings: { width: 1080, height: 1920, fps: 30 },
+  };
+}
 
 /** Single op for applyOperation — matches backend dispatch_operation / timeline_ops. */
 export type TimelineEditOp = {
@@ -30,6 +62,11 @@ export type RenderStatus = "idle" | "rendering" | "done" | "error";
 type TimelineViewState = {
   /** Active plan stem (no .json); persisted file is `{currentPlanName}.json`. */
   currentPlanName: string;
+  /** Stems from GET /api/plans (no .json). */
+  availablePlans: string[];
+  /** User-visible message when listing plans failed or none exist. */
+  plansListError: string | null;
+
   /** Authoritative v2 timeline from the server after load or applyOperation. */
   timeline: TimelineV2 | null;
   timelineLoading: boolean;
@@ -64,9 +101,17 @@ type TimelineViewState = {
   /** Short message when backend rejects apply or undo/redo. */
   opErrorMessage: string | null;
 
-  loadTimeline: (name?: string) => Promise<void>;
+  /** Fetches plan list, opens last opened / first plan (or DEFAULT_PLAN_NAME fallback). */
+  initSession: () => Promise<void>;
+  /** Load plan by stem; optional name reloads current. Confirms if dirty (unless skipDirtyConfirm). */
+  loadPlan: (
+    name?: string,
+    opts?: { skipDirtyConfirm?: boolean },
+  ) => Promise<void>;
   /** PUT current timeline to server; clears dirty on success. */
   savePlan: () => Promise<void>;
+  /** Prompt for stem, PUT empty valid v2, refresh list, load. */
+  createNewPlan: () => Promise<void>;
   /** Save if dirty, then POST /api/render using plan file on disk. */
   exportPlan: () => Promise<void>;
   setPlayheadSeconds: (t: number) => void;
@@ -109,7 +154,9 @@ async function fetchApplyOp(
 }
 
 export const useTimelineStore = create<TimelineViewState>((set, get) => ({
-  currentPlanName: DEFAULT_PLAN_NAME,
+  currentPlanName: "",
+  availablePlans: [],
+  plansListError: null,
   timeline: null,
   timelineLoading: false,
   timelineError: null,
@@ -130,12 +177,80 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
   redoStack: [],
   opErrorMessage: null,
 
-  loadTimeline: async (name) => {
-    const currentPlanName = name ?? get().currentPlanName;
+  initSession: async () => {
+    set({
+      plansListError: null,
+      timelineLoading: true,
+      timelineError: null,
+    });
+    try {
+      const list = await fetchPlanList();
+      if (list.length === 0) {
+        try {
+          await get().loadPlan(DEFAULT_PLAN_NAME, { skipDirtyConfirm: true });
+          set({
+            availablePlans: [DEFAULT_PLAN_NAME],
+            plansListError: null,
+          });
+        } catch {
+          set({
+            availablePlans: [],
+            plansListError:
+              "No plan files in plans/. Add a JSON file or create one with New plan.",
+            timelineLoading: false,
+            timeline: null,
+            timelineError: null,
+            currentPlanName: "",
+            saveStatus: "idle",
+            saveError: null,
+            renderStatus: "idle",
+            renderError: null,
+            outputName: null,
+            outputDownloadUrl: null,
+          });
+        }
+        return;
+      }
+      set({ availablePlans: list, plansListError: null });
+      const stored =
+        typeof localStorage !== "undefined"
+          ? localStorage.getItem(LAST_OPENED_PLAN_KEY)
+          : null;
+      const stem =
+        stored && list.includes(stored) ? stored : list[0];
+      await get().loadPlan(stem, { skipDirtyConfirm: true });
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Failed to list plans";
+      set({
+        plansListError: message,
+        availablePlans: [],
+        timelineLoading: false,
+        timeline: null,
+        timelineError: message,
+        currentPlanName: "",
+      });
+    }
+  },
+
+  loadPlan: async (name, opts) => {
+    const raw = name ?? get().currentPlanName;
+    const target = normalizePlanStem(raw);
+    if (!target) {
+      set({ timelineError: "No plan selected.", timelineLoading: false });
+      return;
+    }
+    if (!opts?.skipDirtyConfirm && get().isDirty) {
+      if (
+        typeof window !== "undefined" &&
+        !window.confirm("Discard unsaved changes?")
+      ) {
+        return;
+      }
+    }
     set({
       timelineLoading: true,
       timelineError: null,
-      currentPlanName,
+      currentPlanName: target,
       saveStatus: "idle",
       saveError: null,
       renderStatus: "idle",
@@ -144,7 +259,10 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
       outputDownloadUrl: null,
     });
     try {
-      const timeline = await fetchPlan(currentPlanName);
+      const timeline = await fetchPlan(target);
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem(LAST_OPENED_PLAN_KEY, target);
+      }
       set({
         timeline,
         timelineLoading: false,
@@ -176,6 +294,37 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Save failed";
       set({ saveStatus: "error", saveError: msg });
+    }
+  },
+
+  createNewPlan: async () => {
+    if (typeof window === "undefined") return;
+    const raw = window.prompt("New plan name (no .json):");
+    if (raw === null) return;
+    const stemErr = validatePlanStem(raw);
+    if (stemErr) {
+      window.alert(stemErr);
+      return;
+    }
+    const stem = normalizePlanStem(raw);
+    if (get().isDirty) {
+      if (!window.confirm("Discard unsaved changes?")) return;
+    }
+    set({ timelineLoading: true, timelineError: null, opErrorMessage: null });
+    try {
+      const tl = newEmptyTimelineV2();
+      await savePlanToServer(stem, tl);
+      let list = get().availablePlans;
+      try {
+        list = await fetchPlanList();
+      } catch {
+        list = [...new Set([...get().availablePlans, stem])].sort();
+      }
+      set({ availablePlans: list, plansListError: null });
+      await get().loadPlan(stem, { skipDirtyConfirm: true });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Failed to create plan";
+      set({ timelineLoading: false, timelineError: msg });
     }
   },
 
