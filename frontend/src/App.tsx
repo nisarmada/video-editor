@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import MediaBin from "./components/MediaBin";
 import TimelineVideoPreview from "./components/TimelineVideoPreview";
 import TimelinePanel from "./components/TimelinePanel";
@@ -5,21 +6,101 @@ import { useTimelineStore } from "./store/timelineStore";
 import "./App.css";
 
 export default function App() {
-  const planName = useTimelineStore((s) => s.planName);
+  const currentPlanName = useTimelineStore((s) => s.currentPlanName);
+  const timeline = useTimelineStore((s) => s.timeline);
+  const timelineLoading = useTimelineStore((s) => s.timelineLoading);
+  const isDirty = useTimelineStore((s) => s.isDirty);
+  const saveStatus = useTimelineStore((s) => s.saveStatus);
+  const saveError = useTimelineStore((s) => s.saveError);
+  const savePlan = useTimelineStore((s) => s.savePlan);
+  const exportPlan = useTimelineStore((s) => s.exportPlan);
+  const renderStatus = useTimelineStore((s) => s.renderStatus);
+  const renderError = useTimelineStore((s) => s.renderError);
+  const outputDownloadUrl = useTimelineStore((s) => s.outputDownloadUrl);
+  const applyOperationInProgress = useTimelineStore(
+    (s) => s.applyOperationInProgress,
+  );
   const timelineBrief = useTimelineStore((s) => s.timeline?.brief);
+  const selectedClipId = useTimelineStore((s) => s.selectedClipId);
+
+  const saving = saveStatus === "saving";
+  const canSave = Boolean(timeline) && isDirty && !saving && !timelineLoading;
+  const rendering = renderStatus === "rendering";
+  const canExport =
+    Boolean(timeline) &&
+    !timelineLoading &&
+    !rendering &&
+    !saving &&
+    !applyOperationInProgress;
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.metaKey && !e.ctrlKey) return;
+      if (e.key.toLowerCase() !== "s") return;
+      const t = e.target as HTMLElement | null;
+      if (
+        t &&
+        (t.tagName === "INPUT" ||
+          t.tagName === "TEXTAREA" ||
+          t.tagName === "SELECT" ||
+          t.isContentEditable)
+      ) {
+        return;
+      }
+      if (!canSave) return;
+      e.preventDefault();
+      void savePlan();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [canSave, savePlan]);
+
+  useEffect(() => {
+    if (!isDirty) return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [isDirty]);
+
+  const saveStatusLine =
+    saveStatus === "error" && saveError
+      ? `Save failed: ${saveError}`
+      : saveStatus;
 
   return (
     <div className="app">
       <header className="app-bar">
         <span className="app-bar__title">Video Editor</span>
-        <span className="app-bar__plan">Plan: {planName}.json</span>
+        <span className="app-bar__plan">Plan: {currentPlanName}.json</span>
         <div className="app-bar__actions">
-          <button type="button" className="app-bar__btn" disabled>
+          <button
+            type="button"
+            className="app-bar__btn"
+            disabled={!canSave}
+            onClick={() => void savePlan()}
+          >
             Save
           </button>
-          <button type="button" className="app-bar__btn" disabled>
+          <span className="app-bar__plan">{saveStatusLine}</span>
+          <button
+            type="button"
+            className="app-bar__btn"
+            disabled={!canExport}
+            onClick={() => void exportPlan()}
+          >
             Export
           </button>
+          <span className="app-bar__plan">
+            {rendering
+              ? "Rendering..."
+              : renderStatus === "error" && renderError
+                ? renderError
+                : renderStatus === "done" && outputDownloadUrl ? (
+                  <a href={outputDownloadUrl}>Download</a>
+                ) : null}
+          </span>
           <button type="button" className="app-bar__btn" disabled>
             Planner…
           </button>
@@ -46,7 +127,7 @@ export default function App() {
             <div className="props-grid">
               <div className="props-row">
                 <label>Plan name</label>
-                <span>{planName}</span>
+                <span>{currentPlanName}</span>
               </div>
               <div className="props-row">
                 <label>Brief</label>
@@ -54,7 +135,7 @@ export default function App() {
               </div>
               <div className="props-row">
                 <label>Selection</label>
-                <span>None</span>
+                <span>{selectedClipId ?? "None"}</span>
               </div>
             </div>
           </div>
