@@ -52,18 +52,11 @@ export default function AICommandBar() {
     <section
       className="ai-command-bar"
       role="region"
-      aria-label="AI assistant"
+      aria-label="Edit planner"
     >
       <div className="ai-command-bar__inner">
-        <div className="ai-command-bar__head">
-          <h2 className="ai-command-bar__title">AI Assistant</h2>
-          <p className="ai-command-bar__subtitle">
-            Describe the edit you want — we generate a timeline from your indexed footage.
-          </p>
-        </div>
         <div className="ai-command-bar__row">
           <label className="ai-command-bar__prompt">
-            <span className="ai-command-bar__label">Prompt</span>
             <input
               type="text"
               className="ai-command-bar__input"
@@ -72,6 +65,7 @@ export default function AICommandBar() {
               onChange={(e) => setBrief(e.target.value)}
               disabled={plannerRunning}
               autoComplete="off"
+              aria-label="Edit brief"
             />
           </label>
           <div className="ai-command-bar__secondary">
