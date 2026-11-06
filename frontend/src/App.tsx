@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import MediaBin from "./components/MediaBin";
 import TimelineVideoPreview from "./components/TimelineVideoPreview";
 import TimelinePanel from "./components/TimelinePanel";
@@ -38,6 +38,20 @@ export default function App() {
     !rendering &&
     !saving &&
     !applyOperationInProgress;
+
+  const plannerRunning = useTimelineStore((s) => s.plannerRunning);
+  const plannerError = useTimelineStore((s) => s.plannerError);
+  const runPlannerJob = useTimelineStore((s) => s.runPlannerJob);
+
+  const [plannerOpen, setPlannerOpen] = useState(false);
+  const [plannerBrief, setPlannerBrief] = useState("");
+  const [plannerSaveAs, setPlannerSaveAs] = useState("");
+
+  useEffect(() => {
+    if (currentPlanName) {
+      setPlannerSaveAs((prev) => prev || currentPlanName);
+    }
+  }, [currentPlanName]);
 
   useEffect(() => {
     void initSession();
@@ -146,11 +160,63 @@ export default function App() {
                   <a href={outputDownloadUrl}>Download</a>
                 ) : null}
           </span>
-          <button type="button" className="app-bar__btn" disabled>
+          <button
+            type="button"
+            className="app-bar__btn"
+            disabled={
+              plannerRunning ||
+              timelineLoading ||
+              saving ||
+              rendering ||
+              applyOperationInProgress
+            }
+            onClick={() => setPlannerOpen((o) => !o)}
+          >
             Planner…
           </button>
         </div>
       </header>
+
+      {plannerOpen && (
+        <div className="app-bar" role="region" aria-label="Planner">
+          <label>
+            Brief{" "}
+            <input
+              type="text"
+              value={plannerBrief}
+              onChange={(e) => setPlannerBrief(e.target.value)}
+              disabled={plannerRunning}
+            />
+          </label>
+          <label>
+            Save as{" "}
+            <input
+              type="text"
+              value={plannerSaveAs}
+              onChange={(e) => setPlannerSaveAs(e.target.value)}
+              placeholder="filename without path"
+              disabled={plannerRunning}
+            />
+          </label>
+          <button
+            type="button"
+            className="app-bar__btn"
+            disabled={
+              plannerRunning ||
+              timelineLoading ||
+              saving ||
+              rendering ||
+              applyOperationInProgress
+            }
+            onClick={() =>
+              void runPlannerJob(plannerBrief, plannerSaveAs || currentPlanName)
+            }
+          >
+            {plannerRunning ? "Running…" : "Run planner"}
+          </button>
+          {plannerError && <span className="app-bar__plan">{plannerError}</span>}
+        </div>
+      )}
 
       <div className="upper-workspace">
         <MediaBin />

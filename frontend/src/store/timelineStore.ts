@@ -4,6 +4,7 @@ import {
   fetchPlanList,
   savePlan as savePlanToServer,
 } from "../api/plans";
+import { runPlanner as callPlanner } from "../api/planner";
 import { renderPlan as requestRender } from "../api/render";
 import { applyTimelineOperation } from "../api/timelineOps";
 import { LAST_OPENED_PLAN_KEY, normalizePlanStem, validatePlanStem } from "../utils/planStem";
@@ -101,8 +102,14 @@ type TimelineViewState = {
   /** Short message when backend rejects apply or undo/redo. */
   opErrorMessage: string | null;
 
+  /** POST /api/planner/run in flight. */
+  plannerRunning: boolean;
+  plannerError: string | null;
+
   /** Fetches plan list, opens last opened / first plan (or DEFAULT_PLAN_NAME fallback). */
   initSession: () => Promise<void>;
+  /** Refetch GET /api/plans (e.g. after planner writes a new file). */
+  refreshAvailablePlans: () => Promise<void>;
   /** Load plan by stem; optional name reloads current. Confirms if dirty (unless skipDirtyConfirm). */
   loadPlan: (
     name?: string,
@@ -112,6 +119,8 @@ type TimelineViewState = {
   savePlan: () => Promise<void>;
   /** Prompt for stem, PUT empty valid v2, refresh list, load. */
   createNewPlan: () => Promise<void>;
+  /** Run AI planner; on success refresh list and load the saved file (skip dirty confirm). */
+  runPlannerJob: (brief: string, saveAsStem: string) => Promise<void>;
   /** Save if dirty, then POST /api/render using plan file on disk. */
   exportPlan: () => Promise<void>;
   setPlayheadSeconds: (t: number) => void;
@@ -176,6 +185,18 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
   undoStack: [],
   redoStack: [],
   opErrorMessage: null,
+  plannerRunning: false,
+  plannerError: null,
+
+  refreshAvailablePlans: async () => {
+    try {
+      const list = await fetchPlanList();
+      set({ availablePlans: list, plansListError: null });
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Failed to list plans";
+      set({ plansListError: message });
+    }
+  },
 
   initSession: async () => {
     set({
@@ -509,5 +530,61 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
     });
     set({ selectedClipId: null });
     return undo;
+  },
+
+  runPlannerJob: async (brief, saveAsStem) => {
+    set({ plannerError: null });
+    if (typeof window !== "undefined") {
+      if (get().isDirty) {
+        if (
+          !window.confirm(
+            "You have unsaved edits. The planner will save a new file and load it; unsaved work will be lost. Continue?",
+          )
+        ) {
+          return;
+        }
+      }
+    }
+    const trimmed = brief.trim();
+    if (!trimmed) {
+      set({ plannerError: "Brief is required." });
+      return;
+    }
+    const stem = normalizePlanStem(saveAsStem);
+    if (!stem) {
+      set({ plannerError: "Save-as name is required." });
+      return;
+    }
+    const stemErr = validatePlanStem(stem);
+    if (stemErr) {
+      set({ plannerError: stemErr });
+      return;
+    }
+    if (
+      typeof window !== "undefined" &&
+      get().availablePlans.includes(stem)
+    ) {
+      if (
+        !window.confirm(
+          `This will overwrite plans/${stem}.json on disk. Continue?`,
+        )
+      ) {
+        return;
+      }
+    }
+    set({ plannerRunning: true, plannerError: null });
+    try {
+      const result = await callPlanner({
+        brief: trimmed,
+        save_as: stem,
+      });
+      await get().refreshAvailablePlans();
+      const stemFromFile = normalizePlanStem(result.plan_name);
+      await get().loadPlan(stemFromFile, { skipDirtyConfirm: true });
+      set({ plannerRunning: false, plannerError: null });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Planner failed";
+      set({ plannerRunning: false, plannerError: msg });
+    }
   },
 }));

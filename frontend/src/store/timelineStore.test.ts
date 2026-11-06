@@ -91,6 +91,8 @@ describe("timeline undo/redo", () => {
       renderError: null,
       outputName: null,
       outputDownloadUrl: null,
+      plannerRunning: false,
+      plannerError: null,
     });
   });
 
