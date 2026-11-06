@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import sys
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -24,22 +27,66 @@ _SCRIPTS = _REPO_ROOT / "scripts"
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
-from backend.paths import ProjectPaths, get_paths, set_paths  # noqa: E402
+from backend.app_logging import get_logs, last_index, log_event  # noqa: E402
+from backend.footage_jobs import get_job, schedule_proxy_work  # noqa: E402
+from backend.waveform_jobs import (  # noqa: E402
+    get_job as get_waveform_job,
+    schedule_waveform_work,
+    waveform_list_status,
+)
+from backend.footage_ops import (  # noqa: E402
+    ffprobe_validate_video,
+    plans_referencing_footage,
+    sanitize_upload_basename,
+    unique_footage_path,
+    video_extension_allowed,
+)
+from backend.paths import ProjectPaths, get_paths, refresh_paths_from_settings, set_paths  # noqa: E402
+from backend.render_jobs import (  # noqa: E402
+    any_active_render,
+    bind_progress,
+    create_job,
+    get_cancel_event,
+    get_job_public,
+    request_cancel,
+    update_job,
+)
+from backend.caption_style_store import fonts_bundle_dir  # noqa: E402
+from backend.settings_store import (  # noqa: E402
+    effective_planner_api_key,
+    effective_render_defaults,
+    get_public_settings,
+    load_raw,
+    merge_settings,
+    save_raw,
+    set_planner_api_key,
+)
 from plan import generate_plan  # noqa: E402
 from proxy_media import (  # noqa: E402
     ensure_proxy,
     ensure_thumbnail,
     footage_entry,
     list_footage_files,
+    proxy_is_fresh,
     proxy_path_for_clip,
+    thumbnail_is_fresh,
     thumbnail_path_for_clip,
 )
 from render_core import render_plan_data, render_plan_file  # noqa: E402
-from timeline_format import is_v2  # noqa: E402
+from convert_v1_to_v2 import convert as convert_plan_v1_to_v2  # noqa: E402
+from index_cache import waveform_path  # noqa: E402
+from timeline_format import is_v2, v1_segments_from_data  # noqa: E402
 from timeline_ops import dispatch_operation  # noqa: E402
 from validate_plan import validate_plan_data  # noqa: E402
+from caption_style import validate_caption_style_dict  # noqa: E402
+from caption_style_resolve import list_builtin_presets, resolve_merged_style_for_plan  # noqa: E402
+from captions import build_ass_for_timeline, remap_words, sample_preview_ass  # noqa: E402
+from media import ffmpeg_has_libass  # noqa: E402
 
 app = FastAPI(title="Video Editor API", version="1.0.0")
+
+# Load path overrides from persisted settings before first request.
+refresh_paths_from_settings()
 
 app.add_middleware(
     CORSMiddleware,
@@ -80,8 +127,69 @@ class RenderRequest(BaseModel):
     plan_name: str | None = None
     timeline: dict[str, Any] | None = None
     output: str = Field(description="Output filename under output/, e.g. export.mp4")
-    captions: bool = False
+    captions: bool | None = None
     max_length: float | None = None
+
+
+class SettingsUpdate(BaseModel):
+    planner_api_key: str | None = None
+    paths: dict[str, str] | None = None
+    render_defaults: dict[str, Any] | None = None
+    user_caption_styles: list[dict[str, Any]] | None = None
+
+
+class CaptionsAssBody(BaseModel):
+    timeline: dict[str, Any]
+    style: dict[str, Any] | None = None
+    clip_ids: list[str] | None = None
+    preview_preset: dict[str, Any] | None = None
+    style_target: str | None = None
+    style_clip_id: str | None = None
+
+
+
+
+class PlanRenameBody(BaseModel):
+    to: str
+
+
+class PlanDuplicateBody(BaseModel):
+    to: str
+
+
+def _client_host_allowed(request: Request) -> bool:
+    h = (request.client.host if request.client else "") or ""
+    return h in ("127.0.0.1", "::1", "localhost")
+
+
+def _merge_footage_job(entry: dict[str, Any]) -> dict[str, Any]:
+    name = entry["name"]
+    job = get_job(name)
+    out = dict(entry)
+    if job:
+        st = job.get("status")
+        err = job.get("error")
+        if st == "processing":
+            out["process_status"] = "processing"
+            out["process_error"] = None
+        elif st == "failed":
+            out["process_status"] = "failed"
+            out["process_error"] = err
+    return out
+
+
+def _enrich_footage_clip(paths: ProjectPaths, clip_path: Path) -> dict[str, Any]:
+    """footage_entry + proxy job merge + waveform_status."""
+    base = clip_path.name
+    entry = footage_entry(paths.root, clip_path)
+    merged = _merge_footage_job(entry)
+    merged["waveform_status"] = waveform_list_status(paths.root, clip_path)
+    wf_job = get_waveform_job(base)
+    if wf_job and wf_job.get("status") == "failed":
+        merged["waveform_error"] = wf_job.get("error")
+    else:
+        merged["waveform_error"] = None
+    return merged
 
 
 @app.get("/api/health")
@@ -89,10 +197,353 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/system/status")
+def system_status() -> dict[str, Any]:
+    return {
+        "ffmpeg_libass": ffmpeg_has_libass(),
+        "ffmpeg_subtitles_filter": ffmpeg_has_libass(),
+    }
+
+
+@app.get("/api/fonts")
+def list_font_files() -> dict[str, Any]:
+    d = fonts_bundle_dir()
+    if not d.is_dir():
+        return {"fonts": []}
+    fonts = sorted(f.name for f in d.iterdir() if f.is_file() and f.suffix.lower() == ".ttf")
+    return {"fonts": fonts, "fontsdir": "/api/fonts/dir"}
+
+
+@app.get("/api/fonts/dir/{filename}")
+def serve_font(filename: str) -> FileResponse:
+    base = Path(filename).name
+    if base != filename or not base.lower().endswith(".ttf"):
+        raise HTTPException(status_code=400, detail="Invalid font name")
+    path = fonts_bundle_dir() / base
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Font not found")
+    return FileResponse(path, filename=base, media_type="font/ttf")
+
+
+@app.get("/api/caption-styles")
+def caption_styles_list(paths: ProjectPaths = Depends(get_paths)) -> dict[str, Any]:
+    built = list_builtin_presets()
+    raw = load_raw(paths.root)
+    user = raw.get("user_caption_styles")
+    user_list: list[dict[str, Any]] = []
+    if isinstance(user, list):
+        for x in user:
+            if isinstance(x, dict) and x.get("id"):
+                user_list.append(x)
+    return {"built_in": built, "user": user_list}
+
+
+def _validate_merged_user_style(body: dict[str, Any]) -> dict[str, Any]:
+    from caption_style_resolve import default_caption_style, get_builtin_preset, merge_style_dict
+
+    sid = body.get("id")
+    if not isinstance(sid, str) or not sid.strip():
+        raise HTTPException(status_code=400, detail="Preset id required")
+    pid = body.get("preset")
+    base = (
+        dict(get_builtin_preset(str(pid)))
+        if isinstance(pid, str) and get_builtin_preset(pid)
+        else default_caption_style()
+    )
+    override = {k: v for k, v in body.items() if k not in ("id", "name", "preset")}
+    merged = merge_style_dict(base, override)
+    err = validate_caption_style_dict(merged, f"user preset {sid}")
+    if err:
+        raise HTTPException(status_code=400, detail={"errors": err})
+    stem = sid.strip()
+    out: dict[str, Any] = {"id": stem, "name": body.get("name") or stem}
+    for k, v in merged.items():
+        if k not in ("id", "name"):
+            out[k] = v
+    return out
+
+
+@app.put("/api/caption-styles/user/{style_id}")
+def put_user_caption_style(
+    style_id: str,
+    body: dict[str, Any],
+    paths: ProjectPaths = Depends(get_paths),
+) -> dict[str, Any]:
+    body = dict(body)
+    body["id"] = style_id
+    preset = _validate_merged_user_style(body)
+    raw = load_raw(paths.root)
+    lst = raw.get("user_caption_styles")
+    if not isinstance(lst, list):
+        lst = []
+    replaced = False
+    for i, x in enumerate(lst):
+        if isinstance(x, dict) and x.get("id") == style_id:
+            lst[i] = preset
+            replaced = True
+            break
+    if not replaced:
+        lst.append(preset)
+    raw["user_caption_styles"] = lst
+    save_raw(paths.root, raw)
+    log_event("info", f"Saved user caption preset {style_id}")
+    return preset
+
+
+@app.delete("/api/caption-styles/user/{style_id}")
+def delete_user_caption_style(style_id: str, paths: ProjectPaths = Depends(get_paths)) -> dict[str, str]:
+    raw = load_raw(paths.root)
+    lst = raw.get("user_caption_styles")
+    if not isinstance(lst, list):
+        raise HTTPException(status_code=404, detail="No user presets")
+    new_list = [x for x in lst if not (isinstance(x, dict) and x.get("id") == style_id)]
+    if len(new_list) == len(lst):
+        raise HTTPException(status_code=404, detail="Preset not found")
+    raw["user_caption_styles"] = new_list
+    save_raw(paths.root, raw)
+    return {"deleted": style_id}
+
+
+@app.post("/api/captions/ass")
+def captions_build_ass(body: CaptionsAssBody, paths: ProjectPaths = Depends(get_paths)) -> dict[str, Any]:
+    """ASS text using the same generator as export (and optional preview_preset for mini-cards)."""
+    if body.preview_preset is not None:
+        tw = th = None
+        tl = body.timeline
+        if isinstance(tl.get("settings"), dict):
+            s = tl["settings"]
+            tw = s.get("width")
+            th = s.get("height")
+        vw = int(tw) if isinstance(tw, (int, float)) else 1080
+        vh = int(th) if isinstance(th, (int, float)) else 1920
+        ass = sample_preview_ass(body.preview_preset, video_w=vw, video_h=vh)
+        return {"ass": ass, "word_count": 3}
+
+    errs = validate_plan_data(body.timeline, None)
+    if errs:
+        raise HTTPException(status_code=400, detail={"errors": errs})
+    tl = dict(body.timeline)
+    tw = th = None
+    if isinstance(tl.get("settings"), dict):
+        s = tl["settings"]
+        tw = s.get("width")
+        th = s.get("height")
+    vw = int(tw) if isinstance(tw, (int, float)) else 1080
+    vh = int(th) if isinstance(th, (int, float)) else 1920
+    target = body.style_target or "plan"
+    clip_filter = body.clip_ids
+    if target == "clip" and body.style_clip_id and not clip_filter:
+        clip_filter = [body.style_clip_id]
+    with project_cwd(paths):
+        ass = build_ass_for_timeline(
+            tl,
+            style=body.style,
+            clip_ids=clip_filter,
+            style_target=target,
+            style_clip_id=body.style_clip_id,
+            video_w=vw,
+            video_h=vh,
+        )
+        segs = v1_segments_from_data(tl)
+        words_ct = remap_words(segs, plan_data=tl)
+    if clip_filter:
+        allow = set(clip_filter)
+        words_ct = [w for w in words_ct if w.get("_clip_id") in allow]
+    return {"ass": ass, "word_count": len(words_ct)}
+
+
+@app.get("/api/logs")
+def api_logs(since: int = 0, limit: int = 200) -> dict[str, Any]:
+    lim = min(max(limit, 1), 500)
+    entries = get_logs(since=since, limit=lim)
+    return {"entries": entries, "latest_id": last_index()}
+
+
+@app.get("/api/settings")
+def get_settings(paths: ProjectPaths = Depends(get_paths)) -> dict[str, Any]:
+    return get_public_settings(paths.root)
+
+
+@app.put("/api/settings")
+def put_settings(body: SettingsUpdate, paths: ProjectPaths = Depends(get_paths)) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    if body.planner_api_key is not None:
+        payload["planner_api_key"] = body.planner_api_key
+    if body.paths is not None:
+        payload["paths"] = body.paths
+    if body.render_defaults is not None:
+        payload["render_defaults"] = body.render_defaults
+    if body.user_caption_styles is not None:
+        payload["user_caption_styles"] = body.user_caption_styles
+    log_event("info", "Settings updated (non-secret keys only)")
+    merge_settings(paths.root, payload)
+    paths2 = refresh_paths_from_settings()
+    for d in (paths2.footage, paths2.plans, paths2.output):
+        d.mkdir(parents=True, exist_ok=True)
+    return get_public_settings(paths2.root)
+
+
+class PlannerKeyBody(BaseModel):
+    api_key: str
+
+
+@app.put("/api/settings/planner-api-key")
+def put_planner_key(
+    body: PlannerKeyBody,
+    paths: ProjectPaths = Depends(get_paths),
+) -> dict[str, str]:
+    set_planner_api_key(paths.root, body.api_key)
+    log_event("info", "Planner API key stored (value not logged)")
+    return {"ok": "true"}
+
+
+@app.post("/api/settings/test-planner")
+def test_planner(paths: ProjectPaths = Depends(get_paths)) -> dict[str, Any]:
+    key = effective_planner_api_key(paths.root)
+    if not key:
+        raise HTTPException(status_code=400, detail="Planner API key not configured")
+    try:
+        import anthropic
+
+        client = anthropic.Anthropic(api_key=key)
+        client.messages.create(
+            model="claude-sonnet-4-5-20250514",
+            max_tokens=8,
+            messages=[{"role": "user", "content": "Reply with OK only."}],
+        )
+    except Exception as e:
+        log_event("warning", f"Planner test failed: {type(e).__name__}")
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    log_event("info", "Planner API test succeeded")
+    return {"ok": True}
+
+
 @app.get("/api/footage")
 def list_footage(paths: ProjectPaths = Depends(get_paths)) -> dict[str, Any]:
     clips = list_footage_files(paths.root)
-    return {"clips": [footage_entry(paths.root, p) for p in clips]}
+    return {"clips": [_enrich_footage_clip(paths, p) for p in clips]}
+
+
+@app.post("/api/footage/upload")
+async def upload_footage(
+    paths: ProjectPaths = Depends(get_paths),
+    file: UploadFile = File(...),
+) -> dict[str, Any]:
+    """Stream multipart file to footage/ in chunks, validate, queue proxy/thumbnail."""
+    raw_name = file.filename or "upload.mp4"
+    try:
+        base = sanitize_upload_basename(raw_name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    paths.footage.mkdir(parents=True, exist_ok=True)
+    try:
+        dest, final_name = unique_footage_path(paths.footage, base)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    try:
+        with dest.open("wb") as out_f:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                out_f.write(chunk)
+    except OSError as e:
+        if dest.is_file():
+            dest.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    try:
+        ffprobe_validate_video(dest)
+    except RuntimeError as e:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    schedule_proxy_work(
+        paths.root,
+        dest,
+        ensure_proxy=ensure_proxy,
+        ensure_thumbnail=ensure_thumbnail,
+        proxy_is_fresh=proxy_is_fresh,
+        thumbnail_is_fresh=thumbnail_is_fresh,
+        proxy_path_for_clip=proxy_path_for_clip,
+        thumbnail_path_for_clip=thumbnail_path_for_clip,
+    )
+    schedule_waveform_work(paths.root, dest)
+
+    return {"clip": _enrich_footage_clip(paths, dest), "saved_as": final_name}
+
+
+@app.post("/api/footage/rescan")
+def rescan_footage(paths: ProjectPaths = Depends(get_paths)) -> dict[str, Any]:
+    """Ensure proxy/thumbnail for every file in footage/ (e.g. after manual copy)."""
+    paths.footage.mkdir(parents=True, exist_ok=True)
+    queued: list[str] = []
+    for p in list_footage_files(paths.root):
+        proxy = proxy_path_for_clip(paths.root, p)
+        thumb = thumbnail_path_for_clip(paths.root, p)
+        if proxy_is_fresh(p, proxy) and thumbnail_is_fresh(p, thumb):
+            continue
+        schedule_proxy_work(
+            paths.root,
+            p,
+            ensure_proxy=ensure_proxy,
+            ensure_thumbnail=ensure_thumbnail,
+            proxy_is_fresh=proxy_is_fresh,
+            thumbnail_is_fresh=thumbnail_is_fresh,
+            proxy_path_for_clip=proxy_path_for_clip,
+            thumbnail_path_for_clip=thumbnail_path_for_clip,
+        )
+        queued.append(p.name)
+        schedule_waveform_work(paths.root, p)
+    return {"queued": queued}
+
+
+@app.delete("/api/footage/{name}")
+def delete_footage(name: str, paths: ProjectPaths = Depends(get_paths)) -> dict[str, Any]:
+    base = Path(name).name
+    if base != name or not video_extension_allowed(base):
+        raise HTTPException(status_code=400, detail="Invalid footage name")
+
+    clip = paths.footage / base
+    if not clip.is_file():
+        raise HTTPException(status_code=404, detail="Footage not found")
+
+    rel = f"footage/{base}"
+    used_by = plans_referencing_footage(paths.plans, rel)
+    if used_by:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Footage is referenced by one or more plans.",
+                "plans": used_by,
+            },
+        )
+
+    try:
+        clip.unlink()
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    proxy = proxy_path_for_clip(paths.root, clip)
+    thumb = thumbnail_path_for_clip(paths.root, clip)
+    for sidecar in (proxy, thumb):
+        if sidecar.is_file():
+            try:
+                sidecar.unlink()
+            except OSError:
+                pass
+
+    with project_cwd(paths):
+        wf = waveform_path(clip)
+        if wf.is_file():
+            try:
+                wf.unlink()
+            except OSError:
+                pass
+
+    return {"deleted": base}
 
 
 @app.get("/api/footage/{name}/proxy")
@@ -121,6 +572,52 @@ def serve_thumbnail(name: str, paths: ProjectPaths = Depends(get_paths)) -> File
     return FileResponse(thumb, media_type="image/jpeg", filename=thumb.name)
 
 
+@app.get("/api/footage/{name}/waveform")
+def get_footage_waveform(name: str, paths: ProjectPaths = Depends(get_paths)) -> dict[str, Any]:
+    """Peak envelope JSON (~100 peaks/sec). Queues background job until cache is ready."""
+    base = Path(name).name
+    if base != name:
+        raise HTTPException(status_code=400, detail="Invalid footage name")
+    clip = paths.footage / base
+    if not clip.is_file():
+        raise HTTPException(status_code=404, detail="Footage not found")
+
+    with project_cwd(paths):
+        from index_cache import load_json, waveform_path
+        from media import clip_metadata
+
+        wf_job = get_waveform_job(base)
+        if wf_job and wf_job.get("status") == "failed":
+            return {
+                "status": "failed",
+                "error": wf_job.get("error"),
+            }
+
+        try:
+            duration, has_audio, _rotation = clip_metadata(clip)
+        except (RuntimeError, OSError):
+            raise HTTPException(
+                status_code=400, detail="Could not read media metadata"
+            ) from None
+        if not has_audio:
+            return {
+                "status": "ready",
+                "has_audio": False,
+                "duration": round(float(duration), 6),
+                "sample_rate_hz_of_peaks": 100.0,
+                "peaks": [],
+            }
+
+        wpath = waveform_path(clip)
+        if wpath.is_file() and wpath.stat().st_mtime >= clip.stat().st_mtime:
+            data = load_json(wpath)
+            if isinstance(data, dict) and data:
+                return {"status": "ready", **data}
+
+        schedule_waveform_work(paths.root, clip)
+        return {"status": "processing"}
+
+
 @app.get("/api/plans")
 def list_plans(paths: ProjectPaths = Depends(get_paths)) -> dict[str, Any]:
     paths.plans.mkdir(parents=True, exist_ok=True)
@@ -135,7 +632,23 @@ def load_timeline(name: str, paths: ProjectPaths = Depends(get_paths)) -> dict[s
         raise HTTPException(status_code=404, detail="Plan not found")
     data = json.loads(path.read_text())
     if not is_v2(data):
-        raise HTTPException(status_code=400, detail="Plan is not schema v2")
+        # Legacy v1 (list or { segments }) — convert in memory so the editor loads;
+        # disk is upgraded when the user saves (PUT).
+        try:
+            data = convert_plan_v1_to_v2(data)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Plan is not schema v2 and could not be auto-converted: {e}",
+            ) from e
+        with project_cwd(paths):
+            errors = validate_plan_data(data, None)
+        if errors:
+            raise HTTPException(
+                status_code=400,
+                detail={"errors": errors, "message": "Converted plan failed validation"},
+            )
+        log_event("info", f"Auto-converted v1 plan to v2 for load: {path.name}")
     return data
 
 
@@ -157,6 +670,73 @@ def save_timeline(
     return {"saved": path.name}
 
 
+@app.delete("/api/plans/{name}")
+def delete_plan(name: str, paths: ProjectPaths = Depends(get_paths)) -> dict[str, str]:
+    if any_active_render():
+        raise HTTPException(status_code=409, detail="A render is in progress")
+    path = paths.plan_file(name)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Plan not found")
+    try:
+        path.unlink()
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    log_event("info", f"Deleted plan {path.name}")
+    return {"deleted": path.stem}
+
+
+@app.patch("/api/plans/{name}/rename")
+def rename_plan(
+    name: str,
+    body: PlanRenameBody,
+    paths: ProjectPaths = Depends(get_paths),
+) -> dict[str, str]:
+    if any_active_render():
+        raise HTTPException(status_code=409, detail="A render is in progress")
+    src = paths.plan_file(name)
+    if not src.is_file():
+        raise HTTPException(status_code=404, detail="Plan not found")
+    raw = body.to.strip()
+    stem = Path(raw).stem
+    if not stem or "/" in stem or "\\" in stem:
+        raise HTTPException(status_code=400, detail="Invalid target name")
+    dst = paths.plan_file(stem)
+    if dst.is_file():
+        raise HTTPException(status_code=409, detail="Target plan already exists")
+    try:
+        src.rename(dst)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    log_event("info", f"Renamed plan {src.name} -> {dst.name}")
+    return {"name": dst.stem}
+
+
+@app.post("/api/plans/{name}/duplicate")
+def duplicate_plan(
+    name: str,
+    body: PlanDuplicateBody,
+    paths: ProjectPaths = Depends(get_paths),
+) -> dict[str, str]:
+    if any_active_render():
+        raise HTTPException(status_code=409, detail="A render is in progress")
+    src = paths.plan_file(name)
+    if not src.is_file():
+        raise HTTPException(status_code=404, detail="Plan not found")
+    raw = body.to.strip()
+    stem = Path(raw).stem
+    if not stem or "/" in stem or "\\" in stem:
+        raise HTTPException(status_code=400, detail="Invalid target name")
+    dst = paths.plan_file(stem)
+    if dst.is_file():
+        raise HTTPException(status_code=409, detail="Target plan already exists")
+    try:
+        shutil.copy2(src, dst)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    log_event("info", f"Duplicated plan -> {dst.name}")
+    return {"name": dst.stem}
+
+
 @app.post("/api/timeline/apply-op")
 def apply_operation(body: ApplyOpRequest) -> dict[str, Any]:
     try:
@@ -171,9 +751,13 @@ def run_planner(
     body: PlannerRequest,
     paths: ProjectPaths = Depends(get_paths),
 ) -> dict[str, Any]:
+    api_key = effective_planner_api_key(paths.root)
     with project_cwd(paths):
         try:
-            plan_v2, group_id, usage = generate_plan(body.brief)
+            plan_v2, group_id, usage = generate_plan(
+                body.brief,
+                api_key=api_key,
+            )
         except RuntimeError as e:
             raise HTTPException(status_code=503, detail=str(e))
         except ValueError as e:
@@ -183,6 +767,7 @@ def run_planner(
     path = paths.plan_file(body.save_as)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(plan_v2, indent=2, ensure_ascii=False) + "\n")
+    log_event("info", f"Planner wrote {path.name}")
     return {
         "plan_name": path.name,
         "group_id": group_id,
@@ -191,30 +776,43 @@ def run_planner(
     }
 
 
-@app.post("/api/render")
-def render_export(
+def _run_render_job(
+    job_id: str,
+    paths: ProjectPaths,
     body: RenderRequest,
-    paths: ProjectPaths = Depends(get_paths),
-) -> dict[str, str]:
-    if not body.plan_name and not body.timeline:
-        raise HTTPException(status_code=400, detail="Provide plan_name or timeline")
+    out_path: Path,
+) -> None:
+    on_prog = bind_progress(job_id)
+    cancel_ev = get_cancel_event(job_id)
 
-    out_path = paths.output_file(body.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    def tick(pct: float | None) -> None:
+        on_prog(pct, "")
 
-    with project_cwd(paths):
-        try:
+    try:
+        update_job(job_id, state="running", percent=0.0)
+        with project_cwd(paths):
+            defaults = effective_render_defaults(paths.root)
+            caps = body.captions if body.captions is not None else bool(
+                defaults.get("captions", False)
+            )
+            max_len = (
+                body.max_length
+                if body.max_length is not None
+                else defaults.get("max_length")
+            )
             if body.timeline is not None:
                 plan_path = None
-                if body.captions and body.plan_name:
+                if caps and body.plan_name:
                     plan_path = paths.plan_file(body.plan_name)
                 render_plan_data(
                     body.timeline,
                     out_path,
                     root=paths.root,
-                    captions=body.captions,
-                    max_length=body.max_length,
+                    captions=caps,
+                    max_length=max_len,
                     plan_path_for_captions=plan_path,
+                    cancel_event=cancel_ev,
+                    on_timeline_progress=tick,
                 )
             else:
                 assert body.plan_name
@@ -222,21 +820,138 @@ def render_export(
                     paths.plan_file(body.plan_name),
                     out_path,
                     root=paths.root,
-                    captions=body.captions,
-                    max_length=body.max_length,
+                    captions=caps,
+                    max_length=max_len,
+                    cancel_event=cancel_ev,
+                    on_timeline_progress=tick,
                 )
-        except FileNotFoundError as e:
-            raise HTTPException(status_code=404, detail=str(e))
-        except ValueError as e:
-            detail = e.args[0] if e.args and isinstance(e.args[0], list) else str(e)
-            raise HTTPException(status_code=400, detail=detail)
-        except RuntimeError as e:
-            raise HTTPException(status_code=500, detail=str(e))
+    except RuntimeError as e:
+        err = str(e)
+        if "cancelled" in err.lower():
+            update_job(job_id, state="cancelled", error=None, percent=None)
+            if out_path.is_file():
+                try:
+                    out_path.unlink()
+                except OSError:
+                    pass
+            log_event("info", f"Render job {job_id} cancelled")
+            return
+        update_job(job_id, state="failed", error=err, percent=None, log_append=err + "\n")
+        log_event("error", f"Render job {job_id} failed: {err[:500]}")
+        return
+    except FileNotFoundError as e:
+        update_job(job_id, state="failed", error=str(e))
+        return
+    except ValueError as e:
+        detail = e.args[0] if e.args and isinstance(e.args[0], list) else str(e)
+        err = str(detail)
+        update_job(job_id, state="failed", error=err)
+        return
 
-    return {
-        "output": str(out_path.relative_to(paths.root)),
-        "url": f"/api/output/{out_path.name}",
-    }
+    rel = str(out_path.relative_to(paths.root))
+    url = f"/api/output/{out_path.name}"
+    update_job(
+        job_id,
+        state="done",
+        percent=100.0,
+        output=rel,
+        url=url,
+    )
+    log_event("info", f"Render job {job_id} done -> {out_path.name}")
+
+
+@app.post("/api/render")
+def start_render(
+    body: RenderRequest,
+    paths: ProjectPaths = Depends(get_paths),
+) -> dict[str, Any]:
+    if not body.plan_name and not body.timeline:
+        raise HTTPException(status_code=400, detail="Provide plan_name or timeline")
+
+    out_path = paths.output_file(body.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    job_id, _ = create_job()
+    update_job(job_id, state="queued")
+
+    def runner() -> None:
+        _run_render_job(job_id, paths, body, out_path)
+
+    threading.Thread(target=runner, name=f"render-{job_id}", daemon=True).start()
+    return {"job_id": job_id}
+
+
+@app.get("/api/render/{job_id}")
+def render_status(job_id: str) -> dict[str, Any]:
+    pub = get_job_public(job_id)
+    if not pub:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return pub
+
+
+@app.post("/api/render/{job_id}/cancel")
+def cancel_render(job_id: str) -> dict[str, str]:
+    ok = request_cancel(job_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Job not found")
+    log_event("info", f"Cancel requested for render {job_id}")
+    return {"ok": "true"}
+
+
+@app.get("/api/output")
+def list_output_files(paths: ProjectPaths = Depends(get_paths)) -> dict[str, Any]:
+    paths.output.mkdir(parents=True, exist_ok=True)
+    files: list[dict[str, Any]] = []
+    for p in sorted(paths.output.iterdir()):
+        if not p.is_file():
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        files.append(
+            {
+                "name": p.name,
+                "size_bytes": st.st_size,
+                "download_url": f"/api/output/{p.name}",
+            }
+        )
+    return {"files": files}
+
+
+@app.delete("/api/output/{name}")
+def delete_output(name: str, paths: ProjectPaths = Depends(get_paths)) -> dict[str, str]:
+    base = Path(name).name
+    if base != name:
+        raise HTTPException(status_code=400, detail="Invalid name")
+    path = paths.output / base
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Output not found")
+    try:
+        path.unlink()
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    log_event("info", f"Deleted output {base}")
+    return {"deleted": base}
+
+
+@app.post("/api/desktop/reveal-output")
+def reveal_output_folder(request: Request, paths: ProjectPaths = Depends(get_paths)) -> dict[str, str]:
+    if not _client_host_allowed(request):
+        raise HTTPException(status_code=403, detail="Localhost only")
+    paths.output.mkdir(parents=True, exist_ok=True)
+    target = str(paths.output.resolve())
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif sys.platform.startswith("win"):
+            os.startfile(target)  # type: ignore[attr-defined]
+        else:
+            subprocess.Popen(["xdg-open", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    log_event("info", "Opened output folder via desktop API")
+    return {"opened": target}
 
 
 @app.get("/api/output/{name}")

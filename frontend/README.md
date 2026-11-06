@@ -31,4 +31,5 @@ Optional: pre-build proxies with `python scripts/make_proxies.py`.
 |---------|---------|
 | `npm run dev` | Dev server with HMR |
 | `npm run build` | Production build to `dist/` |
+| `npm run test` | Vitest (store + API mocks) |
 | `npm run preview` | Serve production build |

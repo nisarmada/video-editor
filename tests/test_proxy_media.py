@@ -17,6 +17,7 @@ def test_footage_entry_lists_urls(tmp_path: Path):
     assert entry["name"] == "demo.mp4"
     assert entry["source"] == "footage/demo.mp4"
     assert entry["has_proxy"] is False
+    assert entry["process_status"] == "pending"
     assert "/api/footage/demo.mp4/proxy" in entry["proxy_url"]
 
 

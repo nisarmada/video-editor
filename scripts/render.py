@@ -13,7 +13,8 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from captions import build_ass, caption_events, load_segments, remap_words  # noqa: E402
+from caption_style_resolve import fonts_bundle_dir  # noqa: E402
+from captions import build_ass, caption_events, load_plan_data, load_segments, remap_words  # noqa: E402
 from media import TimelinePiece, burn_captions, render_timeline  # noqa: E402
 from timeline_format import (  # noqa: E402
     TIMELINE_GAP_SOURCE,
@@ -138,14 +139,32 @@ def main() -> None:
             if args.captions == "AUTO"
             else Path(args.captions)
         )
-        words = remap_words(load_segments(plan_path))
-        events = caption_events(words)
+        pdata = load_plan_data(plan_path)
+        segs = load_segments(plan_path)
+        words = remap_words(segs, plan_data=pdata)
+        events = caption_events(words, plan_data=pdata)
+        tw = th = None
+        if isinstance(pdata, dict) and isinstance(pdata.get("settings"), dict):
+            s = pdata["settings"]
+            tw = s.get("width")
+            th = s.get("height")
+        vw = int(tw) if isinstance(tw, (int, float)) else 1080
+        vh = int(th) if isinstance(th, (int, float)) else 1920
         if not ass_path.is_file():
             print(f"Generating captions -> {ass_path}")
-            ass_path.write_text(build_ass(words), encoding="utf-8")
+            ass_path.write_text(
+                build_ass(words, plan_data=pdata, video_w=vw, video_h=vh),
+                encoding="utf-8",
+            )
         print(f"Burning subtitles ({len(events)} events): {ass_path}")
         try:
-            burn_captions(render_target, output_path, events, ass_path=ass_path)
+            burn_captions(
+                render_target,
+                output_path,
+                events,
+                ass_path=ass_path,
+                fonts_dir=fonts_bundle_dir(),
+            )
         except RuntimeError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)

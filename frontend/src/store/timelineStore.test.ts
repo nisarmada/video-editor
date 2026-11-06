@@ -93,6 +93,8 @@ describe("timeline undo/redo", () => {
       outputDownloadUrl: null,
       plannerRunning: false,
       plannerError: null,
+      captionPreviewClipOnly: false,
+      captionSafeAreaGuide: false,
     });
   });
 

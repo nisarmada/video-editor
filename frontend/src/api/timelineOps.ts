@@ -1,8 +1,10 @@
 import type { TimelineV2 } from "../timeline/types";
+import { parseFastApiErrorBody } from "./httpError";
 
 /** Response from POST /api/timeline/apply-op */
 export type ApplyOpResult = {
   timeline: TimelineV2;
+  /** Inverse op payload from the server (`docs/commands.md`). */
   undo: Record<string, unknown>;
 };
 
@@ -22,7 +24,10 @@ export async function applyTimelineOperation(
   });
   if (!res.ok) {
     const detail = await res.text();
-    throw new Error(detail || `apply-op failed (${res.status})`);
+    const msg = parseFastApiErrorBody(detail) || `apply-op failed (${res.status})`;
+    const err = new Error(msg);
+    (err as Error & { status?: number }).status = res.status;
+    throw err;
   }
   return (await res.json()) as ApplyOpResult;
 }

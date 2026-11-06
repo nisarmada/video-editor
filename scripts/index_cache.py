@@ -34,6 +34,11 @@ def merged_index_path(video: Path) -> Path:
     return index_dir() / f"{video.stem}.json"
 
 
+def waveform_path(video: Path) -> Path:
+    """Cached peak envelope JSON for timeline waveforms (next to other index artifacts)."""
+    return index_dir() / f"{video.stem}_waveform.json"
+
+
 def keyframes_dir(video: Path) -> Path:
     return index_dir() / "keyframes" / video.stem
 
@@ -47,6 +52,15 @@ def load_json(path: Path) -> dict | list | None:
 def save_json(path: Path, payload: dict | list) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+
+
+def save_json_atomic(path: Path, payload: dict | list) -> None:
+    """Write JSON via a temp file then replace, so readers never see a half-written file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    data = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    tmp.write_text(data, encoding="utf-8")
+    tmp.replace(path)
 
 
 def cache_hit(path: Path, force: bool) -> bool:

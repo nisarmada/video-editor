@@ -8,6 +8,7 @@ import {
   timelineEnd,
   timelineToSourceSeconds,
 } from "../timeline/duration";
+import { useCaptionPreviewOverlay } from "../hooks/useCaptionPreviewOverlay";
 import { useTimelineStore } from "../store/timelineStore";
 import { formatTimecode } from "../utils/timeFormat";
 
@@ -19,6 +20,9 @@ export default function TimelineVideoPreview() {
   const playing = useTimelineStore((s) => s.timelinePlaying);
   const setPlaying = useTimelineStore((s) => s.setTimelinePlaying);
   const togglePlaying = useTimelineStore((s) => s.toggleTimelinePlaying);
+  const previewClipOnly = useTimelineStore((s) => s.captionPreviewClipOnly);
+  const selectedClipId = useTimelineStore((s) => s.selectedClipId);
+  const safeAreaGuide = useTimelineStore((s) => s.captionSafeAreaGuide);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const clipsRef = useRef(getSortedVideoClips(timeline));
@@ -43,6 +47,16 @@ export default function TimelineVideoPreview() {
   const proxyUrl = activeClip?.source
     ? proxyUrlFromSource(activeClip.source)
     : null;
+
+  useCaptionPreviewOverlay({
+    videoRef,
+    timeline,
+    playheadSeconds: playhead,
+    previewClipOnly,
+    selectedClipId,
+    enabled: true,
+    debounceMs: 280,
+  });
 
   // Load proxy / seek when clip or paused scrub position changes (not every tick while playing).
   useEffect(() => {
@@ -210,14 +224,19 @@ export default function TimelineVideoPreview() {
       </div>
 
       <div className="preview-frame preview-frame--video preview-frame--timeline">
-        <video
-          ref={videoRef}
-          className={`preview-video${inGap ? " preview-video--hidden" : ""}`}
-          playsInline
-          preload="auto"
-          muted
-          onClick={onToggle}
-        />
+        <div
+          className={`preview-video-wrap${safeAreaGuide ? " preview-video-wrap--safe" : ""}`}
+        >
+          <video
+            ref={videoRef}
+            className={`preview-video${inGap ? " preview-video--hidden" : ""}`}
+            playsInline
+            preload="auto"
+            muted
+            onClick={onToggle}
+          />
+          {safeAreaGuide && <div className="preview-safe-area" aria-hidden />}
+        </div>
       </div>
 
       <div className="preview-controls">

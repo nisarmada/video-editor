@@ -187,14 +187,16 @@ def call_claude(
     model: str,
     system: str,
     user: str,
+    *,
+    api_key: str | None = None,
 ) -> tuple[str, object]:
     import anthropic
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
+    key = (api_key or "").strip() or os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not key:
         raise RuntimeError("ANTHROPIC_API_KEY not set in .env")
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = anthropic.Anthropic(api_key=key)
     response = client.messages.create(
         model=model,
         max_tokens=8192,
@@ -235,7 +237,7 @@ def finalize_v2_plan(v1_plan: dict, brief: str, run_group_id: str) -> dict:
     return v2
 
 
-def generate_plan(brief: str) -> tuple[dict, str, dict]:
+def generate_plan(brief: str, *, api_key: str | None = None) -> tuple[dict, str, dict]:
     """
     Call Claude, validate, return v2 plan, group_id, and token usage tallies.
     Requires cwd = project root (footage/, index/).
@@ -262,7 +264,9 @@ def generate_plan(brief: str) -> tuple[dict, str, dict]:
 
     for i, current_model in enumerate(model_candidates):
         try:
-            text, usage = call_claude(current_model, SYSTEM_PROMPT, user_prompt)
+            text, usage = call_claude(
+                current_model, SYSTEM_PROMPT, user_prompt, api_key=api_key
+            )
             model_used = current_model
             break
         except Exception as e:
@@ -293,7 +297,9 @@ def generate_plan(brief: str) -> tuple[dict, str, dict]:
             + "\n\nReturn a corrected JSON object only."
         )
         try:
-            text, usage2 = call_claude(model_used, SYSTEM_PROMPT, fix_prompt)
+            text, usage2 = call_claude(
+                model_used, SYSTEM_PROMPT, fix_prompt, api_key=api_key
+            )
         except Exception as e:
             raise RuntimeError(f"Planner API error on fix pass: {e}") from e
         if usage2:

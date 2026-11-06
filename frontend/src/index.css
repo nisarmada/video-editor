@@ -25,18 +25,43 @@ body {
 }
 
 :root {
-  --bg-app: #0f1115;
-  --bg-panel: #161a22;
-  --bg-panel-header: #1c212b;
-  --border: #2a3140;
-  --border-strong: #3d4659;
-  --text-primary: #e8eaed;
-  --text-muted: #8b95a8;
-  --accent: #5b8def;
-  --resize-grip: #252b38;
+  /* CapCut-inspired dark shell */
+  --bg-app: #090a0c;
+  --bg-panel: #12141a;
+  --bg-panel-header: #16181f;
+  --bg-elevated: #1a1d26;
+  --border: #2a2f3a;
+  --border-strong: #3d4452;
+  --text-primary: #eceef2;
+  --text-muted: #8a919f;
+  --accent: #00c2cb;
+  --accent-hover: #33d4dc;
+  --accent-muted: rgba(0, 194, 203, 0.15);
+  --danger: #f04e4e;
+  --na-pill-bg: rgba(255, 180, 70, 0.12);
+  --na-pill-border: rgba(255, 180, 70, 0.35);
+  --na-pill-text: #e8b565;
 }
 
 button {
   font: inherit;
-  cursor: default;
+}
+
+button:enabled {
+  cursor: pointer;
+}
+
+a {
+  color: var(--accent);
+}
+
+input,
+textarea,
+select {
+  font: inherit;
+  color: var(--text-primary);
+  background: var(--bg-app);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
 }

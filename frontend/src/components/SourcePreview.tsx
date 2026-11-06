@@ -1,9 +1,16 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { useSelectedFootage } from "../store/editorStore";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useTimelineStore } from "../store/timelineStore";
 import { formatDuration, formatTimecode } from "../utils/timeFormat";
 
 export default function SourcePreview() {
-  const clip = useSelectedFootage();
+  const selectedName = useTimelineStore((s) => s.selectedFootageName);
+  const clips = useTimelineStore((s) => s.footageClips);
+
+  const clip = useMemo(() => {
+    if (!selectedName) return null;
+    return clips.find((c) => c.name === selectedName) ?? null;
+  }, [selectedName, clips]);
+
   const videoRef = useRef<HTMLVideoElement>(null);
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -65,67 +72,64 @@ export default function SourcePreview() {
 
   const maxTime = displayDuration && displayDuration > 0 ? displayDuration : 0;
 
-  return (
-    <section className="panel panel--preview" aria-label="Preview">
-      <div className="panel__header">Preview — source</div>
-      <div className="panel__body panel__body--preview">
-        {!clip ? (
-          <div className="preview-empty">
-            Select a clip in the media bin to preview its 540p proxy.
-          </div>
-        ) : (
-          <div className="source-preview">
-            <div className="source-preview__meta">
-              <span className="source-preview__filename" title={clip.name}>
-                {clip.name}
-              </span>
-              <span className="source-preview__duration">
-                {formatDuration(displayDuration)}
-              </span>
-            </div>
-
-            <div className="preview-frame preview-frame--video">
-              <video
-                ref={videoRef}
-                className="preview-video"
-                playsInline
-                preload="metadata"
-                onTimeUpdate={onTimeUpdate}
-                onLoadedMetadata={onLoadedMetadata}
-                onPlay={onPlay}
-                onPause={onPause}
-                onClick={togglePlay}
-              />
-            </div>
-
-            <div className="preview-controls">
-              <button
-                type="button"
-                className="preview-controls__play"
-                onClick={togglePlay}
-                aria-label={playing ? "Pause" : "Play"}
-              >
-                {playing ? "Pause" : "Play"}
-              </button>
-              <span className="preview-controls__time">
-                {formatTimecode(currentTime)} / {formatTimecode(maxTime || currentTime)}
-              </span>
-            </div>
-
-            <input
-              type="range"
-              className="preview-scrubber"
-              min={0}
-              max={maxTime || 1}
-              step={0.05}
-              value={Math.min(currentTime, maxTime || 0)}
-              disabled={maxTime <= 0}
-              onChange={(e) => onScrub(Number(e.target.value))}
-              aria-label="Scrub source video"
-            />
-          </div>
-        )}
+  if (!clip) {
+    return (
+      <div className="preview-empty">
+        Select a clip in the media bin to preview its 540p proxy.
       </div>
-    </section>
+    );
+  }
+
+  return (
+    <div className="source-preview">
+      <div className="source-preview__meta">
+        <span className="source-preview__filename" title={clip.name}>
+          {clip.name}
+        </span>
+        <span className="source-preview__duration">
+          {formatDuration(displayDuration)}
+        </span>
+      </div>
+
+      <div className="preview-frame preview-frame--video">
+        <video
+          ref={videoRef}
+          className="preview-video"
+          playsInline
+          preload="metadata"
+          onTimeUpdate={onTimeUpdate}
+          onLoadedMetadata={onLoadedMetadata}
+          onPlay={onPlay}
+          onPause={onPause}
+          onClick={togglePlay}
+        />
+      </div>
+
+      <div className="preview-controls">
+        <button
+          type="button"
+          className="preview-controls__play"
+          onClick={togglePlay}
+          aria-label={playing ? "Pause" : "Play"}
+        >
+          {playing ? "Pause" : "Play"}
+        </button>
+        <span className="preview-controls__time">
+          {formatTimecode(currentTime)} / {formatTimecode(maxTime || currentTime)}
+        </span>
+      </div>
+
+      <input
+        type="range"
+        className="preview-scrubber"
+        min={0}
+        max={maxTime || 1}
+        step={0.05}
+        value={Math.min(currentTime, maxTime || 0)}
+        disabled={maxTime <= 0}
+        onChange={(e) => onScrub(Number(e.target.value))}
+        aria-label="Scrub source video"
+      />
+    </div>
   );
 }

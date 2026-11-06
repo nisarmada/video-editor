@@ -19,11 +19,44 @@ CapCut-style multi-track timelines for the visual editor. **v1 plans remain supp
 {
   "width": 1080,
   "height": 1920,
-  "fps": 30
+  "fps": 30,
+  "caption_style": {
+    "preset": "bold_pop",
+    "font_size": 0.045
+  }
 }
 ```
 
-Defaults match the current renderer: 1080×1920 @ 30 fps.
+Defaults match the current renderer: 1080×1920 @ 30 fps. Omitting `caption_style` uses built-in **Bold Pop** (`bold_pop`).
+
+#### `settings.caption_style` (optional)
+
+Burn-in captions (when export has captions enabled) use `scripts/captions_ass.py` + libass. Fields are validated server-side (`scripts/caption_style.py`).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `preset` | string | Built-in preset id from `backend/caption_presets/` (default `bold_pop`) |
+| `font_family` | string | Logical family (Montserrat, Poppins, Inter, Oswald, Anton, Bebas Neue, Bangers, …) — must match a bundled OFL font |
+| `font_size` | number | Size as **fraction of video height** (e.g. `0.04` ≈ 4% of height) |
+| `bold`, `italic`, `uppercase` | bool | Typography |
+| `text_color`, `active_word_color`, `outline_color`, `shadow_color`, `box_color` | `#RRGGBB` | Colors |
+| `outline_width`, `box_opacity`, `box_padding` | number | Outline / box |
+| `shadow_offset` | `[x, y]` | Shadow pixels |
+| `position_y` | number | Vertical anchor as **percent from top** (0–100), safe margins in renderer |
+| `max_words_per_line` | int | 1–5 |
+| `max_lines` | int | 1–5 (chunking uses `max_words_per_line`) |
+| `line_spacing` | number | Line spacing factor (reserved for multi-line) |
+| `animation` | string | `none`, `word_highlight`, `word_pop`, `word_box`, `karaoke_sweep`, `typewriter`, `bounce_in`, `fade_in`, `neon` |
+| `animation_intensity` | number | 0–1 |
+| `active_word_scale` | number | ~1.0–1.4 for pop/bounce |
+
+#### Per-clip `style_override` (optional, **video** clips)
+
+Override any of the same keys as `settings.caption_style` for that clip only (merged on top of the plan style).
+
+| Field | Tracks | Description |
+|-------|--------|-------------|
+| `style_override` | video | Partial `caption_style` fields |
 
 ## Tracks
 
@@ -62,11 +95,12 @@ Common fields:
 
 | Field | Tracks | Description |
 |-------|--------|-------------|
-| `zoom` | video | Scale factor (e.g. `1.15` punch-in). Renderer: reserved |
-| `speed` | video, audio | Playback speed (`1.0` = normal). Renderer: reserved |
-| `volume` | audio, video | `0.0`–`1.0` (relative). Renderer: reserved |
+| `zoom` | video | Scale factor (e.g. `1.15` punch-in). Renderer: centered crop then scale back to frame (`scripts/media.py`, `_zoom_punch_filter`) |
+| `speed` | video, audio | Playback speed (`1.0` = normal). Renderer: `setpts` + `atempo` on video/audio cuts (`scripts/media.py`, `build_timeline_filter_graph`) |
+| `volume` | audio, video | Linear gain (`1.0` = unity; `0` = silence). Renderer: FFmpeg `volume` on clip audio (`scripts/media.py`, `_volume_filter_expr`) |
 | `text` | caption | Caption string |
 | `caption` | video | Legacy-friendly short caption note (planner) |
+| `style_override` | video | Optional partial caption style for burn-in |
 
 ### Clip duration on the timeline
 
@@ -170,10 +204,10 @@ python scripts/convert_v1_to_v2.py plans/draft1.json plans/draft1_v2.json
 - Video/audio: `source`, `source_in`, `source_out`; `source_in < source_out`; min length 0.3s
 - Clips on the **same track** must not overlap in timeline time
 - `source` paths must exist; `source_out` within file duration
-- **Render** uses the **video** track only today (sorted by `timeline_start`); gaps on the timeline are not filled with black yet
+- **Render** uses the **video** track for picture (sorted by `timeline_start`); timeline gaps become black + silent segments (`scripts/timeline_format.py`, `flatten_v2_to_v1_segments` / `TIMELINE_GAP_SOURCE`; `scripts/media.py`)
 
 ## Renderer notes
 
 - **v1**: unchanged — concat segments in order
-- **v2**: video track clips sorted by `timeline_start`; optional fields `zoom`, `speed`, `volume` are stored for the editor and ignored by FFmpeg until implemented
+- **v2**: video track sorted by `timeline_start`; per-clip **`speed`**, **`volume`**, and **`zoom`** are applied in FFmpeg (`scripts/media.py`). Top-level **`settings`** is stored on plans but the renderer still uses built-in **1080×1920 @ 30 fps** constants until it reads `settings`.
 - **`--captions`**: still builds word captions from video cuts + transcripts (same as v1 flatten)

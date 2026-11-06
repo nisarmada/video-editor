@@ -1,6 +1,6 @@
 import { parseFastApiErrorBody } from "./httpError";
 
-/** POST /api/render body (RenderRequest) — either plan_name or timeline on server. */
+/** POST /api/render body — either plan_name or timeline on server. */
 export type RenderPlanRequest = {
   plan_name: string;
   output: string;
@@ -8,18 +8,27 @@ export type RenderPlanRequest = {
   max_length?: number | null;
 };
 
-export type RenderPlanResponse = {
-  /** Relative path under project root, e.g. `output/foo.mp4` */
-  output: string;
-  /** URL path to download, e.g. `/api/output/foo.mp4` */
-  url: string;
+export type RenderJobPublic = {
+  id: string;
+  state: string;
+  percent: number | null;
+  error: string | null;
+  log: string;
+  output: string | null;
+  url: string | null;
 };
 
-/**
- * POST /api/render — runs FFmpeg synchronously until the handler returns.
- * On failure: 400/404/500 with FastAPI `detail` (string or list).
- */
-export async function renderPlan(body: RenderPlanRequest): Promise<RenderPlanResponse> {
+async function readError(res: Response): Promise<never> {
+  const text = await res.text();
+  throw new Error(
+    parseFastApiErrorBody(text) || `Request failed (${res.status})`,
+  );
+}
+
+/** Starts background render; poll with {@link getRenderJob}. */
+export async function startRender(
+  body: RenderPlanRequest,
+): Promise<{ job_id: string }> {
   const res = await fetch("/api/render", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -30,9 +39,20 @@ export async function renderPlan(body: RenderPlanRequest): Promise<RenderPlanRes
       max_length: body.max_length ?? undefined,
     }),
   });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(parseFastApiErrorBody(text) || `Render failed (${res.status})`);
-  }
-  return (await res.json()) as RenderPlanResponse;
+  if (!res.ok) return readError(res);
+  return (await res.json()) as { job_id: string };
+}
+
+export async function getRenderJob(jobId: string): Promise<RenderJobPublic> {
+  const res = await fetch(`/api/render/${encodeURIComponent(jobId)}`);
+  if (!res.ok) return readError(res);
+  return (await res.json()) as RenderJobPublic;
+}
+
+export async function cancelRenderJob(jobId: string): Promise<void> {
+  const res = await fetch(
+    `/api/render/${encodeURIComponent(jobId)}/cancel`,
+    { method: "POST" },
+  );
+  if (!res.ok) return readError(res);
 }

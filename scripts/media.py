@@ -5,9 +5,14 @@ Shared FFmpeg helpers: probe metadata, cut, join, and render timeline plans.
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -119,6 +124,99 @@ def run_ffmpeg(cmd: list[str]) -> None:
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "ffmpeg failed")
+
+
+def run_ffmpeg_with_progress(
+    cmd: list[str],
+    *,
+    cancel_event: threading.Event | None = None,
+    on_progress: Callable[[float | None], None] | None = None,
+) -> None:
+    """
+    Run ffmpeg with -progress to a temp file; parse out_time_ms vs duration for percent.
+    """
+    if len(cmd) < 2 or cmd[0] != "ffmpeg":
+        raise ValueError("Expected ffmpeg command")
+
+    fd, prog_tmp = tempfile.mkstemp(suffix="_ffprogress.txt")
+    os.close(fd)
+    prog_path = Path(prog_tmp)
+
+    try:
+        # Insert -progress and -nostats before the final output argument
+        out_arg = cmd[-1]
+        core = cmd[:-1] + ["-progress", str(prog_path), "-nostats", out_arg]
+
+        proc = subprocess.Popen(
+            core,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        duration_sec: float | None = None
+        stderr_chunks: list[str] = []
+
+        def pump_stderr() -> None:
+            if proc.stderr:
+                for line in proc.stderr:
+                    stderr_chunks.append(line)
+
+        err_t = threading.Thread(target=pump_stderr, daemon=True)
+        err_t.start()
+
+        def parse_progress_file() -> tuple[float | None, float | None]:
+            nonlocal duration_sec
+            try:
+                raw = prog_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return None, duration_sec
+            dur_m = re.search(r"^duration=(\d+(?:\.\d+)?)\s*$", raw, re.MULTILINE)
+            if dur_m:
+                try:
+                    duration_sec = float(dur_m.group(1))
+                except ValueError:
+                    pass
+            time_m = None
+            for m in re.finditer(r"^out_time_ms=(\d+)\s*$", raw, re.MULTILINE):
+                time_m = m
+            if not time_m:
+                return None, duration_sec
+            try:
+                ms = float(time_m.group(1))
+            except ValueError:
+                return None, duration_sec
+            return ms / 1_000_000.0, duration_sec
+
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                raise RuntimeError("Render cancelled")
+
+            code = proc.poll()
+            t_sec, dur = parse_progress_file()
+            pct: float | None = None
+            if dur is not None and dur > 1e-6 and t_sec is not None:
+                pct = max(0.0, min(100.0, (t_sec / dur) * 100.0))
+            elif on_progress:
+                pct = None
+            if on_progress:
+                on_progress(pct)
+
+            if code is not None:
+                break
+            time.sleep(0.25)
+
+        err_t.join(timeout=2)
+        if proc.returncode != 0:
+            err_tail = "".join(stderr_chunks)[-4000:].strip()
+            raise RuntimeError(err_tail or "ffmpeg failed")
+    finally:
+        prog_path.unlink(missing_ok=True)
 
 
 def cut_segment(
@@ -394,27 +492,45 @@ def _ffmpeg_supports_filter(name: str) -> bool:
     return name in result.stdout
 
 
+def ffmpeg_has_libass() -> bool:
+    """True if subtitles filter is available (libass)."""
+    return _ffmpeg_supports_filter("subtitles")
+
+
+def _escape_subtitles_path(p: Path) -> str:
+    """Path segment for subtitles= filter (POSIX slashes; escape :, ', comma)."""
+    s = str(p.resolve()).replace("\\", "/")
+    return s.replace("\\", "/").replace(":", r"\:").replace("'", r"\'").replace(",", r"\,")
+
+
 def burn_captions(
     input_video: Path,
     output_path: Path,
     caption_events: list[dict],
     ass_path: Path | None = None,
+    fonts_dir: Path | None = None,
 ) -> None:
     """
-    Burn captions onto video. Uses libass subtitles when available, else PNG overlays.
+    Burn captions onto video. Prefers libass (subtitles filter) with fontsdir when available.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    if ass_path and ass_path.is_file() and _ffmpeg_supports_filter("subtitles"):
+    if ass_path and ass_path.is_file() and ffmpeg_has_libass():
         tmp = Path(tempfile.mkstemp(suffix=".ass")[1])
         try:
             shutil.copy2(ass_path, tmp)
+            sub_arg = _escape_subtitles_path(tmp)
+            if fonts_dir is not None and fonts_dir.is_dir():
+                fd = _escape_subtitles_path(fonts_dir)
+                vf = f"subtitles={sub_arg}:fontsdir={fd}"
+            else:
+                vf = f"subtitles={sub_arg}"
             cmd = [
                 "ffmpeg",
                 "-y",
                 "-i",
                 str(input_video),
                 "-vf",
-                f"subtitles={tmp}",
+                vf,
                 "-c:v",
                 "libx264",
                 "-preset",
@@ -520,7 +636,13 @@ def _burn_captions_png_overlay(
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def render_timeline(pieces: list[TimelinePiece], output_path: Path) -> None:
+def render_timeline(
+    pieces: list[TimelinePiece],
+    output_path: Path,
+    *,
+    cancel_event: threading.Event | None = None,
+    on_progress: Callable[[float | None], None] | None = None,
+) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     filter_complex, ffmpeg_inputs = build_timeline_filter_graph(pieces)
     cmd = [
@@ -543,4 +665,9 @@ def render_timeline(pieces: list[TimelinePiece], output_path: Path) -> None:
         "192k",
         str(output_path),
     ]
-    run_ffmpeg(cmd)
+    if on_progress is not None or cancel_event is not None:
+        run_ffmpeg_with_progress(
+            cmd, cancel_event=cancel_event, on_progress=on_progress
+        )
+    else:
+        run_ffmpeg(cmd)

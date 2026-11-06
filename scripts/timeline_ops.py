@@ -15,7 +15,16 @@ EPS = 0.001
 TimelineOpResult = dict[str, Any]
 
 ALLOWED_CLIP_PROPERTIES = frozenset(
-    {"zoom", "speed", "volume", "text", "caption", "group_id", "created_by"}
+    {
+        "zoom",
+        "speed",
+        "volume",
+        "text",
+        "caption",
+        "group_id",
+        "created_by",
+        "style_override",
+    }
 )
 
 
@@ -330,6 +339,35 @@ def merge_clips(
     }
 
 
+def set_timeline_settings(
+    timeline: dict, *, properties: dict[str, Any]
+) -> TimelineOpResult:
+    if not properties:
+        raise ValueError("set_timeline_settings: properties must be non-empty.")
+    tl = _clone(timeline)
+    settings = tl.get("settings")
+    if not isinstance(settings, dict):
+        settings = {}
+        tl["settings"] = settings
+    previous: dict[str, Any] = {}
+    for key, value in properties.items():
+        if key in settings:
+            previous[key] = copy.deepcopy(settings[key])
+        else:
+            previous[key] = None
+        if value is None:
+            settings.pop(key, None)
+        else:
+            settings[key] = copy.deepcopy(value)
+    return {
+        "timeline": tl,
+        "undo": {
+            "op": "set_timeline_settings",
+            "properties": previous,
+        },
+    }
+
+
 def set_clip_property(
     timeline: dict, *, clip_id: str, properties: dict[str, Any]
 ) -> TimelineOpResult:
@@ -415,7 +453,30 @@ def apply_undo(timeline: dict, undo: dict) -> TimelineOpResult:
                 "properties": redo,
             },
         }
+    if op == "set_timeline_settings":
+        tl = _clone(timeline)
+        settings = tl.setdefault("settings", {})
+        if not isinstance(settings, dict):
+            tl["settings"] = {}
+            settings = tl["settings"]
+        redo: dict[str, Any] = {}
+        for key in undo["properties"]:
+            redo[key] = copy.deepcopy(settings[key]) if key in settings else None
+        for key, value in undo["properties"].items():
+            if value is None:
+                settings.pop(key, None)
+            else:
+                settings[key] = copy.deepcopy(value)
+        return {
+            "timeline": tl,
+            "undo": {"op": "set_timeline_settings", "properties": redo},
+        }
     raise ValueError(f"Unknown undo op: {op!r}.")
+
+
+def apply_undo_op(timeline: dict, undo: dict) -> TimelineOpResult:
+    """Apply an inverse payload from the undo stack (same shape as `apply_undo` in tests)."""
+    return apply_undo(timeline, undo)
 
 
 OPERATIONS = {
@@ -426,6 +487,8 @@ OPERATIONS = {
     "add_clip": add_clip,
     "merge_clips": merge_clips,
     "set_clip_property": set_clip_property,
+    "set_timeline_settings": set_timeline_settings,
+    "apply_undo": apply_undo_op,
 }
 
 

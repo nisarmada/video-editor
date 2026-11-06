@@ -69,6 +69,8 @@ def test_list_footage(client: TestClient, monkeypatch):
     data = r.json()
     assert len(data["clips"]) == 1
     assert data["clips"][0]["name"] == "clip.mp4"
+    assert data["clips"][0]["process_status"] in ("pending", "ready")
+    assert "waveform_status" in data["clips"][0]
 
 
 def test_apply_timeline_op(client: TestClient):
@@ -88,6 +90,37 @@ def test_apply_timeline_op(client: TestClient):
     body = r.json()
     assert body["timeline"]["tracks"][0]["clips"][0]["zoom"] == 1.2
     assert body["undo"]["op"] == "set_clip_property"
+
+
+def test_apply_undo_restores_delete(client: TestClient, monkeypatch):
+    monkeypatch.setattr("backend.main.validate_plan_data", lambda data, ml: [])
+
+    tl = _minimal_v2()
+    del_r = client.post(
+        "/api/timeline/apply-op",
+        json={
+            "timeline": tl,
+            "operation": "delete_clip",
+            "arguments": {"clip_id": "c1"},
+        },
+    )
+    assert del_r.status_code == 200
+    deleted = del_r.json()
+    assert deleted["timeline"]["tracks"][0]["clips"] == []
+    undo_payload = deleted["undo"]
+
+    back = client.post(
+        "/api/timeline/apply-op",
+        json={
+            "timeline": deleted["timeline"],
+            "operation": "apply_undo",
+            "arguments": {"undo": undo_payload},
+        },
+    )
+    assert back.status_code == 200
+    restored = back.json()["timeline"]
+    assert len(restored["tracks"][0]["clips"]) == 1
+    assert restored["tracks"][0]["clips"][0]["id"] == "c1"
 
 
 def test_save_and_load_plan(client: TestClient, monkeypatch):
@@ -118,7 +151,7 @@ def test_serve_proxy_mock(client: TestClient, monkeypatch, tmp_path: Path):
 def test_planner_run_mock(client: TestClient, monkeypatch):
     tl = _minimal_v2()
 
-    def fake_plan(brief: str):
+    def fake_plan(brief: str, **kwargs):
         return tl, "group-1", {"input_tokens": 1, "output_tokens": 2}
 
     monkeypatch.setattr("backend.main.generate_plan", fake_plan)
@@ -138,10 +171,31 @@ def test_render_mock(client: TestClient, monkeypatch):
         called["plan"] = plan_path
         output_path.write_bytes(b"mp4")
 
+    monkeypatch.setattr("backend.main.validate_plan_data", lambda data, ml: [])
+    tl = _minimal_v2()
+    save = client.put("/api/plans/myedit", json={"timeline": tl})
+    assert save.status_code == 200
+
     monkeypatch.setattr("backend.main.render_plan_file", fake_render)
-    r = client.post(
+    start = client.post(
         "/api/render",
         json={"plan_name": "myedit", "output": "out.mp4"},
     )
-    assert r.status_code == 200
-    assert "output/out.mp4" in r.json()["output"]
+    assert start.status_code == 200
+    job_id = start.json()["job_id"]
+    assert job_id
+    import time
+
+    for _ in range(50):
+        st = client.get(f"/api/render/{job_id}")
+        assert st.status_code == 200
+        body = st.json()
+        if body.get("state") == "done":
+            assert "output/out.mp4" in (body.get("output") or "")
+            assert called.get("plan") is not None
+            break
+        if body.get("state") in ("failed", "cancelled"):
+            raise AssertionError(body)
+        time.sleep(0.05)
+    else:
+        raise AssertionError("render job did not finish")

@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from caption_style import validate_caption_style_dict, validate_style_override
+
 SCHEMA_V2 = 2
 MIN_CLIP_SECONDS = 0.3
 TRACK_TYPES = frozenset({"video", "audio", "caption"})
@@ -84,6 +86,10 @@ def flatten_v2_to_v1_segments(data: dict) -> list[dict]:
             "start": float(c["source_in"]),
             "end": float(c["source_out"]),
         }
+        if c.get("id"):
+            seg["_clip_id"] = c["id"]
+        if isinstance(c.get("style_override"), dict):
+            seg["style_override"] = c["style_override"]
         if c.get("caption"):
             seg["caption"] = c["caption"]
         if c.get("text"):
@@ -236,6 +242,24 @@ def validate_v2_data(
 
     if not has_video:
         errors.append("v2 plan needs at least one clip on a video track.")
+
+    settings = data.get("settings")
+    if isinstance(settings, dict) and "caption_style" in settings:
+        cs = settings["caption_style"]
+        if cs is not None and not isinstance(cs, dict):
+            errors.append("settings.caption_style must be an object.")
+        elif isinstance(cs, dict):
+            errors.extend(validate_caption_style_dict(cs, "settings.caption_style"))
+
+    for track in tracks:
+        if track.get("type") != "video":
+            continue
+        for i, clip in enumerate(track.get("clips") or []):
+            so = clip.get("style_override")
+            if so is not None:
+                errors.extend(
+                    validate_style_override(so, f"video clip {i} style_override"),
+                )
 
     total = v2_timeline_duration(data)
     if max_length is not None and total > max_length + 0.05:

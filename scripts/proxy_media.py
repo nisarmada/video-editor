@@ -135,7 +135,7 @@ def ensure_thumbnail(root: Path, clip_path: Path, *, force: bool = False) -> Pat
 
 
 def footage_entry(root: Path, clip_path: Path) -> dict:
-    """Metadata for API list (does not build proxies)."""
+    """Metadata for API list (does not build proxies). Background jobs may still run."""
     rel = f"footage/{clip_path.name}"
     proxy = proxy_path_for_clip(root, clip_path)
     thumb = thumbnail_path_for_clip(root, clip_path)
@@ -144,12 +144,23 @@ def footage_entry(root: Path, clip_path: Path) -> dict:
     except RuntimeError:
         duration = None
 
+    has_p = proxy.is_file()
+    has_t = thumb.is_file()
+    if has_p and has_t:
+        process_status = "ready"
+    elif has_p or has_t:
+        process_status = "processing"
+    else:
+        process_status = "pending"
+
     return {
         "name": clip_path.name,
         "source": rel,
         "duration_seconds": duration,
-        "has_proxy": proxy.is_file(),
-        "has_thumbnail": thumb.is_file(),
+        "has_proxy": has_p,
+        "has_thumbnail": has_t,
+        "process_status": process_status,
+        "process_error": None,
         "proxy_url": f"/api/footage/{clip_path.name}/proxy",
         "thumbnail_url": f"/api/footage/{clip_path.name}/thumbnail",
     }

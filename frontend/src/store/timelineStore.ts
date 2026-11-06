@@ -1,11 +1,28 @@
 import { create } from "zustand";
 import {
+  fetchFootageList,
+  rescanFootageFolder,
+  type FootageClip,
+} from "../api/footage";
+import {
   fetchPlan,
   fetchPlanList,
   savePlan as savePlanToServer,
 } from "../api/plans";
 import { runPlanner as callPlanner } from "../api/planner";
-import { renderPlan as requestRender } from "../api/render";
+import {
+  cancelRenderJob,
+  getRenderJob,
+  startRender,
+  type RenderJobPublic,
+} from "../api/render";
+import { fetchSettings } from "../api/settings";
+import { revealOutputFolder } from "../api/desktop";
+import {
+  deletePlan as deletePlanApi,
+  duplicatePlan as duplicatePlanApi,
+  renamePlan as renamePlanApi,
+} from "../api/planManagement";
 import { applyTimelineOperation } from "../api/timelineOps";
 import { LAST_OPENED_PLAN_KEY, normalizePlanStem, validatePlanStem } from "../utils/planStem";
 import {
@@ -13,7 +30,7 @@ import {
   parseApplyOpErrorMessage,
   wrapUndoPayload,
 } from "./timelineMutation";
-import type { TimelineV2 } from "../timeline/types";
+import type { CaptionStyle, TimelineV2 } from "../timeline/types";
 
 export const DEFAULT_PLAN_NAME = "draft1_v2";
 
@@ -22,6 +39,19 @@ export const MAX_PX_PER_SEC = 160;
 export const DEFAULT_PX_PER_SEC = 48;
 
 /** One clip on video + empty audio/caption; passes validate_v2_data (scripts/timeline_format.py). */
+const DEFAULT_CAPTION_STYLE: CaptionStyle = { preset: "bold_pop" };
+
+function ensureCaptionStyle(tl: TimelineV2): TimelineV2 {
+  const s = tl.settings ?? {};
+  if (!s.caption_style) {
+    return {
+      ...tl,
+      settings: { ...s, caption_style: { ...DEFAULT_CAPTION_STYLE } },
+    };
+  }
+  return tl;
+}
+
 export function newEmptyTimelineV2(): TimelineV2 {
   return {
     schema_version: 2,
@@ -44,7 +74,12 @@ export function newEmptyTimelineV2(): TimelineV2 {
       { id: "track-audio-main", type: "audio", label: "Audio", clips: [] },
       { id: "track-caption-main", type: "caption", label: "Captions", clips: [] },
     ],
-    settings: { width: 1080, height: 1920, fps: 30 },
+    settings: {
+      width: 1080,
+      height: 1920,
+      fps: 30,
+      caption_style: { ...DEFAULT_CAPTION_STYLE },
+    },
   };
 }
 
@@ -59,6 +94,9 @@ export type TimelineInverseOp = Record<string, unknown>;
 
 export type SaveStatus = "idle" | "saving" | "saved" | "error";
 export type RenderStatus = "idle" | "rendering" | "done" | "error";
+
+/** Upper preview panel: timeline (video track) vs source file from media bin. */
+export type PreviewPanelMode = "timeline" | "source";
 
 type TimelineViewState = {
   /** Active plan stem (no .json); persisted file is `{currentPlanName}.json`. */
@@ -83,6 +121,13 @@ type TimelineViewState = {
   /** Basename of last successful export (e.g. `draft1_v2_export.mp4`). */
   outputName: string | null;
   outputDownloadUrl: string | null;
+  /** Background render job (polls GET /api/render/{id}). */
+  renderJobId: string | null;
+  renderJob: RenderJobPublic | null;
+  renderLogVisible: boolean;
+
+  /** Cross-cutting API errors (non-blocking toast line). */
+  uiBannerError: string | null;
 
   playheadSeconds: number;
   pxPerSecond: number;
@@ -90,6 +135,23 @@ type TimelineViewState = {
 
   /** Selected clip on the timeline (UI); not necessarily validated server-side. */
   selectedClipId: string | null;
+
+  /** Selected item in the media bin (footage filename stem). */
+  selectedFootageName: string | null;
+  footageClips: FootageClip[];
+  footageLoading: boolean;
+  footageError: string | null;
+
+  /** Which preview is shown — only one player mounts at a time. */
+  previewPanelMode: PreviewPanelMode;
+
+  /** Timeline caption overlay: limit ASS to selected clip (preview only). */
+  captionPreviewClipOnly: boolean;
+  setCaptionPreviewClipOnly: (v: boolean) => void;
+
+  /** Draw TikTok/Reels-style safe margins on the main preview. */
+  captionSafeAreaGuide: boolean;
+  setCaptionSafeAreaGuide: (v: boolean) => void;
 
   /** Block concurrent apply while a mutation request is in flight. */
   applyOperationInProgress: boolean;
@@ -105,6 +167,11 @@ type TimelineViewState = {
   /** POST /api/planner/run in flight. */
   plannerRunning: boolean;
   plannerError: string | null;
+
+  /** Apply local caption style edits (commits via applyOperation set_timeline_settings). */
+  setCaptionStyleDraft: (style: CaptionStyle) => void;
+  /** Set per-clip style override draft (commits via set_clip_property). */
+  setClipStyleOverrideDraft: (clipId: string, style: Partial<CaptionStyle> | null) => void;
 
   /** Fetches plan list, opens last opened / first plan (or DEFAULT_PLAN_NAME fallback). */
   initSession: () => Promise<void>;
@@ -123,6 +190,17 @@ type TimelineViewState = {
   runPlannerJob: (brief: string, saveAsStem: string) => Promise<void>;
   /** Save if dirty, then POST /api/render using plan file on disk. */
   exportPlan: () => Promise<void>;
+  cancelExport: () => Promise<void>;
+  setRenderLogVisible: (v: boolean) => void;
+  revealOutputInFinder: () => Promise<void>;
+  clearUiBanner: () => void;
+  setUiBannerError: (msg: string | null) => void;
+
+  /** Plan file ops (picker); blocks while a render is running. */
+  renamePlanFile: (fromStem: string, toStem: string) => Promise<void>;
+  duplicatePlanFile: (fromStem: string, toStem: string) => Promise<void>;
+  deletePlanFile: (stem: string) => Promise<void>;
+
   setPlayheadSeconds: (t: number) => void;
   setPxPerSecond: (pps: number) => void;
   setTimelinePlaying: (playing: boolean) => void;
@@ -149,6 +227,12 @@ type TimelineViewState = {
 
   /** Delete selected clip (delegates to applyOperation). */
   deleteSelectedClip: () => Promise<TimelineInverseOp>;
+
+  /** List footage from server. Pass `{ silent: true }` to refresh without clearing the list (polling). */
+  fetchFootage: (opts?: { silent?: boolean }) => Promise<void>;
+  rescanFootage: () => Promise<void>;
+  selectFootage: (name: string) => void;
+  setPreviewPanelMode: (mode: PreviewPanelMode) => void;
 };
 
 /**
@@ -176,10 +260,23 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
   renderError: null,
   outputName: null,
   outputDownloadUrl: null,
+  renderJobId: null,
+  renderJob: null,
+  renderLogVisible: false,
+  uiBannerError: null,
   playheadSeconds: 0,
   pxPerSecond: DEFAULT_PX_PER_SEC,
   timelinePlaying: false,
   selectedClipId: null,
+  selectedFootageName: null,
+  footageClips: [],
+  footageLoading: false,
+  footageError: null,
+  previewPanelMode: "timeline",
+  captionPreviewClipOnly: false,
+  setCaptionPreviewClipOnly: (v) => set({ captionPreviewClipOnly: v }),
+  captionSafeAreaGuide: false,
+  setCaptionSafeAreaGuide: (v) => set({ captionSafeAreaGuide: v }),
   applyOperationInProgress: false,
   dragInProgress: false,
   undoStack: [],
@@ -187,6 +284,50 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
   opErrorMessage: null,
   plannerRunning: false,
   plannerError: null,
+
+  fetchFootage: async (opts) => {
+    const silent = opts?.silent ?? false;
+    if (!silent) {
+      set({ footageLoading: true, footageError: null });
+    }
+    try {
+      const clips = await fetchFootageList();
+      set((s) => ({
+        footageClips: clips,
+        footageLoading: silent ? s.footageLoading : false,
+        footageError: silent ? s.footageError : null,
+      }));
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Unknown error";
+      if (!silent) {
+        set({ footageLoading: false, footageError: message });
+      }
+    }
+  },
+
+  rescanFootage: async () => {
+    set({ footageError: null });
+    try {
+      await rescanFootageFolder();
+      await get().fetchFootage({ silent: true });
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Rescan failed";
+      set({ footageError: message });
+    }
+  },
+
+  selectFootage: (name) =>
+    set({
+      selectedFootageName: name,
+      previewPanelMode: "source",
+      timelinePlaying: false,
+    }),
+
+  setPreviewPanelMode: (mode) =>
+    set({
+      previewPanelMode: mode,
+      ...(mode === "source" ? { timelinePlaying: false } : {}),
+    }),
 
   refreshAvailablePlans: async () => {
     try {
@@ -228,6 +369,9 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
             renderError: null,
             outputName: null,
             outputDownloadUrl: null,
+            renderJobId: null,
+            renderJob: null,
+            renderLogVisible: false,
           });
         }
         return;
@@ -278,9 +422,12 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
       renderError: null,
       outputName: null,
       outputDownloadUrl: null,
+      renderJobId: null,
+      renderJob: null,
+      renderLogVisible: false,
     });
     try {
-      const timeline = await fetchPlan(target);
+      const timeline = ensureCaptionStyle(await fetchPlan(target));
       if (typeof localStorage !== "undefined") {
         localStorage.setItem(LAST_OPENED_PLAN_KEY, target);
       }
@@ -291,6 +438,7 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
         playheadSeconds: 0,
         timelinePlaying: false,
         selectedClipId: null,
+        previewPanelMode: "timeline",
         undoStack: [],
         redoStack: [],
         opErrorMessage: null,
@@ -298,6 +446,9 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
         renderError: null,
         outputName: null,
         outputDownloadUrl: null,
+        renderJobId: null,
+        renderJob: null,
+        renderLogVisible: false,
       });
     } catch (e) {
       const message = e instanceof Error ? e.message : "Unknown error";
@@ -359,6 +510,9 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
       renderError: null,
       outputName: null,
       outputDownloadUrl: null,
+      renderJobId: null,
+      renderJob: null,
+      uiBannerError: null,
     });
     try {
       if (s0.isDirty) {
@@ -388,20 +542,201 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
       }
       const { currentPlanName } = get();
       const outputStem = `${currentPlanName.replace(/\.json$/i, "")}_export`;
-      const result = await requestRender({
+      let settings;
+      try {
+        settings = await fetchSettings();
+      } catch {
+        settings = {
+          render_defaults: { captions: false, max_length: null },
+        };
+      }
+      const rd = settings.render_defaults;
+      const { job_id: jobId } = await startRender({
         plan_name: currentPlanName,
         output: outputStem,
+        captions: rd.captions,
+        max_length: rd.max_length,
       });
-      const basename = result.output.split(/[/\\]/).pop() ?? result.output;
-      set({
-        renderStatus: "done",
-        renderError: null,
-        outputName: basename,
-        outputDownloadUrl: result.url,
-      });
+
+      set({ renderJobId: jobId });
+
+      for (;;) {
+        const j = await getRenderJob(jobId);
+        set({ renderJob: j });
+        if (j.state === "done") {
+          const basename =
+            (j.output && j.output.split(/[/\\]/).pop()) || `${outputStem}.mp4`;
+          set({
+            renderStatus: "done",
+            renderError: null,
+            outputName: basename,
+            outputDownloadUrl: j.url,
+            renderJobId: jobId,
+          });
+          break;
+        }
+        if (j.state === "failed" || j.state === "cancelled") {
+          const msg =
+            j.state === "cancelled"
+              ? "Export cancelled."
+              : j.error || "Render failed";
+          set({
+            renderStatus: "error",
+            renderError: msg,
+            renderJobId: jobId,
+          });
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Render failed";
-      set({ renderStatus: "error", renderError: msg });
+      set({
+        renderStatus: "error",
+        renderError: msg,
+        uiBannerError: msg,
+      });
+    }
+  },
+
+  cancelExport: async () => {
+    const id = get().renderJobId;
+    if (!id) return;
+    try {
+      await cancelRenderJob(id);
+      set({ uiBannerError: null });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Cancel failed";
+      set({ uiBannerError: msg });
+    }
+  },
+
+  setRenderLogVisible: (v) => set({ renderLogVisible: v }),
+
+  revealOutputInFinder: async () => {
+    try {
+      await revealOutputFolder();
+      set({ uiBannerError: null });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Could not open folder";
+      set({ uiBannerError: msg });
+    }
+  },
+
+  clearUiBanner: () => set({ uiBannerError: null }),
+  setUiBannerError: (msg) => set({ uiBannerError: msg }),
+
+  setCaptionStyleDraft: async (style) => {
+    const tl = get().timeline;
+    if (!tl) return;
+    await get().applyOperation({
+      operation: "set_timeline_settings",
+      arguments: {
+        properties: { caption_style: style as unknown as Record<string, unknown> },
+      },
+    });
+  },
+
+  setClipStyleOverrideDraft: async (clipId, style) => {
+    const p: Record<string, unknown> = { style_override: style };
+    await get().applyOperation({
+      operation: "set_clip_property",
+      arguments: { clip_id: clipId, properties: p },
+    });
+  },
+
+  renamePlanFile: async (fromStem, toStem) => {
+    const norm = normalizePlanStem(toStem);
+    const err = validatePlanStem(norm);
+    if (err) {
+      set({ uiBannerError: err });
+      return;
+    }
+    if (get().renderStatus === "rendering") {
+      set({ uiBannerError: "Wait for export to finish before renaming a plan." });
+      return;
+    }
+    try {
+      const { name } = await renamePlanApi(fromStem, norm);
+      await get().refreshAvailablePlans();
+      const next = normalizePlanStem(name);
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem(LAST_OPENED_PLAN_KEY, next);
+      }
+      if (get().currentPlanName === normalizePlanStem(fromStem)) {
+        await get().loadPlan(next, { skipDirtyConfirm: true });
+      }
+      set({ uiBannerError: null });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Rename failed";
+      set({ uiBannerError: msg });
+    }
+  },
+
+  duplicatePlanFile: async (fromStem, toStem) => {
+    const norm = normalizePlanStem(toStem);
+    const err = validatePlanStem(norm);
+    if (err) {
+      set({ uiBannerError: err });
+      return;
+    }
+    if (get().renderStatus === "rendering") {
+      set({
+        uiBannerError: "Wait for export to finish before duplicating a plan.",
+      });
+      return;
+    }
+    try {
+      const { name } = await duplicatePlanApi(fromStem, norm);
+      await get().refreshAvailablePlans();
+      const next = normalizePlanStem(name);
+      set({ uiBannerError: null });
+      if (
+        typeof window !== "undefined" &&
+        window.confirm(`Open copy "${next}"?`)
+      ) {
+        await get().loadPlan(next, { skipDirtyConfirm: true });
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Duplicate failed";
+      set({ uiBannerError: msg });
+    }
+  },
+
+  deletePlanFile: async (stem) => {
+    const s = normalizePlanStem(stem);
+    if (get().renderStatus === "rendering") {
+      set({
+        uiBannerError: "Wait for export to finish before deleting a plan.",
+      });
+      return;
+    }
+    if (
+      typeof window !== "undefined" &&
+      !window.confirm(`Delete plan "${s}.json"? This cannot be undone.`)
+    ) {
+      return;
+    }
+    try {
+      await deletePlanApi(s);
+      const list = (await fetchPlanList()).filter((x) => x !== s);
+      set({ availablePlans: list, plansListError: null });
+      if (get().currentPlanName === s) {
+        if (list[0]) {
+          await get().loadPlan(list[0], { skipDirtyConfirm: true });
+        } else {
+          set({
+            timeline: null,
+            currentPlanName: "",
+            timelineLoading: false,
+            isDirty: false,
+          });
+        }
+      }
+      set({ uiBannerError: null });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Delete failed";
+      set({ uiBannerError: msg });
     }
   },
 
@@ -410,9 +745,19 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
     set({
       pxPerSecond: Math.min(MAX_PX_PER_SEC, Math.max(MIN_PX_PER_SEC, pps)),
     }),
-  setTimelinePlaying: (playing) => set({ timelinePlaying: playing }),
+  setTimelinePlaying: (playing) =>
+    set({
+      timelinePlaying: playing,
+      ...(playing ? { previewPanelMode: "timeline" as PreviewPanelMode } : {}),
+    }),
   toggleTimelinePlaying: () =>
-    set((s) => ({ timelinePlaying: !s.timelinePlaying })),
+    set((s) => {
+      const next = !s.timelinePlaying;
+      return {
+        timelinePlaying: next,
+        ...(next ? { previewPanelMode: "timeline" as PreviewPanelMode } : {}),
+      };
+    }),
   setSelectedClipId: (id) => set({ selectedClipId: id }),
   setDragInProgress: (v) => set({ dragInProgress: v }),
   clearOpError: () => set({ opErrorMessage: null }),
