@@ -254,13 +254,14 @@ export default function App() {
         </div>
       )}
 
-      <ExportBar />
+      <div className="app-scroll">
+        <ExportBar />
 
-      <AICommandBar />
+        <AICommandBar />
 
-      <div className="editor-workspace">
-        <div className="editor-workspace__upper">
-          <div
+        <div className="editor-workspace">
+          <div className="editor-workspace__upper">
+            <div
             className="col col--media"
             data-cursor-region="mediaBin"
             onPointerEnter={() => {
@@ -273,11 +274,11 @@ export default function App() {
             onPointerLeave={() =>
               updateCursorContextPartial({ region: "none", hasFinePointer: false })
             }
-          >
+            >
             <AssetCategoryStrip />
             <MediaBin />
-          </div>
-          <section
+            </div>
+            <section
             className="panel panel--player"
             aria-label="Player"
             data-cursor-region="preview"
@@ -291,7 +292,7 @@ export default function App() {
             onPointerLeave={() =>
               updateCursorContextPartial({ region: "none", hasFinePointer: false })
             }
-          >
+            >
             <div className="panel__header panel__header--player">
               <span>Player</span>
               <div
@@ -324,8 +325,8 @@ export default function App() {
                 <SourcePreview />
               )}
             </div>
-          </section>
-          <section
+            </section>
+            <section
             className="panel panel--details"
             aria-label="Details"
             data-cursor-region="details"
@@ -339,21 +340,22 @@ export default function App() {
             onPointerLeave={() =>
               updateCursorContextPartial({ region: "none", hasFinePointer: false })
             }
-          >
+            >
             <div className="panel__header">Details</div>
             <div className="panel__body panel__body--details">
               <ClipDetails />
             </div>
-          </section>
+            </section>
+          </div>
+
+          <TimelinePanel />
         </div>
 
-        <TimelinePanel />
+        <LogsPanel
+          expanded={logsExpanded}
+          onToggle={() => setLogsExpanded((x) => !x)}
+        />
       </div>
-
-      <LogsPanel
-        expanded={logsExpanded}
-        onToggle={() => setLogsExpanded((x) => !x)}
-      />
 
       <SettingsPanel
         open={settingsOpen}

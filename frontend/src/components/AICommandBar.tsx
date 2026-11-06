@@ -3,6 +3,8 @@ import { useTimelineStore } from "../store/timelineStore";
 
 type FootageScope = "all" | "selected";
 
+const PLANNER_BAR_COLLAPSED_KEY = "video-editor:plannerBarCollapsed";
+
 export default function AICommandBar() {
   const currentPlanName = useTimelineStore((s) => s.currentPlanName);
   const timelineLoading = useTimelineStore((s) => s.timelineLoading);
@@ -28,6 +30,10 @@ export default function AICommandBar() {
   const [brief, setBrief] = useState("");
   const [saveAs, setSaveAs] = useState("");
   const [footageScope, setFootageScope] = useState<FootageScope>("all");
+  const [barCollapsed, setBarCollapsed] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return window.localStorage.getItem(PLANNER_BAR_COLLAPSED_KEY) === "1";
+  });
 
   useEffect(() => {
     if (currentPlanName) {
@@ -48,12 +54,51 @@ export default function AICommandBar() {
     !plannerRunning &&
     (footageScope === "all" || selectedFootageNames.length > 0);
 
+  function setCollapsed(next: boolean) {
+    setBarCollapsed(next);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(PLANNER_BAR_COLLAPSED_KEY, next ? "1" : "0");
+    }
+  }
+
+  if (barCollapsed) {
+    return (
+      <section
+        className="ai-command-bar ai-command-bar--collapsed"
+        role="region"
+        aria-label="Edit planner"
+      >
+        <div className="ai-command-bar__collapsed">
+          <button
+            type="button"
+            className="btn btn--ghost ai-command-bar__expand"
+            aria-expanded={false}
+            onClick={() => setCollapsed(false)}
+          >
+            Show planner bar
+          </button>
+        </div>
+      </section>
+    );
+  }
+
   return (
     <section
       className="ai-command-bar"
       role="region"
       aria-label="Edit planner"
     >
+      <div className="ai-command-bar__top-tools">
+        <button
+          type="button"
+          className="btn btn--ghost ai-command-bar__hide"
+          aria-expanded
+          title="Hide this bar — scroll the page or use Show planner bar"
+          onClick={() => setCollapsed(true)}
+        >
+          Hide bar
+        </button>
+      </div>
       <div className="ai-command-bar__inner">
         <div className="ai-command-bar__row">
           <label className="ai-command-bar__prompt">
