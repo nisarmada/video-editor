@@ -442,6 +442,109 @@ def trim_clip(
     }
 
 
+def _trim_timeline_edge_one(
+    tl: dict,
+    *,
+    clip_id: str,
+    edge: str,
+    at_timeline_time: float,
+) -> TimelineOpResult:
+    """Move clip start/end on the timeline wall clock and keep source trim in sync."""
+    track, clip, _idx = _find_clip(tl, clip_id)
+    ttype = _track_type(track)
+    t0 = float(clip["timeline_start"])
+    t1 = _clip_end(clip, ttype)
+    at = float(at_timeline_time)
+    if edge == "start":
+        if at <= t0 + EPS or at >= t1 - EPS:
+            raise ValueError(
+                f"trim_timeline_edge (start): time must be strictly inside "
+                f"({t0:.3f}s, {t1:.3f}s), got {at:.3f}s."
+            )
+        old_t0 = t0
+        old_si = float(clip["source_in"])
+        new_si = _source_split_time(clip, at)
+        clip["timeline_start"] = at
+        clip["source_in"] = new_si
+        _check_min_source_span(clip, "Trim start (timeline)")
+        _assert_no_overlaps(track)
+        return {
+            "timeline": tl,
+            "undo": {
+                "op": "trim_timeline_edge",
+                "clip_id": clip_id,
+                "edge": "start",
+                "old_timeline_start": old_t0,
+                "old_source_in": old_si,
+                "at_timeline_time": at,
+            },
+        }
+    if edge == "end":
+        if at <= t0 + EPS or at >= t1 - EPS:
+            raise ValueError(
+                f"trim_timeline_edge (end): time must be strictly inside "
+                f"({t0:.3f}s, {t1:.3f}s), got {at:.3f}s."
+            )
+        old_so = float(clip["source_out"])
+        new_so = _source_split_time(clip, at)
+        clip["source_out"] = new_so
+        _check_min_source_span(clip, "Trim end (timeline)")
+        _assert_no_overlaps(track)
+        return {
+            "timeline": tl,
+            "undo": {
+                "op": "trim_timeline_edge",
+                "clip_id": clip_id,
+                "edge": "end",
+                "old_source_out": old_so,
+                "at_timeline_time": at,
+            },
+        }
+    raise ValueError("trim_timeline_edge: edge must be 'start' or 'end'.")
+
+
+def trim_timeline_edge(
+    timeline: dict,
+    *,
+    clip_id: str,
+    edge: str,
+    at_timeline_time: float,
+) -> TimelineOpResult:
+    """Trim clip start/end so the timeline boundary lands at `at_timeline_time`."""
+    tl = _clone(timeline)
+    e = str(edge)
+    if e not in ("start", "end"):
+        raise ValueError("trim_timeline_edge: edge must be 'start' or 'end'.")
+
+    if not _clip_linking_enabled(tl):
+        return _trim_timeline_edge_one(
+            tl, clip_id=clip_id, edge=e, at_timeline_time=at_timeline_time
+        )
+
+    ids = _expand_linked_clip_ids(tl, clip_id)
+    if len(ids) <= 1:
+        return _trim_timeline_edge_one(
+            tl, clip_id=clip_id, edge=e, at_timeline_time=at_timeline_time
+        )
+
+    merge_undos: list[dict[str, Any]] = []
+    for cid in sorted(
+        ids,
+        key=lambda c: (
+            0 if _track_type(_find_clip(tl, c)[0]) == "video" else 1,
+            c,
+        ),
+    ):
+        one = _trim_timeline_edge_one(
+            tl, clip_id=cid, edge=e, at_timeline_time=at_timeline_time
+        )
+        merge_undos.append(one["undo"])
+    return {
+        "timeline": tl,
+        "undo": {"op": "sequence", "steps": list(reversed(merge_undos))},
+    }
+
+
 def _move_clip_one(
     tl: dict,
     *,
@@ -791,8 +894,10 @@ def set_track_property(
 ) -> TimelineOpResult:
     if not properties:
         raise ValueError("set_track_property: properties must be non-empty.")
-    if set(properties.keys()) - {"muted", "volume"}:
-        raise ValueError("set_track_property: only 'muted' and 'volume' are supported.")
+    if set(properties.keys()) - {"muted", "volume", "locked"}:
+        raise ValueError(
+            "set_track_property: only 'muted', 'volume', and 'locked' are supported."
+        )
 
     tl = _clone(timeline)
     track = _find_track(tl, track_id)
@@ -812,6 +917,8 @@ def set_track_property(
             track[key] = bool(value)
         elif key == "volume":
             track[key] = float(value)
+        elif key == "locked":
+            track[key] = bool(value)
         else:
             track[key] = copy.deepcopy(value)
 
@@ -1024,6 +1131,36 @@ def apply_undo(timeline: dict, undo: dict) -> TimelineOpResult:
             source_in=kwargs.get("source_in"),
             source_out=kwargs.get("source_out"),
         )
+    if op == "trim_timeline_edge":
+        cid = str(undo["clip_id"])
+        edge = str(undo.get("edge") or "")
+        if "old_timeline_start" in undo or "old_source_out" in undo:
+            tl4 = _clone(timeline)
+            tr, clip, _i = _find_clip(tl4, cid)
+            at_applied = float(undo["at_timeline_time"])
+            if edge == "start":
+                clip["timeline_start"] = float(undo["old_timeline_start"])
+                clip["source_in"] = float(undo["old_source_in"])
+            elif edge == "end":
+                clip["source_out"] = float(undo["old_source_out"])
+            else:
+                raise ValueError(f"trim_timeline_edge undo: bad edge {edge!r}.")
+            _assert_no_overlaps(tr)
+            return {
+                "timeline": tl4,
+                "undo": {
+                    "op": "trim_timeline_edge",
+                    "clip_id": cid,
+                    "edge": edge,
+                    "at_timeline_time": at_applied,
+                },
+            }
+        return trim_timeline_edge(
+            timeline,
+            clip_id=cid,
+            edge=edge,
+            at_timeline_time=float(undo["at_timeline_time"]),
+        )
     if op == "move_clip":
         return move_clip(
             timeline,
@@ -1114,6 +1251,7 @@ def apply_undo_op(timeline: dict, undo: dict) -> TimelineOpResult:
 OPERATIONS = {
     "split_clip": split_clip,
     "trim_clip": trim_clip,
+    "trim_timeline_edge": trim_timeline_edge,
     "move_clip": move_clip,
     "delete_clip": delete_clip,
     "delete_clip_solo": delete_clip_solo,
@@ -1142,3 +1280,30 @@ def dispatch_operation(
         known = ", ".join(sorted(OPERATIONS))
         raise ValueError(f"Unknown operation {operation!r}. Known: {known}.")
     return fn(timeline, **(arguments or {}))
+
+
+def batch_operations(timeline: dict, *, steps: list[dict[str, Any]]) -> TimelineOpResult:
+    """Run multiple ops in one request; single undo step (sequence) for one undo pop."""
+    if not isinstance(steps, list) or len(steps) == 0:
+        raise ValueError("batch_operations: non-empty steps list required.")
+    cur = timeline
+    undo_steps: list[dict[str, Any]] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            raise ValueError("batch_operations: each step must be an object.")
+        op = step.get("operation")
+        args = step.get("arguments")
+        if not isinstance(op, str) or not op:
+            raise ValueError("batch_operations: step missing operation string.")
+        if args is not None and not isinstance(args, dict):
+            raise ValueError("batch_operations: step.arguments must be an object.")
+        result = dispatch_operation(cur, op, args if isinstance(args, dict) else {})
+        cur = result["timeline"]
+        undo_steps.append(result["undo"])
+    return {
+        "timeline": cur,
+        "undo": {"op": "sequence", "steps": list(reversed(undo_steps))},
+    }
+
+
+OPERATIONS["batch_operations"] = batch_operations

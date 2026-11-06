@@ -9,6 +9,7 @@ import pytest
 from timeline_ops import (
     add_clip,
     apply_undo,
+    batch_operations,
     delete_clip,
     dispatch_operation,
     merge_clips,
@@ -17,6 +18,7 @@ from timeline_ops import (
     set_clip_property,
     split_clip,
     trim_clip,
+    trim_timeline_edge,
 )
 
 
@@ -289,3 +291,37 @@ def test_dispatch_operation_unknown():
 def test_split_rejects_exterior_time():
     with pytest.raises(ValueError, match="strictly inside"):
         split_clip(sample_timeline(), clip_id="clip-1", at_timeline_time=0.0)
+
+
+def test_trim_timeline_edge_start_and_undo():
+    tl = sample_timeline()
+    out = trim_timeline_edge(tl, clip_id="clip-1", edge="start", at_timeline_time=2.0)
+    c = video_clips(out["timeline"])[0]
+    assert c["timeline_start"] == pytest.approx(2.0)
+    assert c["source_in"] == pytest.approx(2.0)
+    back = apply_undo(out["timeline"], out["undo"])
+    c2 = video_clips(back["timeline"])[0]
+    assert c2["timeline_start"] == pytest.approx(0.0)
+    assert c2["source_in"] == pytest.approx(0.0)
+
+
+def test_batch_operations_two_splits_one_undo():
+    tl = sample_timeline()
+    batch = batch_operations(
+        tl,
+        steps=[
+            {
+                "operation": "split_clip",
+                "arguments": {"clip_id": "clip-1", "at_timeline_time": 2.0},
+            },
+            {
+                "operation": "split_clip",
+                "arguments": {"clip_id": "clip-2", "at_timeline_time": 7.0},
+            },
+        ],
+    )
+    v = video_clips(batch["timeline"])
+    assert len(v) == 4
+    assert batch["undo"]["op"] == "sequence"
+    back = apply_undo(batch["timeline"], batch["undo"])
+    assert len(video_clips(back["timeline"])) == 2

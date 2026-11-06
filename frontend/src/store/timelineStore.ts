@@ -174,6 +174,8 @@ type TimelineViewState = {
 
   /** Short message when backend rejects apply or undo/redo. */
   opErrorMessage: string | null;
+  /** Ephemeral hint for keyboard shortcuts (no-op, split refused, etc.). */
+  shortcutToast: string | null;
 
   /** POST /api/planner/run in flight. */
   plannerRunning: boolean;
@@ -220,6 +222,7 @@ type TimelineViewState = {
   setSelectedClipIds: (ids: string[]) => void;
   setDragInProgress: (v: boolean) => void;
   clearOpError: () => void;
+  setShortcutToast: (msg: string | null) => void;
 
   /**
    * All timeline edits go through this: POST /api/timeline/apply-op, replace `timeline`
@@ -250,6 +253,20 @@ type TimelineViewState = {
   toggleClipLinking: () => Promise<TimelineInverseOp | void>;
   /** Toggle muted on the track that contains the selected clip (video/audio only). */
   toggleSelectedTrackMute: () => Promise<TimelineInverseOp | void>;
+  /** Split many clips at one timeline time — single undo step via batch_operations. */
+  splitClipsAtTime: (clipIds: string[], atTimelineTime: number) => Promise<TimelineInverseOp>;
+  deleteClipsByIds: (clipIds: string[]) => Promise<TimelineInverseOp>;
+  separateAudioForClip: (clipId: string) => Promise<TimelineInverseOp | void>;
+  reattachAudioForClip: (clipId: string) => Promise<TimelineInverseOp | void>;
+  unlinkClipsForClip: (clipId: string) => Promise<TimelineInverseOp | void>;
+  toggleTrackMuteById: (trackId: string) => Promise<TimelineInverseOp | void>;
+  toggleTrackLockById: (trackId: string) => Promise<TimelineInverseOp | void>;
+  muteClipToggleById: (clipId: string) => Promise<TimelineInverseOp | void>;
+  trimTimelineEdge: (
+    clipId: string,
+    edge: "start" | "end",
+    atTimelineTime: number,
+  ) => Promise<TimelineInverseOp>;
 
   /** List footage from server. Pass `{ silent: true }` to refresh without clearing the list (polling). */
   fetchFootage: (opts?: { silent?: boolean }) => Promise<void>;
@@ -306,6 +323,7 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
   undoStack: [],
   redoStack: [],
   opErrorMessage: null,
+  shortcutToast: null,
   plannerRunning: false,
   plannerError: null,
 
@@ -795,6 +813,7 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
     }),
   setDragInProgress: (v) => set({ dragInProgress: v }),
   clearOpError: () => set({ opErrorMessage: null }),
+  setShortcutToast: (msg) => set({ shortcutToast: msg }),
 
   applyOperation: async (op) => {
     const { timeline } = get();
@@ -963,6 +982,127 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
         arguments: { track_id: tr.id, properties: { muted: next } },
       });
     }
+  },
+
+  splitClipsAtTime: async (clipIds, atTimelineTime) => {
+    if (clipIds.length === 0) throw new Error("No clips");
+    if (clipIds.length === 1) {
+      return get().applyOperation({
+        operation: "split_clip",
+        arguments: {
+          clip_id: clipIds[0]!,
+          at_timeline_time: atTimelineTime,
+        },
+      });
+    }
+    return get().applyOperation({
+      operation: "batch_operations",
+      arguments: {
+        steps: clipIds.map((cid) => ({
+          operation: "split_clip",
+          arguments: { clip_id: cid, at_timeline_time: atTimelineTime },
+        })),
+      },
+    });
+  },
+
+  deleteClipsByIds: async (clipIds) => {
+    if (clipIds.length === 0) throw new Error("No clips");
+    if (clipIds.length === 1) {
+      const undo = await get().applyOperation({
+        operation: "delete_clip",
+        arguments: { clip_id: clipIds[0]! },
+      });
+      set({ selectedClipId: null, selectedClipIds: [] });
+      return undo;
+    }
+    const undo = await get().applyOperation({
+      operation: "batch_operations",
+      arguments: {
+        steps: clipIds.map((cid) => ({
+          operation: "delete_clip",
+          arguments: { clip_id: cid },
+        })),
+      },
+    });
+    set({ selectedClipId: null, selectedClipIds: [] });
+    return undo;
+  },
+
+  separateAudioForClip: async (clipId) => {
+    if (!clipId) return;
+    return get().applyOperation({
+      operation: "separate_audio",
+      arguments: { clip_id: clipId },
+    });
+  },
+
+  reattachAudioForClip: async (clipId) => {
+    if (!clipId) return;
+    return get().applyOperation({
+      operation: "reattach_audio",
+      arguments: { clip_id: clipId },
+    });
+  },
+
+  unlinkClipsForClip: async (clipId) => {
+    if (!clipId) return;
+    return get().applyOperation({
+      operation: "unlink_clips",
+      arguments: { clip_id: clipId },
+    });
+  },
+
+  toggleTrackMuteById: async (trackId) => {
+    const tl = get().timeline;
+    if (!tl) return;
+    const tr = tl.tracks?.find((x) => x.id === trackId);
+    if (!tr || (tr.type !== "video" && tr.type !== "audio")) return;
+    const next = !(tr.muted ?? false);
+    return get().applyOperation({
+      operation: "set_track_property",
+      arguments: { track_id: trackId, properties: { muted: next } },
+    });
+  },
+
+  toggleTrackLockById: async (trackId) => {
+    const tl = get().timeline;
+    if (!tl) return;
+    const tr = tl.tracks?.find((x) => x.id === trackId);
+    if (!tr || (tr.type !== "video" && tr.type !== "audio")) return;
+    const next = !(tr.locked ?? false);
+    return get().applyOperation({
+      operation: "set_track_property",
+      arguments: { track_id: trackId, properties: { locked: next } },
+    });
+  },
+
+  muteClipToggleById: async (clipId) => {
+    const tl = get().timeline;
+    if (!tl || !clipId) return;
+    const hit = tl.tracks
+      ?.flatMap((tr) => (tr.clips ?? []).map((c) => ({ tr, c })))
+      .find((x) => x.c.id === clipId);
+    if (!hit) return;
+    const vol = hit.c.volume !== undefined ? hit.c.volume : 1;
+    return get().applyOperation({
+      operation: "set_clip_property",
+      arguments: {
+        clip_id: clipId,
+        properties: { volume: vol <= 0 ? 1 : 0 },
+      },
+    });
+  },
+
+  trimTimelineEdge: async (clipId, edge, atTimelineTime) => {
+    return get().applyOperation({
+      operation: "trim_timeline_edge",
+      arguments: {
+        clip_id: clipId,
+        edge,
+        at_timeline_time: atTimelineTime,
+      },
+    });
   },
 
   runPlannerJob: async (brief, saveAsStem) => {

@@ -23,7 +23,8 @@ import {
   playheadInsideClip,
   readClipFromClipboard,
 } from "../timeline/selection";
-import { shortcutKeys, shortcutTitle } from "../timeline/shortcuts";
+import { getBindingLabel } from "../shortcuts/tooltip";
+import { useKeybindingsStore } from "../store/keybindingsStore";
 import TimelineContextMenu, {
   type ContextMenuState,
 } from "./TimelineContextMenu";
@@ -33,6 +34,14 @@ import {
   MIN_CLIP_SECONDS,
   TIMELINE_SNAP_SEC,
 } from "../timeline/dragConstants";
+import {
+  laneContentXFromClient,
+  findTrackUnderPoint,
+  clipAtTimeOnTrack,
+  TIMELINE_LABEL_WIDTH,
+  TIMELINE_RULER_HEIGHT,
+  TIMELINE_TRACK_HEIGHT,
+} from "../timeline/timelinePointer";
 import { isFootageFromBinDragging } from "../timeline/footageDragState";
 import {
   MAX_PX_PER_SEC,
@@ -45,10 +54,18 @@ import type { TrackType } from "../timeline/types";
 import { formatTimecode } from "../utils/timeFormat";
 import ClipWaveformCanvas from "./ClipWaveformCanvas";
 import { useWaveformCacheStore } from "../store/waveformCacheStore";
+import {
+  updateCursorContextPartial,
+  resetCursorContext,
+  setIgnoreCursorMovesUntil,
+  shouldIgnoreCursorPointerMove,
+  setCursorHoverClip,
+} from "../store/cursorContextStore";
+import { timelineViewportElRef, useEditorSettingsStore } from "../store/editorSettingsStore";
 
-const LABEL_WIDTH = 88;
-const RULER_HEIGHT = 28;
-const TRACK_HEIGHT = 48;
+const LABEL_WIDTH = TIMELINE_LABEL_WIDTH;
+const RULER_HEIGHT = TIMELINE_RULER_HEIGHT;
+const TRACK_HEIGHT = TIMELINE_TRACK_HEIGHT;
 
 function rulerStepSeconds(pxPerSecond: number): number {
   if (pxPerSecond >= 80) return 1;
@@ -60,34 +77,6 @@ function rulerStepSeconds(pxPerSecond: number): number {
 function snapTimelineSec(sec: number): number {
   const s = Math.round(sec / TIMELINE_SNAP_SEC) * TIMELINE_SNAP_SEC;
   return Math.max(0, s);
-}
-
-function laneContentXFromClient(
-  clientX: number,
-  laneEl: HTMLElement,
-  viewportEl: HTMLElement | null,
-): number {
-  const laneRect = laneEl.getBoundingClientRect();
-  const scrollLeft = viewportEl?.scrollLeft ?? 0;
-  return clientX - laneRect.left + scrollLeft;
-}
-
-function findTrackUnderPoint(
-  viewportEl: HTMLElement,
-  clientY: number,
-): { trackId: string; trackType: TrackType } | null {
-  const lanes = viewportEl.querySelectorAll<HTMLElement>(
-    "[data-track-lane-id]",
-  );
-  for (const el of lanes) {
-    const r = el.getBoundingClientRect();
-    if (clientY >= r.top && clientY <= r.bottom) {
-      const id = el.dataset.trackLaneId;
-      const t = el.dataset.trackType as TrackType | undefined;
-      if (id && t) return { trackId: id, trackType: t };
-    }
-  }
-  return null;
 }
 
 type FootageDragPayload = Pick<FootageClip, "name" | "source" | "duration_seconds">;
@@ -156,10 +145,15 @@ export default function TimelinePanel() {
   const unlinkClipsAction = useTimelineStore((s) => s.unlinkClipsAction);
   const toggleClipLinking = useTimelineStore((s) => s.toggleClipLinking);
   const applyOperation = useTimelineStore((s) => s.applyOperation);
+  const shortcutToast = useTimelineStore((s) => s.shortcutToast);
+  const setShortcutToast = useTimelineStore((s) => s.setShortcutToast);
 
   const rulerRef = useRef<HTMLDivElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
+  const cursorGuideRef = useRef<HTMLDivElement>(null);
+  const cursorMoveRaf = useRef<number | null>(null);
   const ensureWaveform = useWaveformCacheStore((s) => s.ensureFetch);
+  const showCursorGuide = useEditorSettingsStore((s) => s.showCursorTimelineGuide);
 
   /** Pixels available for lanes (viewport minus sticky label); stretches short edits to full width. */
   const [viewportLanePx, setViewportLanePx] = useState(800);
@@ -168,6 +162,8 @@ export default function TimelinePanel() {
   const [pointerDrag, setPointerDrag] = useState<PointerDragState | null>(null);
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
   const [hoverClipId, setHoverClipId] = useState<string | null>(null);
+  /** Clip that would receive cursor-based shortcuts (keyboard), for outline */
+  const [cursorTargetClipId, setCursorTargetClipId] = useState<string | null>(null);
 
   const canUndo = undoStack.length > 0;
   const canRedo = redoStack.length > 0;
@@ -190,115 +186,17 @@ export default function TimelinePanel() {
 
   const linkingEnabled = timeline?.settings?.clip_linking_enabled !== false;
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (!e.metaKey || e.key.toLowerCase() !== "z") return;
-      const t = e.target as HTMLElement | null;
-      if (
-        t &&
-        (t.tagName === "INPUT" ||
-          t.tagName === "TEXTAREA" ||
-          t.tagName === "SELECT" ||
-          t.isContentEditable)
-      ) {
-        return;
-      }
-      e.preventDefault();
-      if (busy) return;
-      if (e.shiftKey) {
-        void redo();
-      } else {
-        void undo();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [busy, undo, redo]);
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const t = e.target as HTMLElement | null;
-      if (
-        t &&
-        (t.tagName === "INPUT" ||
-          t.tagName === "TEXTAREA" ||
-          t.tagName === "SELECT" ||
-          t.isContentEditable)
-      ) {
-        return;
-      }
-      if (busy) return;
-
-      const isMod = e.metaKey || e.ctrlKey;
-      if (isMod && e.shiftKey && e.code === "KeyS") {
-        e.preventDefault();
-        void runOp(() => useTimelineStore.getState().separateAudio());
-        return;
-      }
-      if (isMod && !e.shiftKey && e.code === "KeyL") {
-        e.preventDefault();
-        void runOp(() => useTimelineStore.getState().toggleClipLinking());
-        return;
-      }
-      if (!isMod && e.code === "KeyM") {
-        e.preventDefault();
-        void runOp(() => useTimelineStore.getState().toggleSelectedTrackMute());
-        return;
-      }
-      if (isMod && e.code === "KeyC" && useTimelineStore.getState().selectedClipId) {
-        e.preventDefault();
-        const tl = useTimelineStore.getState().timeline;
-        const sid = useTimelineStore.getState().selectedClipId;
-        if (!tl || !sid) return;
-        const hit = findClipById(tl, sid);
-        if (hit) {
-          copyClipPayload({
-            clip: hit.clip,
-            sourceTrackId: hit.trackId,
-            sourceTrackType: hit.trackType,
-          });
-        }
-        return;
-      }
-      if (isMod && e.code === "KeyV") {
-        e.preventDefault();
-        const tl = useTimelineStore.getState().timeline;
-        const ph = useTimelineStore.getState().playheadSeconds;
-        const data = readClipFromClipboard();
-        if (!tl || !data) return;
-        const videoTr = tl.tracks.find((x) => x.type === "video");
-        const audioTr = tl.tracks.find((x) => x.type === "audio");
-        const capTr = tl.tracks.find((x) => x.type === "caption");
-        const st = data.sourceTrackType;
-        const targetId =
-          st === "audio" && audioTr
-            ? audioTr.id
-            : st === "caption" && capTr
-              ? capTr.id
-              : videoTr?.id;
-        const { group_id: _omitG, id: _omitId, ...clipRest } = data.clip;
-        const newClip: Record<string, unknown> = {
-          ...clipRest,
-          id: crypto.randomUUID(),
-          timeline_start: ph,
-          created_by: "user",
-        };
-        if (st === "video" || (!st && !targetId)) {
-          newClip.audio_source = "embedded";
-        }
-        const args: Record<string, unknown> = { clip: newClip };
-        if (targetId) args.track_id = targetId;
-        void runOp(() =>
-          useTimelineStore.getState().applyOperation({
-            operation: "add_clip",
-            arguments: args,
-          }),
-        );
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [busy, runOp]);
+  const kbOverrides = useKeybindingsStore((s) => s.overrides);
+  useEditorSettingsStore((s) => s.shortcutTargeting);
+  useEditorSettingsStore((s) => s.perActionTargetMode);
+  const bindingTitle = useCallback(
+    (actionId: string, label: string) => `${label} (${getBindingLabel(actionId, kbOverrides)})`,
+    [kbOverrides],
+  );
+  const bindingKeysOnly = useCallback(
+    (actionId: string) => getBindingLabel(actionId, kbOverrides),
+    [kbOverrides],
+  );
 
   const duration = useMemo(
     () => (timeline ? timelineEnd(timeline) : 0),
@@ -323,6 +221,155 @@ export default function TimelinePanel() {
       window.removeEventListener("resize", measure);
     };
   }, [loading, error, timeline]);
+
+  useLayoutEffect(() => {
+    timelineViewportElRef.current = viewportRef.current;
+    return () => {
+      timelineViewportElRef.current = null;
+    };
+  }, [loading, error, timeline]);
+
+  useEffect(() => {
+    if (!timeline) return;
+
+    const syncFromPointer = (e: PointerEvent) => {
+      if (shouldIgnoreCursorPointerMove()) return;
+      const vp = viewportRef.current;
+      if (!vp) return;
+      const vr = vp.getBoundingClientRect();
+      if (
+        e.clientX < vr.left ||
+        e.clientX > vr.right ||
+        e.clientY < vr.top ||
+        e.clientY > vr.bottom
+      ) {
+        updateCursorContextPartial({
+          region: "none",
+          trackIdAtCursor: null,
+          trackTypeAtCursor: null,
+          clipIdAtCursor: null,
+          clipOffsetAtCursor: null,
+          timeAtCursorRaw: 0,
+        });
+        setCursorTargetClipId(null);
+        setCursorHoverClip(null);
+        if (cursorGuideRef.current) cursorGuideRef.current.style.display = "none";
+        return;
+      }
+
+      const canvas = vp.querySelector<HTMLElement>(".timeline-canvas");
+      if (!canvas) return;
+      const cr = canvas.getBoundingClientRect();
+      const inCanvas =
+        e.clientX >= cr.left &&
+        e.clientX <= cr.right &&
+        e.clientY >= cr.top &&
+        e.clientY <= cr.bottom;
+      if (!inCanvas) {
+        updateCursorContextPartial({
+          region: "none",
+          trackIdAtCursor: null,
+          trackTypeAtCursor: null,
+          clipIdAtCursor: null,
+          clipOffsetAtCursor: null,
+          timeAtCursorRaw: 0,
+        });
+        setCursorTargetClipId(null);
+        setCursorHoverClip(null);
+        if (cursorGuideRef.current) cursorGuideRef.current.style.display = "none";
+        return;
+      }
+
+      const mq =
+        typeof window !== "undefined" ? window.matchMedia("(pointer: coarse)") : null;
+      const hasFine = !mq?.matches;
+      const relY = e.clientY - cr.top;
+      const sub: "ruler" | "timeline" =
+        relY < RULER_HEIGHT ? "ruler" : "timeline";
+
+      let yProbe = e.clientY;
+      if (sub === "ruler") {
+        const firstLane = vp.querySelector<HTMLElement>("[data-track-lane-id]");
+        if (firstLane) {
+          const lr = firstLane.getBoundingClientRect();
+          yProbe = lr.top + Math.min(8, lr.height / 2);
+        }
+      }
+
+      const trackHit = findTrackUnderPoint(vp, yProbe);
+      let trackId: string | null = trackHit?.trackId ?? null;
+      let trackType: TrackType | null = trackHit?.trackType ?? null;
+      let rawSec = 0;
+      let clipId: string | null = null;
+      let offsetInClip: number | null = null;
+
+      if (trackHit) {
+        const lane = vp.querySelector<HTMLElement>(
+          `[data-track-lane-id="${trackHit.trackId}"]`,
+        );
+        if (lane) {
+          const xInLane = laneContentXFromClient(e.clientX, lane, vp);
+          rawSec = Math.max(0, xInLane / pxPerSecond);
+          const cHit = clipAtTimeOnTrack(timeline, trackHit.trackId, rawSec);
+          if (cHit) {
+            clipId = cHit.clipId;
+            offsetInClip = cHit.offsetInClip;
+          }
+        }
+      }
+
+      updateCursorContextPartial({
+        region: sub === "ruler" ? "ruler" : "timeline",
+        clientX: e.clientX,
+        clientY: e.clientY,
+        hasFinePointer: hasFine,
+        timeAtCursorRaw: rawSec,
+        trackIdAtCursor: trackId,
+        trackTypeAtCursor: trackType,
+        clipIdAtCursor: clipId,
+        clipOffsetAtCursor: offsetInClip,
+      });
+
+      setCursorTargetClipId(clipId);
+      setCursorHoverClip(clipId);
+
+      const xGuide = e.clientX - cr.left + vp.scrollLeft;
+      const gl = cursorGuideRef.current;
+      if (gl) {
+        gl.style.display =
+          showCursorGuide && sub === "timeline" && hasFine ? "block" : "none";
+        gl.style.left = `${xGuide}px`;
+      }
+    };
+
+    const onPointerMove = (e: PointerEvent) => {
+      if (cursorMoveRaf.current != null) return;
+      cursorMoveRaf.current = window.requestAnimationFrame(() => {
+        cursorMoveRaf.current = null;
+        syncFromPointer(e);
+      });
+    };
+
+    const onLeaveWindow = () => {
+      resetCursorContext();
+      setCursorTargetClipId(null);
+      setCursorHoverClip(null);
+      if (cursorGuideRef.current) cursorGuideRef.current.style.display = "none";
+    };
+
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("blur", onLeaveWindow);
+    document.addEventListener("mouseleave", onLeaveWindow);
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("blur", onLeaveWindow);
+      document.removeEventListener("mouseleave", onLeaveWindow);
+      if (cursorMoveRaf.current != null) {
+        cancelAnimationFrame(cursorMoveRaf.current);
+        cursorMoveRaf.current = null;
+      }
+    };
+  }, [timeline, pxPerSecond, showCursorGuide]);
 
   const totalClipCount = useMemo(() => {
     if (!timeline?.tracks) return 0;
@@ -430,6 +477,7 @@ export default function TimelinePanel() {
       if (e.pointerId !== pd.pointerId) return;
       const vp = viewportRef.current;
       setPointerDrag(null);
+      setIgnoreCursorMovesUntil(0);
       setDropIndicatorSec(null);
       setDragInProgress(false);
 
@@ -480,8 +528,11 @@ export default function TimelinePanel() {
       },
     ) => {
       if (e.button !== 0 || busy || applyInProgress) return;
+      const tr = timeline?.tracks?.find((x) => x.id === opts.trackId);
+      if (tr?.locked) return;
       e.stopPropagation();
       setDragInProgress(true);
+      setIgnoreCursorMovesUntil(performance.now() + 60_000);
       setPointerDrag({
         clipId: opts.clipId,
         originTrackId: opts.trackId,
@@ -735,6 +786,21 @@ export default function TimelinePanel() {
     [applyOperation, runOp],
   );
 
+  const toggleTrackLocked = useCallback(
+    (trackId: string, current: boolean | undefined) => {
+      void runOp(() =>
+        applyOperation({
+          operation: "set_track_property",
+          arguments: {
+            track_id: trackId,
+            properties: { locked: !current },
+          },
+        }),
+      );
+    },
+    [applyOperation, runOp],
+  );
+
   const playheadLeft = LABEL_WIDTH + playhead * pxPerSecond;
   const indicatorLeft =
     dropIndicatorSec !== null
@@ -753,7 +819,7 @@ export default function TimelinePanel() {
             className="timeline-toolbar__tool timeline-toolbar__tool--text"
             disabled={busy || !canUndo}
             onClick={() => void undo()}
-            title={shortcutTitle("undo")}
+            title={bindingTitle("undo", "Undo")}
           >
             Undo
           </button>
@@ -762,7 +828,7 @@ export default function TimelinePanel() {
             className="timeline-toolbar__tool timeline-toolbar__tool--text"
             disabled={busy || !canRedo}
             onClick={() => void redo()}
-            title={shortcutTitle("redo")}
+            title={bindingTitle("redo", "Redo")}
           >
             Redo
           </button>
@@ -772,7 +838,7 @@ export default function TimelinePanel() {
             className="timeline-toolbar__tool timeline-toolbar__tool--text"
             disabled={busy || !selectedClipId}
             onClick={() => void splitAtPlayhead().catch(() => {})}
-            title={shortcutTitle("split")}
+            title={bindingTitle("split", "Split")}
           >
             Split
           </button>
@@ -781,7 +847,7 @@ export default function TimelinePanel() {
             className="timeline-toolbar__tool timeline-toolbar__tool--text"
             disabled={busy || !selectedClipId}
             onClick={() => void deleteSelectedClip().catch(() => {})}
-            title={shortcutTitle("delete")}
+            title={bindingTitle("delete", "Delete")}
           >
             Del
           </button>
@@ -797,7 +863,7 @@ export default function TimelinePanel() {
               (linkingEnabled ? " timeline-toolbar__link-on" : "")
             }
             disabled={busy}
-            title={shortcutTitle("toggleLinking")}
+            title={bindingTitle("toggle_clip_linking", "Toggle clip linking")}
             onClick={() => void runOp(() => toggleClipLinking())}
           >
             Link {linkingEnabled ? "on" : "off"}
@@ -826,6 +892,18 @@ export default function TimelinePanel() {
         <div className="timeline-op-error" role="alert">
           <span>{opErrorMessage}</span>
           <button type="button" className="link-btn" onClick={clearOpError}>
+            Dismiss
+          </button>
+        </div>
+      )}
+      {shortcutToast && (
+        <div className="timeline-shortcut-toast" role="status">
+          {shortcutToast}
+          <button
+            type="button"
+            className="link-btn"
+            onClick={() => setShortcutToast(null)}
+          >
             Dismiss
           </button>
         </div>
@@ -878,6 +956,12 @@ export default function TimelinePanel() {
                 className="timeline-playhead"
                 style={{ left: playheadLeft }}
                 aria-hidden
+              />
+              <div
+                ref={cursorGuideRef}
+                className="timeline-cursor-guide"
+                aria-hidden
+                style={{ display: "none", left: 0 }}
               />
               {indicatorLeft !== null && (
                 <div
@@ -951,16 +1035,30 @@ export default function TimelinePanel() {
                               "track-mute-btn" +
                               (track.muted ? " track-mute-btn--on" : "")
                             }
-                            title={shortcutTitle("muteTrack")}
+                            title={bindingTitle("toggle_track_mute", "Mute track")}
                             aria-label={
                               track.muted ? "Unmute track" : "Mute track"
                             }
-                            disabled={busy}
+                            disabled={busy || track.locked}
                             onClick={() =>
                               toggleTrackMuted(track.id, track.muted)
                             }
                           >
                             {track.muted ? "🔇" : "🔊"}
+                          </button>
+                          <button
+                            type="button"
+                            className={
+                              "track-lock-btn" + (track.locked ? " track-lock-btn--on" : "")
+                            }
+                            title={bindingTitle("toggle_track_lock", "Lock track")}
+                            aria-label={track.locked ? "Unlock track" : "Lock track"}
+                            disabled={busy}
+                            onClick={() =>
+                              toggleTrackLocked(track.id, track.locked)
+                            }
+                          >
+                            {track.locked ? "🔒" : "🔓"}
                           </button>
                           <label className="track-label__vol">
                             <span className="sr-only">Track volume</span>
@@ -1003,6 +1101,7 @@ export default function TimelinePanel() {
                         const selected =
                           selectedClipIds.includes(clip.id) ||
                           clip.id === selectedClipId;
+                        const cursorTarget = clip.id === cursorTargetClipId;
                         const partner =
                           timeline && (track.type === "video" || track.type === "audio")
                             ? linkedPartnerId(timeline, clip.id)
@@ -1030,6 +1129,7 @@ export default function TimelinePanel() {
                             className={
                               trackClipClass(track.type) +
                               (selected ? " tl-clip--selected" : "") +
+                              (cursorTarget ? " tl-clip--cursor-target" : "") +
                               (linkedHover ? " tl-clip--linked-peer-hover" : "")
                             }
                             style={{ left, width, touchAction: "none" }}
@@ -1145,7 +1245,7 @@ export default function TimelinePanel() {
                 return [
                   {
                     label: "Separate audio",
-                    shortcut: shortcutKeys("separateAudio"),
+                    shortcut: bindingKeysOnly("separate_audio"),
                     disabled: !canSeparate || busy,
                     onSelect: () =>
                       void runOp(async () => {
@@ -1158,7 +1258,7 @@ export default function TimelinePanel() {
                   },
                   {
                     label: "Reattach audio",
-                    shortcut: shortcutKeys("reattachAudio"),
+                    shortcut: bindingKeysOnly("reattach_audio"),
                     disabled: !canReattach || busy,
                     onSelect: () =>
                       void runOp(async () => {
@@ -1171,7 +1271,7 @@ export default function TimelinePanel() {
                   },
                   {
                     label: "Unlink",
-                    shortcut: shortcutKeys("unlink"),
+                    shortcut: bindingKeysOnly("unlink_clips"),
                     disabled: !canUnlink || busy,
                     onSelect: () =>
                       void runOp(async () => {
@@ -1184,7 +1284,7 @@ export default function TimelinePanel() {
                   },
                   {
                     label: "Split at playhead",
-                    shortcut: shortcutKeys("split"),
+                    shortcut: bindingKeysOnly("split"),
                     disabled:
                       busy ||
                       !playheadInsideClip(c, trackType, playhead),
@@ -1199,7 +1299,7 @@ export default function TimelinePanel() {
                   },
                   {
                     label: "Delete",
-                    shortcut: shortcutKeys("delete"),
+                    shortcut: bindingKeysOnly("delete"),
                     disabled: busy,
                     onSelect: () =>
                       void runOp(async () => {
@@ -1212,7 +1312,7 @@ export default function TimelinePanel() {
                   },
                   {
                     label: vol <= 0 ? "Unmute clip" : "Mute clip",
-                    shortcut: shortcutKeys("muteClip"),
+                    shortcut: bindingKeysOnly("mute_clip"),
                     disabled: busy,
                     onSelect: () =>
                       void runOp(() =>
@@ -1227,7 +1327,7 @@ export default function TimelinePanel() {
                   },
                   {
                     label: "Copy",
-                    shortcut: shortcutKeys("copyClip"),
+                    shortcut: bindingKeysOnly("copy_clip"),
                     disabled: busy,
                     onSelect: () =>
                       copyClipPayload({
@@ -1238,7 +1338,7 @@ export default function TimelinePanel() {
                   },
                   {
                     label: "Paste at playhead",
-                    shortcut: shortcutKeys("pasteClip"),
+                    shortcut: bindingKeysOnly("paste_clip"),
                     disabled: busy || !canPaste,
                     onSelect: () => {
                       const data = readClipFromClipboard();

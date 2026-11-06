@@ -11,13 +11,18 @@ import { useTimelineStore } from "../store/timelineStore";
 type Props = {
   open: boolean;
   onClose: () => void;
+  onOpenKeyboardShortcuts?: () => void;
 };
 
 /**
  * Folder names are one segment under the project root (backend enforces).
  * API key is write-only on the server; we never show the value back.
  */
-export default function SettingsPanel({ open, onClose }: Props) {
+export default function SettingsPanel({
+  open,
+  onClose,
+  onOpenKeyboardShortcuts,
+}: Props) {
   const setUiBannerError = useTimelineStore((s) => s.setUiBannerError);
   const [loading, setLoading] = useState(false);
   const [s, setS] = useState<PublicSettings | null>(null);
@@ -123,9 +128,23 @@ export default function SettingsPanel({ open, onClose }: Props) {
       >
         <div className="modal-sheet__header">
           <h2 className="modal-sheet__title">Settings</h2>
-          <button type="button" className="btn btn--ghost" onClick={onClose}>
-            Close
-          </button>
+          <div className="modal-sheet__header-actions">
+            {onOpenKeyboardShortcuts ? (
+              <button
+                type="button"
+                className="btn btn--ghost"
+                onClick={() => {
+                  onOpenKeyboardShortcuts();
+                  onClose();
+                }}
+              >
+                Keyboard shortcuts…
+              </button>
+            ) : null}
+            <button type="button" className="btn btn--ghost" onClick={onClose}>
+              Close
+            </button>
+          </div>
         </div>
         {loading && !s ? (
           <p className="modal-sheet__muted">Loading…</p>

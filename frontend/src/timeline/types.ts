@@ -73,6 +73,8 @@ export type TimelineTrack = {
   id: string;
   type: TrackType;
   label?: string;
+  /** When true, block edits that target this track via cursor shortcuts. */
+  locked?: boolean;
   /** Mute this video or audio track in the UI (export unchanged in this milestone). */
   muted?: boolean;
   /** Linear gain for preview/export mixing (default 1). */

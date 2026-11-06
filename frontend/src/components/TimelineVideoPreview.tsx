@@ -12,10 +12,15 @@ import {
 import { useCaptionPreviewOverlay } from "../hooks/useCaptionPreviewOverlay";
 import { useTimelineStore } from "../store/timelineStore";
 import { formatTimecode } from "../utils/timeFormat";
+import { useKeybindingsStore } from "../store/keybindingsStore";
+import { useEditorSettingsStore } from "../store/editorSettingsStore";
+import { getBindingLabel, getBindingTitle } from "../shortcuts/tooltip";
 
 const SOURCE_END_EPS = 0.05;
 
 export default function TimelineVideoPreview() {
+  useEditorSettingsStore((s) => s.shortcutTargeting);
+  useEditorSettingsStore((s) => s.perActionTargetMode);
   const timeline = useTimelineStore((s) => s.timeline);
   const playhead = useTimelineStore((s) => s.playheadSeconds);
   const playing = useTimelineStore((s) => s.timelinePlaying);
@@ -223,26 +228,8 @@ export default function TimelineVideoPreview() {
     return () => cancelAnimationFrame(raf);
   }, [playing, timeline]);
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.code !== "Space") return;
-      const t = e.target as HTMLElement | null;
-      if (
-        t &&
-        (t.tagName === "INPUT" ||
-          t.tagName === "TEXTAREA" ||
-          t.tagName === "SELECT" ||
-          t.tagName === "BUTTON" ||
-          t.isContentEditable)
-      ) {
-        return;
-      }
-      e.preventDefault();
-      togglePlaying();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlaying]);
+  const kbOverrides = useKeybindingsStore((s) => s.overrides);
+  const playPauseTitle = getBindingTitle("play_pause", kbOverrides);
 
   const onToggle = () => togglePlaying();
 
@@ -286,6 +273,7 @@ export default function TimelineVideoPreview() {
           type="button"
           className="preview-controls__play"
           onClick={onToggle}
+          title={playPauseTitle}
           aria-label={playing ? "Pause timeline" : "Play timeline"}
         >
           {playing ? "Pause" : "Play"}
@@ -315,7 +303,9 @@ export default function TimelineVideoPreview() {
         >
           {audioMasterMuted ? "Unmute" : "Mute"}
         </button>
-        <span className="preview-controls__hint">Space — video track</span>
+        <span className="preview-controls__hint" title={playPauseTitle}>
+          {getBindingLabel("play_pause", kbOverrides)}
+        </span>
       </div>
     </div>
   );

@@ -50,6 +50,14 @@ def get_public_settings(root: Path) -> dict[str, Any]:
         for item in ucs:
             if isinstance(item, dict) and item.get("id"):
                 user_presets.append(item)
+    kb = raw.get("keybindings")
+    keybindings: dict[str, Any] = {}
+    if isinstance(kb, dict):
+        keybindings = kb
+    ui = raw.get("ui")
+    ui_public: dict[str, Any] = {}
+    if isinstance(ui, dict):
+        ui_public = ui
     return {
         "planner_api_key_configured": configured,
         "paths": {
@@ -62,6 +70,8 @@ def get_public_settings(root: Path) -> dict[str, Any]:
             "max_length": render_defaults.get("max_length"),
         },
         "user_caption_styles": user_presets,
+        "keybindings": keybindings,
+        "ui": ui_public,
     }
 
 
@@ -99,6 +109,20 @@ def merge_settings(root: Path, body: dict[str, Any]) -> dict[str, Any]:
             )
     if "user_caption_styles" in body and isinstance(body["user_caption_styles"], list):
         raw["user_caption_styles"] = body["user_caption_styles"]
+    if "keybindings" in body:
+        kb = body["keybindings"]
+        if kb is None:
+            raw.pop("keybindings", None)
+        elif isinstance(kb, dict):
+            raw["keybindings"] = kb
+    if "ui" in body:
+        u = body["ui"]
+        if u is None:
+            raw.pop("ui", None)
+        elif isinstance(u, dict):
+            prev = raw.get("ui") if isinstance(raw.get("ui"), dict) else {}
+            merged = {**prev, **u}
+            raw["ui"] = merged
     save_raw(root, raw)
     return get_public_settings(root)
 

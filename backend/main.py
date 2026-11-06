@@ -136,6 +136,8 @@ class SettingsUpdate(BaseModel):
     paths: dict[str, str] | None = None
     render_defaults: dict[str, Any] | None = None
     user_caption_styles: list[dict[str, Any]] | None = None
+    keybindings: dict[str, Any] | None = None
+    ui: dict[str, Any] | None = None
 
 
 class CaptionsAssBody(BaseModel):
@@ -375,6 +377,10 @@ def put_settings(body: SettingsUpdate, paths: ProjectPaths = Depends(get_paths))
         payload["render_defaults"] = body.render_defaults
     if body.user_caption_styles is not None:
         payload["user_caption_styles"] = body.user_caption_styles
+    if body.keybindings is not None:
+        payload["keybindings"] = body.keybindings
+    if body.ui is not None:
+        payload["ui"] = body.ui
     log_event("info", "Settings updated (non-secret keys only)")
     merge_settings(paths.root, payload)
     paths2 = refresh_paths_from_settings()

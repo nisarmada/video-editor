@@ -9,10 +9,18 @@ import SettingsPanel from "./components/SettingsPanel";
 import SourcePreview from "./components/SourcePreview";
 import TimelineVideoPreview from "./components/TimelineVideoPreview";
 import TimelinePanel from "./components/TimelinePanel";
+import KeyboardShortcutsPanel from "./components/KeyboardShortcutsPanel";
+import ShortcutCheatSheet from "./components/ShortcutCheatSheet";
+import { updateCursorContextPartial } from "./store/cursorContextStore";
+import { useShortcuts } from "./hooks/useShortcuts";
+import { getBindingTitle } from "./shortcuts/tooltip";
+import { useKeybindingsStore } from "./store/keybindingsStore";
 import { useTimelineStore } from "./store/timelineStore";
 import "./App.css";
 
 export default function App() {
+  useShortcuts();
+
   const currentPlanName = useTimelineStore((s) => s.currentPlanName);
   const availablePlans = useTimelineStore((s) => s.availablePlans);
   const plansListError = useTimelineStore((s) => s.plansListError);
@@ -58,6 +66,13 @@ export default function App() {
   const [plannerBrief, setPlannerBrief] = useState("");
   const [plannerSaveAs, setPlannerSaveAs] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const keyboardShortcutsOpen = useKeybindingsStore((s) => s.keyboardSettingsOpen);
+  const setKeyboardShortcutsOpen = useKeybindingsStore(
+    (s) => s.setKeyboardSettingsOpen,
+  );
+  const kbOverrides = useKeybindingsStore((s) => s.overrides);
+  const cheatSheetOpen = useKeybindingsStore((s) => s.cheatSheetOpen);
+  const setCheatSheetOpen = useKeybindingsStore((s) => s.setCheatSheetOpen);
   const [outputOpen, setOutputOpen] = useState(false);
   const [logsExpanded, setLogsExpanded] = useState(false);
 
@@ -77,28 +92,6 @@ export default function App() {
       : "";
 
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (!e.metaKey && !e.ctrlKey) return;
-      if (e.key.toLowerCase() !== "s") return;
-      const t = e.target as HTMLElement | null;
-      if (
-        t &&
-        (t.tagName === "INPUT" ||
-          t.tagName === "TEXTAREA" ||
-          t.tagName === "SELECT" ||
-          t.isContentEditable)
-      ) {
-        return;
-      }
-      if (!canSave) return;
-      e.preventDefault();
-      void savePlan();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [canSave, savePlan]);
-
-  useEffect(() => {
     if (!isDirty) return;
     const onBeforeUnload = (e: BeforeUnloadEvent) => {
       e.preventDefault();
@@ -113,6 +106,8 @@ export default function App() {
       : saveStatus;
 
   const displayProjectName = currentPlanName || "Untitled";
+  const saveTitle = getBindingTitle("save_plan", kbOverrides);
+  const exportTitle = getBindingTitle("export_render", kbOverrides);
 
   return (
     <div className="app">
@@ -201,6 +196,7 @@ export default function App() {
             type="button"
             className="btn btn--primary"
             disabled={!canSave}
+            title={saveTitle}
             onClick={() => void savePlan()}
           >
             Save
@@ -212,6 +208,7 @@ export default function App() {
             type="button"
             className="btn btn--export"
             disabled={!canExport}
+            title={exportTitle}
             onClick={() => void exportPlan()}
           >
             Export
@@ -237,6 +234,14 @@ export default function App() {
             onClick={() => setOutputOpen(true)}
           >
             Output…
+          </button>
+          <button
+            type="button"
+            className="btn btn--ghost"
+            title={getBindingTitle("open_keyboard_settings", kbOverrides)}
+            onClick={() => setKeyboardShortcutsOpen(true)}
+          >
+            Keyboard
           </button>
           <button
             type="button"
@@ -320,11 +325,38 @@ export default function App() {
 
       <div className="editor-workspace">
         <div className="editor-workspace__upper">
-          <div className="col col--media">
+          <div
+            className="col col--media"
+            data-cursor-region="mediaBin"
+            onPointerEnter={() => {
+              const coarse = window.matchMedia("(pointer: coarse)").matches;
+              updateCursorContextPartial({
+                region: "mediaBin",
+                hasFinePointer: !coarse,
+              });
+            }}
+            onPointerLeave={() =>
+              updateCursorContextPartial({ region: "none", hasFinePointer: false })
+            }
+          >
             <AssetCategoryStrip />
             <MediaBin />
           </div>
-          <section className="panel panel--player" aria-label="Player">
+          <section
+            className="panel panel--player"
+            aria-label="Player"
+            data-cursor-region="preview"
+            onPointerEnter={() => {
+              const coarse = window.matchMedia("(pointer: coarse)").matches;
+              updateCursorContextPartial({
+                region: "preview",
+                hasFinePointer: !coarse,
+              });
+            }}
+            onPointerLeave={() =>
+              updateCursorContextPartial({ region: "none", hasFinePointer: false })
+            }
+          >
             <div className="panel__header panel__header--player">
               <span>Player</span>
               <div
@@ -358,7 +390,21 @@ export default function App() {
               )}
             </div>
           </section>
-          <section className="panel panel--details" aria-label="Details">
+          <section
+            className="panel panel--details"
+            aria-label="Details"
+            data-cursor-region="details"
+            onPointerEnter={() => {
+              const coarse = window.matchMedia("(pointer: coarse)").matches;
+              updateCursorContextPartial({
+                region: "details",
+                hasFinePointer: !coarse,
+              });
+            }}
+            onPointerLeave={() =>
+              updateCursorContextPartial({ region: "none", hasFinePointer: false })
+            }
+          >
             <div className="panel__header">Details</div>
             <div className="panel__body panel__body--details">
               <ClipDetails />
@@ -374,7 +420,16 @@ export default function App() {
         onToggle={() => setLogsExpanded((x) => !x)}
       />
 
-      <SettingsPanel open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <SettingsPanel
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        onOpenKeyboardShortcuts={() => setKeyboardShortcutsOpen(true)}
+      />
+      <KeyboardShortcutsPanel
+        open={keyboardShortcutsOpen}
+        onClose={() => setKeyboardShortcutsOpen(false)}
+      />
+      <ShortcutCheatSheet open={cheatSheetOpen} onClose={() => setCheatSheetOpen(false)} />
       <OutputManagerPanel open={outputOpen} onClose={() => setOutputOpen(false)} />
     </div>
   );

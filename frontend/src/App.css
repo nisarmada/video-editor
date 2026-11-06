@@ -514,6 +514,34 @@
   pointer-events: none;
 }
 
+.timeline-cursor-guide {
+  position: absolute;
+  top: 28px;
+  bottom: 0;
+  width: 1px;
+  margin-left: 0;
+  background: rgba(120, 180, 255, 0.85);
+  z-index: 3;
+  pointer-events: none;
+}
+
+.tl-clip--cursor-target {
+  outline: 2px solid rgba(120, 180, 255, 0.95);
+  outline-offset: -1px;
+}
+
+.timeline-shortcut-toast {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.35rem 0.75rem;
+  margin: 0 0 0.5rem;
+  font-size: 0.9rem;
+  background: rgba(40, 50, 70, 0.95);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
 .timeline-ruler-row {
   display: flex;
   position: sticky;
@@ -1658,4 +1686,191 @@
   font-size: 11px;
   color: var(--text-muted);
   white-space: pre-wrap;
+}
+
+/* Keyboard shortcuts overlay / editor (minimal) */
+.shortcut-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 24px 16px;
+  overflow: auto;
+}
+
+.shortcut-overlay--wide .shortcut-overlay__panel {
+  max-width: 720px;
+}
+
+.shortcut-overlay__panel {
+  width: 100%;
+  max-width: 480px;
+  max-height: 90vh;
+  overflow: auto;
+  background: #12141a;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.shortcut-overlay__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.shortcut-overlay__title {
+  margin: 0;
+  font-size: 16px;
+}
+
+.shortcut-overlay__body {
+  padding: 12px 14px 16px;
+}
+
+.shortcut-overlay__section {
+  margin-bottom: 14px;
+}
+
+.shortcut-overlay__cat {
+  margin: 8px 0 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.shortcut-overlay__list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.shortcut-overlay__row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 0;
+  font-size: 12px;
+}
+
+.shortcut-overlay__keys {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.shortcut-settings__toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.shortcut-settings__toolbar input[type="search"] {
+  flex: 1;
+  min-width: 140px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: #0a0b0e;
+  color: var(--text-primary);
+}
+
+.shortcut-settings__note {
+  margin: 0;
+  padding: 8px 14px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.shortcut-settings__conflict {
+  display: flex;
+  gap: 8px;
+  padding: 0 14px 8px;
+}
+
+.shortcut-settings__body {
+  padding: 10px 14px 16px;
+}
+
+.shortcut-settings__actions {
+  margin: 0 0 16px;
+  padding: 0;
+  list-style: none;
+}
+
+.shortcut-settings__action {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.shortcut-settings__label {
+  font-size: 13px;
+}
+
+.shortcut-settings__desc {
+  display: block;
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+.shortcut-settings__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.shortcut-settings__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  font-size: 11px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: #1a1c22;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.shortcut-settings__chip-x {
+  opacity: 0.7;
+  cursor: pointer;
+}
+
+.shortcut-settings__add {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+  border-radius: 4px;
+  border: 1px dashed var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.shortcut-settings__unassigned {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.shortcut-settings__reset {
+  margin-left: auto;
+  padding: 2px 8px !important;
+  font-size: 11px !important;
 }
