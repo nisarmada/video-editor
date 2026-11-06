@@ -1,5 +1,5 @@
 import MediaBin from "./components/MediaBin";
-import SourcePreview from "./components/SourcePreview";
+import TimelineVideoPreview from "./components/TimelineVideoPreview";
 import TimelinePanel from "./components/TimelinePanel";
 import { useTimelineStore } from "./store/timelineStore";
 import "./App.css";
@@ -31,7 +31,12 @@ export default function App() {
 
         <div className="resize-handle" aria-hidden title="Resize (coming soon)" />
 
-        <SourcePreview />
+        <section className="panel panel--preview" aria-label="Preview">
+          <div className="panel__header">Preview — timeline (video track)</div>
+          <div className="panel__body panel__body--preview">
+            <TimelineVideoPreview />
+          </div>
+        </section>
 
         <div className="resize-handle" aria-hidden title="Resize (coming soon)" />
 

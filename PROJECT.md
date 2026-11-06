@@ -54,6 +54,9 @@ backend/    FastAPI server for UI and tools
 ## Current milestone
 **UI playback** — local web editor (`frontend/`) with media bin + proxy preview + read-only v2 timeline; `backend/` serves footage and plans. Next: timeline editing, then render + review loop.
 
+### Frontend session state (before milestone 5a — editing)
+Zustand `useTimelineStore` holds **`timeline`** (v2, server-loaded), **`playheadSeconds`**, **`selectedClipId`**, and UI-only fields (zoom, playing). **All timeline mutations** must go through **`applyOperation({ operation, arguments })`**, which `POST`s to `/api/timeline/apply-op`, then **replaces `timeline`** with the returned JSON. The same function returns **`undo`** for the undo stack; undo/redo and the Claude planner panel should reuse this path (planner may return a new timeline and call `applyOperation` per step or merge server-side — keep one code path for “mutate timeline via backend”).
+
 ## Later ideas (don't build yet)
 Style profile from reference creators, beat-synced cuts, music, captions
 styling, export to FCPXML, a simple UI.

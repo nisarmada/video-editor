@@ -32,6 +32,7 @@ export default function TimelinePanel() {
   const loadTimeline = useTimelineStore((s) => s.loadTimeline);
   const setPlayhead = useTimelineStore((s) => s.setPlayheadSeconds);
   const setPxPerSecond = useTimelineStore((s) => s.setPxPerSecond);
+  const setTimelinePlaying = useTimelineStore((s) => s.setTimelinePlaying);
   const planName = useTimelineStore((s) => s.planName);
 
   const rulerRef = useRef<HTMLDivElement>(null);
@@ -62,12 +63,13 @@ export default function TimelinePanel() {
     (e: React.MouseEvent<HTMLDivElement>) => {
       const el = rulerRef.current;
       if (!el) return;
+      setTimelinePlaying(false);
       const rect = el.getBoundingClientRect();
       const x = e.clientX - rect.left;
       const t = x / pxPerSecond;
       setPlayhead(Math.min(Math.max(0, t), duration || t));
     },
-    [pxPerSecond, setPlayhead, duration],
+    [pxPerSecond, setPlayhead, duration, setTimelinePlaying],
   );
 
   const playheadLeft = LABEL_WIDTH + playhead * pxPerSecond;
