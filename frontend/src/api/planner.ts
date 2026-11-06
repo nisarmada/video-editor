@@ -5,6 +5,8 @@ export type RunPlannerRequest = {
   brief: string;
   /** Plan filename without path, e.g. draft1 — backend writes plans/{save_as}.json */
   save_as: string;
+  /** Optional: limit planning context to these footage basenames (merged index required per file). */
+  clip_filenames?: string[];
 };
 
 export type RunPlannerResponse = {

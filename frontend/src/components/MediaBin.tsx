@@ -24,6 +24,7 @@ export default function MediaBin() {
   const loading = useTimelineStore((s) => s.footageLoading);
   const error = useTimelineStore((s) => s.footageError);
   const selectedName = useTimelineStore((s) => s.selectedFootageName);
+  const selectedNames = useTimelineStore((s) => s.selectedFootageNames);
   const fetchFootage = useTimelineStore((s) => s.fetchFootage);
   const rescanFootage = useTimelineStore((s) => s.rescanFootage);
   const selectFootage = useTimelineStore((s) => s.selectFootage);
@@ -91,8 +92,11 @@ export default function MediaBin() {
     setDeleteBusy(name);
     try {
       await deleteFootageFile(name);
-      if (selectedName === name) {
-        useTimelineStore.setState({ selectedFootageName: null });
+      if (selectedName === name || selectedNames.includes(name)) {
+        useTimelineStore.setState({
+          selectedFootageName: null,
+          selectedFootageNames: [],
+        });
       }
       await fetchFootage({ silent: true });
     } catch (e) {
@@ -195,7 +199,8 @@ export default function MediaBin() {
         )}
         <ul className="media-list">
           {clips.map((clip) => {
-            const isSelected = clip.name === selectedName;
+            const isSelected =
+              clip.name === selectedName || selectedNames.includes(clip.name);
             const pStatus = clip.process_status ?? "ready";
             const processing =
               pStatus === "processing" || pStatus === "pending";
@@ -206,7 +211,9 @@ export default function MediaBin() {
                   type="button"
                   className={`media-list__item${isSelected ? " media-list__item--selected" : ""}`}
                   draggable={!processing}
-                  onClick={() => selectFootage(clip.name)}
+                  onClick={(e) =>
+                    selectFootage(clip.name, { additive: e.shiftKey })
+                  }
                   onDragStart={(e) => {
                     if (processing) {
                       e.preventDefault();

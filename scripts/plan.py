@@ -80,11 +80,33 @@ def footage_clips() -> list[Path]:
     return sorted(p for p in root.iterdir() if p.suffix.lower() in exts and p.is_file())
 
 
-def load_indexes() -> list[tuple[Path, dict]]:
-    """Merged index/<stem>.json for each file in footage/."""
+def load_indexes(only_basenames: list[str] | None = None) -> list[tuple[Path, dict]]:
+    """Merged index/<stem>.json for each file in footage/ (or only the given basenames)."""
+    all_clips = footage_clips()
+    if only_basenames is not None:
+        want = {Path(n).name for n in only_basenames if n and str(n).strip()}
+        if not want:
+            raise ValueError("No clip names provided for selected-clips planning.")
+        by_name = {p.name: p for p in all_clips}
+        clips: list[Path] = []
+        unknown: list[str] = []
+        for name in sorted(want):
+            p = by_name.get(name)
+            if p is None:
+                unknown.append(name)
+            else:
+                clips.append(p)
+        if unknown:
+            raise ValueError(
+                "These files are not in footage/: " + ", ".join(unknown)
+            )
+        if not clips:
+            raise ValueError("No matching footage files for the selected clips.")
+    else:
+        clips = all_clips
     loaded: list[tuple[Path, dict]] = []
     missing: list[str] = []
-    for clip in footage_clips():
+    for clip in clips:
         path = merged_index_path(clip)
         data = load_json(path)
         if data is None:
@@ -237,14 +259,20 @@ def finalize_v2_plan(v1_plan: dict, brief: str, run_group_id: str) -> dict:
     return v2
 
 
-def generate_plan(brief: str, *, api_key: str | None = None) -> tuple[dict, str, dict]:
+def generate_plan(
+    brief: str,
+    *,
+    api_key: str | None = None,
+    clip_filenames: list[str] | None = None,
+) -> tuple[dict, str, dict]:
     """
     Call Claude, validate, return v2 plan, group_id, and token usage tallies.
     Requires cwd = project root (footage/, index/).
+    If clip_filenames is set, only those footage basenames are summarized for the model.
     """
     load_dotenv()
 
-    indexes = load_indexes()
+    indexes = load_indexes(only_basenames=clip_filenames)
     if not indexes:
         raise RuntimeError(
             "No merged indexes found. Add clips to footage/ and run index_clip.py."

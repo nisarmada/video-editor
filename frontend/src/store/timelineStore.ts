@@ -32,6 +32,19 @@ import {
 } from "./timelineMutation";
 import type { CaptionStyle, TimelineV2 } from "../timeline/types";
 
+/** Human-readable line after planner succeeds (toast + optional inline). */
+function summarizePlannerTimeline(tl: TimelineV2): string {
+  let videoClips = 0;
+  let audioTracksWithClips = 0;
+  for (const tr of tl.tracks ?? []) {
+    const n = tr.clips?.length ?? 0;
+    if (n === 0) continue;
+    if (tr.type === "video") videoClips += n;
+    if (tr.type === "audio") audioTracksWithClips += 1;
+  }
+  return `Generated timeline with ${videoClips} video clip${videoClips === 1 ? "" : "s"} and ${audioTracksWithClips} audio track${audioTracksWithClips === 1 ? "" : "s"}.`;
+}
+
 export const DEFAULT_PLAN_NAME = "draft1_v2";
 
 export const MIN_PX_PER_SEC = 24;
@@ -149,6 +162,8 @@ type TimelineViewState = {
 
   /** Selected item in the media bin (footage filename stem). */
   selectedFootageName: string | null;
+  /** Shift-click multi-select for AI planner scope (basenames). */
+  selectedFootageNames: string[];
   footageClips: FootageClip[];
   footageLoading: boolean;
   footageError: string | null;
@@ -180,6 +195,11 @@ type TimelineViewState = {
   /** POST /api/planner/run in flight. */
   plannerRunning: boolean;
   plannerError: string | null;
+  /** Sub-step: gathering context vs waiting on Claude vs applying timeline. */
+  plannerPhase: "idle" | "context" | "planning" | "applying" | "saving";
+  plannerProgressMessage: string | null;
+  /** Shown briefly after success (and in toast). */
+  plannerSuccessSummary: string | null;
 
   /** Apply local caption style edits (commits via applyOperation set_timeline_settings). */
   setCaptionStyleDraft: (style: CaptionStyle) => void;
@@ -199,8 +219,18 @@ type TimelineViewState = {
   savePlan: () => Promise<void>;
   /** Prompt for stem, PUT empty valid v2, refresh list, load. */
   createNewPlan: () => Promise<void>;
-  /** Run AI planner; on success refresh list and load the saved file (skip dirty confirm). */
-  runPlannerJob: (brief: string, saveAsStem: string) => Promise<void>;
+  /**
+   * Run AI planner. Writes plans/{save_as}.json; if that is the active plan, applies via
+   * replace_timeline (undoable) and auto-saves. Otherwise loads the new file.
+   */
+  runPlannerJob: (
+    brief: string,
+    saveAsStem: string,
+    opts?: {
+      footageScope?: "all" | "selected";
+      clipNames?: string[];
+    },
+  ) => Promise<void>;
   /** Save if dirty, then POST /api/render using plan file on disk. */
   exportPlan: () => Promise<void>;
   cancelExport: () => Promise<void>;
@@ -271,7 +301,8 @@ type TimelineViewState = {
   /** List footage from server. Pass `{ silent: true }` to refresh without clearing the list (polling). */
   fetchFootage: (opts?: { silent?: boolean }) => Promise<void>;
   rescanFootage: () => Promise<void>;
-  selectFootage: (name: string) => void;
+  /** `additive`: Shift+click — toggle in `selectedFootageNames` for planner scope. */
+  selectFootage: (name: string, opts?: { additive?: boolean }) => void;
   setPreviewPanelMode: (mode: PreviewPanelMode) => void;
 };
 
@@ -310,6 +341,7 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
   selectedClipId: null,
   selectedClipIds: [],
   selectedFootageName: null,
+  selectedFootageNames: [],
   footageClips: [],
   footageLoading: false,
   footageError: null,
@@ -326,6 +358,9 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
   shortcutToast: null,
   plannerRunning: false,
   plannerError: null,
+  plannerPhase: "idle",
+  plannerProgressMessage: null,
+  plannerSuccessSummary: null,
 
   fetchFootage: async (opts) => {
     const silent = opts?.silent ?? false;
@@ -358,12 +393,30 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
     }
   },
 
-  selectFootage: (name) =>
+  selectFootage: (name, opts) => {
+    if (opts?.additive) {
+      set((s) => {
+        const cur = new Set(s.selectedFootageNames);
+        if (cur.has(name)) cur.delete(name);
+        else cur.add(name);
+        const arr = [...cur];
+        const primary = arr.length ? arr[arr.length - 1]! : null;
+        return {
+          selectedFootageName: primary,
+          selectedFootageNames: arr,
+          previewPanelMode: "source",
+          timelinePlaying: false,
+        };
+      });
+      return;
+    }
     set({
       selectedFootageName: name,
+      selectedFootageNames: [name],
       previewPanelMode: "source",
       timelinePlaying: false,
-    }),
+    });
+  },
 
   setPreviewPanelMode: (mode) =>
     set({
@@ -481,6 +534,7 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
         timelinePlaying: false,
         selectedClipId: null,
         selectedClipIds: [],
+        selectedFootageNames: [],
         previewPanelMode: "timeline",
         undoStack: [],
         redoStack: [],
@@ -1105,13 +1159,17 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
     });
   },
 
-  runPlannerJob: async (brief, saveAsStem) => {
-    set({ plannerError: null });
+  runPlannerJob: async (brief, saveAsStem, opts) => {
+    set({
+      plannerError: null,
+      plannerSuccessSummary: null,
+      uiBannerError: null,
+    });
     if (typeof window !== "undefined") {
       if (get().isDirty) {
         if (
           !window.confirm(
-            "You have unsaved edits. The planner will save a new file and load it; unsaved work will be lost. Continue?",
+            "You have unsaved edits. The planner overwrites the plan file on disk; unsaved work will be lost. Continue?",
           )
         ) {
           return;
@@ -1120,7 +1178,7 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
     }
     const trimmed = brief.trim();
     if (!trimmed) {
-      set({ plannerError: "Brief is required." });
+      set({ plannerError: "Describe the edit you want (brief is required)." });
       return;
     }
     const stem = normalizePlanStem(saveAsStem);
@@ -1132,6 +1190,19 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
     if (stemErr) {
       set({ plannerError: stemErr });
       return;
+    }
+    const scope = opts?.footageScope ?? "all";
+    let clipFilter: string[] | undefined;
+    if (scope === "selected") {
+      const names = opts?.clipNames ?? get().selectedFootageNames;
+      if (!names.length) {
+        set({
+          plannerError:
+            "Select one or more clips in the media bin (Shift+click), or switch scope to “All clips”.",
+        });
+        return;
+      }
+      clipFilter = [...names];
     }
     if (
       typeof window !== "undefined" &&
@@ -1145,19 +1216,75 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
         return;
       }
     }
-    set({ plannerRunning: true, plannerError: null });
+    set({
+      plannerRunning: true,
+      plannerError: null,
+      plannerPhase: "context",
+      plannerProgressMessage: "Gathering media index context…",
+    });
     try {
+      set({ plannerPhase: "planning", plannerProgressMessage: "Sending to planner (Claude)…" });
       const result = await callPlanner({
         brief: trimmed,
         save_as: stem,
+        ...(clipFilter ? { clip_filenames: clipFilter } : {}),
       });
       await get().refreshAvailablePlans();
       const stemFromFile = normalizePlanStem(result.plan_name);
+      const merged = ensureCaptionStyle(result.timeline);
+
+      const activeStem = normalizePlanStem(get().currentPlanName);
+      if (activeStem && stemFromFile === activeStem && get().timeline) {
+        set({ plannerPhase: "applying", plannerProgressMessage: "Applying plan to timeline…" });
+        await get().applyOperation({
+          operation: "replace_timeline",
+          arguments: { timeline_data: merged as unknown as Record<string, unknown> },
+        });
+        set({ plannerPhase: "saving", plannerProgressMessage: "Saving plan file…" });
+        await savePlanToServer(stemFromFile, get().timeline!);
+        const doneTl = get().timeline!;
+        set({
+          plannerRunning: false,
+          plannerError: null,
+          plannerPhase: "idle",
+          plannerProgressMessage: null,
+          isDirty: false,
+          saveStatus: "saved",
+          saveError: null,
+          plannerSuccessSummary: summarizePlannerTimeline(doneTl),
+          selectedClipId: null,
+          selectedClipIds: [],
+        });
+        get().setShortcutToast(summarizePlannerTimeline(doneTl));
+        window.setTimeout(() => get().setShortcutToast(null), 6000);
+        return;
+      }
+
       await get().loadPlan(stemFromFile, { skipDirtyConfirm: true });
-      set({ plannerRunning: false, plannerError: null });
+      const tl2 = get().timeline;
+      set({
+        plannerRunning: false,
+        plannerError: null,
+        plannerPhase: "idle",
+        plannerProgressMessage: null,
+        ...(tl2
+          ? { plannerSuccessSummary: summarizePlannerTimeline(tl2) }
+          : {}),
+      });
+      if (tl2) {
+        const line = summarizePlannerTimeline(tl2);
+        get().setShortcutToast(line);
+        window.setTimeout(() => get().setShortcutToast(null), 6000);
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Planner failed";
-      set({ plannerRunning: false, plannerError: msg });
+      set({
+        plannerRunning: false,
+        plannerError: msg,
+        plannerPhase: "idle",
+        plannerProgressMessage: null,
+        uiBannerError: msg,
+      });
     }
   },
 }));

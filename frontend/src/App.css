@@ -118,6 +118,147 @@
   color: #e88a8a;
 }
 
+/* AI assistant command bar (below ExportBar) */
+.ai-command-bar {
+  flex-shrink: 0;
+  padding: 10px 16px 12px;
+  background: linear-gradient(180deg, #161922 0%, #12141a 100%);
+  border-bottom: 1px solid var(--border);
+}
+
+.ai-command-bar__row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px 14px;
+}
+
+.ai-command-bar__label {
+  display: block;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+.ai-command-bar__prompt {
+  flex: 1 1 280px;
+  min-width: 0;
+}
+
+.ai-command-bar__save {
+  flex: 0 1 160px;
+  min-width: 120px;
+}
+
+.ai-command-bar__input {
+  width: 100%;
+  padding: 8px 11px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.ai-command-bar__input--stem {
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+}
+
+.ai-command-bar__input:focus {
+  outline: none;
+  border-color: rgba(0, 194, 203, 0.55);
+  box-shadow: 0 0 0 1px rgba(0, 194, 203, 0.2);
+}
+
+.ai-command-bar__scope {
+  flex: 0 1 auto;
+}
+
+.ai-command-bar__segment {
+  display: flex;
+  border-radius: 6px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+
+.ai-command-bar__segment .btn--segment {
+  border: none;
+  border-radius: 0;
+}
+
+.ai-command-bar__submit {
+  flex: 0 0 auto;
+  min-width: 118px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.ai-command-bar__spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255, 255, 255, 0.25);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: ai-cmdbar-spin 0.7s linear infinite;
+}
+
+@keyframes ai-cmdbar-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.ai-command-bar__status {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 14px;
+  font-size: 12px;
+  min-height: 1.25em;
+}
+
+.ai-command-bar__progress {
+  color: var(--accent);
+}
+
+.ai-command-bar__hint {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.ai-command-bar__error {
+  color: #e88a8a;
+}
+
+.ai-command-bar__ok {
+  color: #8dd4a3;
+}
+
+.ai-command-bar__help {
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+
+.ai-command-bar__kbd {
+  display: inline-block;
+  padding: 1px 5px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  font-size: 10px;
+  font-family: ui-monospace, monospace;
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+}
+
 .editor-workspace {
   flex: 1;
   min-height: 0;

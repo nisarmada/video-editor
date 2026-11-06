@@ -121,6 +121,8 @@ class SaveTimelineRequest(BaseModel):
 class PlannerRequest(BaseModel):
     brief: str
     save_as: str = Field(description="Plan filename without path, e.g. draft1")
+    # If set, only these footage basenames are sent to the model (merged indexes must exist).
+    clip_filenames: list[str] | None = None
 
 
 class RenderRequest(BaseModel):
@@ -770,6 +772,7 @@ def run_planner(
             plan_v2, group_id, usage = generate_plan(
                 body.brief,
                 api_key=api_key,
+                clip_filenames=body.clip_filenames,
             )
         except RuntimeError as e:
             raise HTTPException(status_code=503, detail=str(e))

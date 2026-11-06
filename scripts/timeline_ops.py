@@ -1095,6 +1095,16 @@ def unlink_clips(timeline: dict, *, clip_id: str) -> TimelineOpResult:
     }
 
 
+def replace_timeline(timeline: dict, *, timeline_data: dict) -> TimelineOpResult:
+    """Swap the entire v2 timeline (e.g. AI planner output); undo restores the previous tree."""
+    old_snap = copy.deepcopy(timeline)
+    new_tl = copy.deepcopy(timeline_data)
+    return {
+        "timeline": new_tl,
+        "undo": {"op": "replace_timeline", "previous_timeline": old_snap},
+    }
+
+
 def apply_undo(timeline: dict, undo: dict) -> TimelineOpResult:
     """Apply an undo payload returned by any operation."""
     op = undo.get("op")
@@ -1240,6 +1250,15 @@ def apply_undo(timeline: dict, undo: dict) -> TimelineOpResult:
                 "properties": redo,
             },
         }
+    if op == "replace_timeline":
+        prev = undo.get("previous_timeline")
+        if not isinstance(prev, dict):
+            raise ValueError("replace_timeline undo: missing previous_timeline.")
+        cur_snap = copy.deepcopy(timeline)
+        return {
+            "timeline": copy.deepcopy(prev),
+            "undo": {"op": "replace_timeline", "previous_timeline": cur_snap},
+        }
     raise ValueError(f"Unknown undo op: {op!r}.")
 
 
@@ -1259,6 +1278,7 @@ OPERATIONS = {
     "remove_track": remove_track,
     "restore_track": restore_track,
     "merge_clips": merge_clips,
+    "replace_timeline": replace_timeline,
     "set_clip_property": set_clip_property,
     "set_track_property": set_track_property,
     "set_timeline_settings": set_timeline_settings,

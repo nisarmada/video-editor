@@ -92,6 +92,37 @@ def test_apply_timeline_op(client: TestClient):
     assert body["undo"]["op"] == "set_clip_property"
 
 
+def test_replace_timeline_undo(client: TestClient):
+    tl = _minimal_v2()
+    tl2 = _minimal_v2()
+    tl2["name"] = "replaced"
+    r = client.post(
+        "/api/timeline/apply-op",
+        json={
+            "timeline": tl,
+            "operation": "replace_timeline",
+            "arguments": {"timeline_data": tl2},
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["timeline"].get("name") == "replaced"
+    assert body["undo"]["op"] == "replace_timeline"
+
+    back = client.post(
+        "/api/timeline/apply-op",
+        json={
+            "timeline": body["timeline"],
+            "operation": "apply_undo",
+            "arguments": {"undo": body["undo"]},
+        },
+    )
+    assert back.status_code == 200
+    restored = back.json()["timeline"]
+    assert restored.get("name") == "test"
+    assert len(restored["tracks"][0]["clips"]) == 1
+
+
 def test_apply_undo_restores_delete(client: TestClient, monkeypatch):
     monkeypatch.setattr(
         "backend.main.validate_plan_data",

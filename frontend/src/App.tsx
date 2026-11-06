@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import AssetCategoryStrip from "./components/AssetCategoryStrip";
 import ClipDetails from "./components/ClipDetails";
 import ExportBar from "./components/ExportBar";
+import AICommandBar from "./components/AICommandBar";
 import LogsPanel from "./components/LogsPanel";
 import MediaBin from "./components/MediaBin";
 import OutputManagerPanel from "./components/OutputManagerPanel";
@@ -58,13 +59,6 @@ export default function App() {
     !saving &&
     !applyOperationInProgress;
 
-  const plannerRunning = useTimelineStore((s) => s.plannerRunning);
-  const plannerError = useTimelineStore((s) => s.plannerError);
-  const runPlannerJob = useTimelineStore((s) => s.runPlannerJob);
-
-  const [plannerOpen, setPlannerOpen] = useState(false);
-  const [plannerBrief, setPlannerBrief] = useState("");
-  const [plannerSaveAs, setPlannerSaveAs] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const keyboardShortcutsOpen = useKeybindingsStore((s) => s.keyboardSettingsOpen);
   const setKeyboardShortcutsOpen = useKeybindingsStore(
@@ -75,12 +69,6 @@ export default function App() {
   const setCheatSheetOpen = useKeybindingsStore((s) => s.setCheatSheetOpen);
   const [outputOpen, setOutputOpen] = useState(false);
   const [logsExpanded, setLogsExpanded] = useState(false);
-
-  useEffect(() => {
-    if (currentPlanName) {
-      setPlannerSaveAs((prev) => prev || currentPlanName);
-    }
-  }, [currentPlanName]);
 
   useEffect(() => {
     void initSession();
@@ -250,20 +238,6 @@ export default function App() {
           >
             Settings
           </button>
-          <button
-            type="button"
-            className="btn btn--ghost"
-            disabled={
-              plannerRunning ||
-              timelineLoading ||
-              saving ||
-              rendering ||
-              applyOperationInProgress
-            }
-            onClick={() => setPlannerOpen((o) => !o)}
-          >
-            AI planner…
-          </button>
         </div>
       </header>
 
@@ -282,46 +256,7 @@ export default function App() {
 
       <ExportBar />
 
-      {plannerOpen && (
-        <div className="planner-bar" role="region" aria-label="Planner">
-          <label className="planner-bar__field">
-            Brief{" "}
-            <input
-              type="text"
-              value={plannerBrief}
-              onChange={(e) => setPlannerBrief(e.target.value)}
-              disabled={plannerRunning}
-            />
-          </label>
-          <label className="planner-bar__field">
-            Save as{" "}
-            <input
-              type="text"
-              value={plannerSaveAs}
-              onChange={(e) => setPlannerSaveAs(e.target.value)}
-              placeholder="stem, no .json"
-              disabled={plannerRunning}
-            />
-          </label>
-          <button
-            type="button"
-            className="btn btn--primary"
-            disabled={
-              plannerRunning ||
-              timelineLoading ||
-              saving ||
-              rendering ||
-              applyOperationInProgress
-            }
-            onClick={() =>
-              void runPlannerJob(plannerBrief, plannerSaveAs || currentPlanName)
-            }
-          >
-            {plannerRunning ? "Running…" : "Run planner"}
-          </button>
-          {plannerError && <span className="planner-bar__error">{plannerError}</span>}
-        </div>
-      )}
+      <AICommandBar />
 
       <div className="editor-workspace">
         <div className="editor-workspace__upper">
