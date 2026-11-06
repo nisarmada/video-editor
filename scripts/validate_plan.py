@@ -104,7 +104,7 @@ def validate_segments(
 def validate_plan_data(
     data: dict | list,
     max_length: float | None = None,
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     if isinstance(data, dict) and is_v2(data):
         return validate_v2_data(
             data,
@@ -112,17 +112,18 @@ def validate_plan_data(
             resolve_source,
             video_duration_seconds,
         )
-    return validate_segments(v1_segments_from_data(data), max_length)
+    se = validate_segments(v1_segments_from_data(data), max_length)
+    return se, []
 
 
 def validate_plan(
     plan_path: Path,
     max_length: float | None = None,
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     try:
         data = load_plan_file(plan_path)
     except json.JSONDecodeError as e:
-        return [str(e)]
+        return [str(e)], []
     return validate_plan_data(data, max_length)
 
 
@@ -142,12 +143,16 @@ def main() -> None:
         print(f"Error: plan not found: {plan_path}", file=sys.stderr)
         sys.exit(1)
 
-    errors = validate_plan(plan_path, args.max_length)
+    errors, warnings = validate_plan(plan_path, args.max_length)
     if errors:
         print("Plan validation failed:")
         for err in errors:
             print(f"  - {err}")
         sys.exit(1)
+    if warnings:
+        print("Warnings:")
+        for w in warnings:
+            print(f"  - {w}")
 
     data = load_plan_file(plan_path)
     version = "v2" if isinstance(data, dict) and is_v2(data) else "v1"

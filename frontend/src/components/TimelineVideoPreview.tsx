@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useTimelineAudio } from "../audio/useTimelineAudio";
 import {
   activeVideoClipAt,
   clipTimelineDuration,
@@ -18,13 +19,20 @@ export default function TimelineVideoPreview() {
   const timeline = useTimelineStore((s) => s.timeline);
   const playhead = useTimelineStore((s) => s.playheadSeconds);
   const playing = useTimelineStore((s) => s.timelinePlaying);
-  const setPlaying = useTimelineStore((s) => s.setTimelinePlaying);
   const togglePlaying = useTimelineStore((s) => s.toggleTimelinePlaying);
   const previewClipOnly = useTimelineStore((s) => s.captionPreviewClipOnly);
   const selectedClipId = useTimelineStore((s) => s.selectedClipId);
   const safeAreaGuide = useTimelineStore((s) => s.captionSafeAreaGuide);
 
   const videoRef = useRef<HTMLVideoElement>(null);
+  const [audioMasterVolume, setAudioMasterVolume] = useState(1);
+  const [audioMasterMuted, setAudioMasterMuted] = useState(false);
+
+  useTimelineAudio({
+    videoRef,
+    masterVolume: audioMasterVolume,
+    masterMuted: audioMasterMuted,
+  });
   const clipsRef = useRef(getSortedVideoClips(timeline));
   clipsRef.current = getSortedVideoClips(timeline);
 
@@ -89,6 +97,10 @@ export default function TimelineVideoPreview() {
       }
     };
 
+    if (!playing) {
+      video.pause();
+    }
+
     if (playing && !needNewSrc) {
       return;
     }
@@ -99,13 +111,45 @@ export default function TimelineVideoPreview() {
       const onReady = () => {
         video.removeEventListener("loadedmetadata", onReady);
         doSeek();
-        if (playing) void video.play().catch(() => setPlaying(false));
       };
       video.addEventListener("loadedmetadata", onReady);
     } else {
       doSeek();
     }
-  }, [timeline, clipId, proxyUrl, playing, playhead, activeClip, setPlaying]);
+  }, [timeline, clipId, proxyUrl, playing, playhead, activeClip]);
+
+  /**
+   * Single transport: `timelinePlaying` drives <video> only (no play()/pause() from rAF or timeupdate).
+   * Seek effect loads src + currentTime; this effect starts/stops playback when the proxy is ready.
+   */
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    const syncFromStore = () => {
+      const pl = useTimelineStore.getState().timelinePlaying;
+      const hasClip = !!activeClip && !!proxyUrl;
+      if (!pl || !hasClip) {
+        video.pause();
+        return;
+      }
+      const absWant = new URL(proxyUrl!, window.location.origin).href;
+      if (!video.src || video.src !== absWant) {
+        return;
+      }
+      void video.play().catch((err: unknown) => {
+        if (err instanceof Error && err.name === "AbortError") return;
+        useTimelineStore.getState().setTimelinePlaying(false);
+      });
+    };
+
+    video.addEventListener("loadedmetadata", syncFromStore);
+    syncFromStore();
+
+    return () => {
+      video.removeEventListener("loadedmetadata", syncFromStore);
+    };
+  }, [playing, activeClip, proxyUrl, clipId]);
 
   // While playing inside a clip, don't fight timeupdate with seeks.
   useEffect(() => {
@@ -157,9 +201,7 @@ export default function TimelineVideoPreview() {
       const video = videoRef.current;
 
       if (clip) {
-        if (video && video.paused) {
-          void video.play().catch(() => setPlaying(false));
-        }
+        /* Video play/pause is owned by timelinePlaying sync effect — not here. */
         raf = requestAnimationFrame(step);
         return;
       }
@@ -179,7 +221,7 @@ export default function TimelineVideoPreview() {
 
     raf = requestAnimationFrame(step);
     return () => cancelAnimationFrame(raf);
-  }, [playing, timeline, setPlaying]);
+  }, [playing, timeline]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -247,6 +289,31 @@ export default function TimelineVideoPreview() {
           aria-label={playing ? "Pause timeline" : "Play timeline"}
         >
           {playing ? "Pause" : "Play"}
+        </button>
+        <label className="preview-controls__volume">
+          <span className="preview-controls__volume-label">Volume</span>
+          <input
+            type="range"
+            min={0}
+            max={1}
+            step={0.02}
+            value={audioMasterMuted ? 0 : audioMasterVolume}
+            onChange={(e) => {
+              const v = Number(e.target.value);
+              setAudioMasterVolume(v);
+              if (v > 0) setAudioMasterMuted(false);
+            }}
+            aria-label="Preview master volume"
+          />
+        </label>
+        <button
+          type="button"
+          className="preview-controls__mute"
+          onClick={() => setAudioMasterMuted((m) => !m)}
+          aria-pressed={audioMasterMuted}
+          aria-label={audioMasterMuted ? "Unmute preview" : "Mute preview"}
+        >
+          {audioMasterMuted ? "Unmute" : "Mute"}
         </button>
         <span className="preview-controls__hint">Space — video track</span>
       </div>

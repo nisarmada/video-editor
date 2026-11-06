@@ -93,7 +93,10 @@ def test_apply_timeline_op(client: TestClient):
 
 
 def test_apply_undo_restores_delete(client: TestClient, monkeypatch):
-    monkeypatch.setattr("backend.main.validate_plan_data", lambda data, ml: [])
+    monkeypatch.setattr(
+        "backend.main.validate_plan_data",
+        lambda data, ml: ([], []),
+    )
 
     tl = _minimal_v2()
     del_r = client.post(
@@ -124,7 +127,10 @@ def test_apply_undo_restores_delete(client: TestClient, monkeypatch):
 
 
 def test_save_and_load_plan(client: TestClient, monkeypatch):
-    monkeypatch.setattr("backend.main.validate_plan_data", lambda data, ml: [])
+    monkeypatch.setattr(
+        "backend.main.validate_plan_data",
+        lambda data, ml: ([], []),
+    )
 
     tl = _minimal_v2()
     save = client.put("/api/plans/myedit", json={"timeline": tl})
@@ -171,7 +177,10 @@ def test_render_mock(client: TestClient, monkeypatch):
         called["plan"] = plan_path
         output_path.write_bytes(b"mp4")
 
-    monkeypatch.setattr("backend.main.validate_plan_data", lambda data, ml: [])
+    monkeypatch.setattr(
+        "backend.main.validate_plan_data",
+        lambda data, ml: ([], []),
+    )
     tl = _minimal_v2()
     save = client.put("/api/plans/myedit", json={"timeline": tl})
     assert save.status_code == 200

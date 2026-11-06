@@ -26,6 +26,8 @@ from caption_style_resolve import (  # noqa: E402
 )
 from timeline_format import (  # noqa: E402
     TIMELINE_GAP_SOURCE,
+    get_track,
+    is_v2,
     load_plan_file,
     v1_segments_from_data,
 )
@@ -78,6 +80,168 @@ def word_in_segment(ws: float, we: float, seg_start: float, seg_end: float) -> b
     return ws < seg_end - 0.001 and we > seg_start + 0.001
 
 
+def _clip_volume(clip: dict) -> float:
+    v = clip.get("volume")
+    if v is None:
+        return 1.0
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def remap_words_for_source_trim(
+    stem: str,
+    source_in: float,
+    source_out: float,
+    *,
+    timeline_start: float,
+    speed: float,
+    style: dict[str, Any],
+    clip_id: str | None,
+    seen_source_words: set[tuple[str, float, float]],
+) -> list[dict]:
+    """
+    Map transcript words for one trimmed source span onto wall-clock timeline time.
+
+    Transcript times are in source seconds [source_in, source_out]. Output times follow
+    timeline_start + (source_offset) / speed so they match sped-up/truncated export audio.
+    """
+    sp = float(speed) if speed and float(speed) > 0 else 1.0
+    seg_start = float(source_in)
+    seg_end = float(source_out)
+    if seg_end - seg_start <= 1e-9:
+        return []
+
+    out: list[dict] = []
+    for w in words_for_clip(stem):
+        ws = float(w["start"])
+        we = float(w["end"])
+        if not word_in_segment(ws, we, seg_start, seg_end):
+            continue
+
+        dedupe_key = (stem, round(ws, 3), round(we, 3))
+        if dedupe_key in seen_source_words:
+            continue
+        seen_source_words.add(dedupe_key)
+
+        clip_start = max(ws, seg_start)
+        clip_end = min(we, seg_end)
+        if clip_end - clip_start < 0.03:
+            continue
+
+        t0 = timeline_start + (clip_start - seg_start) / sp
+        t1 = timeline_start + (clip_end - seg_start) / sp
+        out.append(
+            {
+                "word": w.get("word", "").strip(),
+                "start": round(t0, 3),
+                "end": round(t1, 3),
+                "_style": style,
+                "_clip_id": clip_id,
+            }
+        )
+    return out
+
+
+def _caption_style_for_audible_clip(
+    plan: dict[str, Any],
+    plan_merged: dict[str, Any],
+    clip: dict[str, Any],
+    track_type: str,
+) -> dict[str, Any]:
+    """Prefer linked video clip's style_override; else video clip's own; else plan default."""
+    gid = clip.get("group_id")
+    if isinstance(gid, str) and gid.strip():
+        vtrack = get_track(plan, "video")
+        if vtrack:
+            for vc in vtrack.get("clips") or []:
+                if vc.get("group_id") == gid:
+                    fake_seg: dict[str, Any] = {}
+                    if isinstance(vc.get("style_override"), dict):
+                        fake_seg["style_override"] = vc["style_override"]
+                    return style_for_segment(plan_merged, fake_seg)
+    if track_type == "video":
+        fake_seg = {}
+        if isinstance(clip.get("style_override"), dict):
+            fake_seg["style_override"] = clip["style_override"]
+        return style_for_segment(plan_merged, fake_seg) if fake_seg else dict(plan_merged)
+    return dict(plan_merged)
+
+
+def _remap_words_v2_audible(
+    plan: dict[str, Any],
+    plan_merged: dict[str, Any],
+) -> list[dict]:
+    """One entry per audible clip: embedded video (non-muted) + non-muted audio track clips."""
+    remapped: list[dict] = []
+    seen_source_words: set[tuple[str, float, float]] = set()
+
+    specs: list[dict[str, Any]] = []
+    for tr in plan.get("tracks") or []:
+        ttype = tr.get("type")
+        if ttype not in ("video", "audio"):
+            continue
+        if tr.get("muted"):
+            continue
+        try:
+            tv = float(tr["volume"]) if tr.get("volume") is not None else 1.0
+        except (TypeError, ValueError):
+            tv = 1.0
+        if tv <= 0:
+            continue
+
+        for c in tr.get("clips") or []:
+            raw = c.get("source")
+            if not raw or not isinstance(raw, str):
+                continue
+            if ttype == "video" and c.get("audio_source") == "detached":
+                continue
+            if _clip_volume(c) <= 0:
+                continue
+
+            try:
+                t0 = float(c["timeline_start"])
+                src_in = float(c["source_in"])
+                src_out = float(c["source_out"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            spd = float(c.get("speed") or 1.0) or 1.0
+            cid = c.get("id") if isinstance(c.get("id"), str) else None
+            st = _caption_style_for_audible_clip(plan, plan_merged, c, str(ttype))
+
+            specs.append(
+                {
+                    "stem": source_stem(raw),
+                    "source_in": src_in,
+                    "source_out": src_out,
+                    "timeline_start": t0,
+                    "speed": spd,
+                    "style": st,
+                    "clip_id": cid,
+                }
+            )
+
+    specs.sort(key=lambda x: float(x["timeline_start"]))
+
+    for sp in specs:
+        remapped.extend(
+            remap_words_for_source_trim(
+                sp["stem"],
+                sp["source_in"],
+                sp["source_out"],
+                timeline_start=float(sp["timeline_start"]),
+                speed=float(sp["speed"]),
+                style=sp["style"],
+                clip_id=sp["clip_id"],
+                seen_source_words=seen_source_words,
+            )
+        )
+
+    remapped.sort(key=lambda x: (x["start"], x["end"]))
+    return remapped
+
+
 def remap_words(
     plan_segments: list[dict],
     plan_data: dict | list | None = None,
@@ -88,6 +252,9 @@ def remap_words(
         if isinstance(plan_data, dict)
         else default_caption_style()
     )
+    if isinstance(plan_data, dict) and is_v2(plan_data):
+        return _remap_words_v2_audible(plan_data, merged)
+
     remapped: list[dict] = []
     output_cursor = 0.0
     seen_source_words: set[tuple[str, float, float]] = set()
@@ -104,31 +271,18 @@ def remap_words(
         seg_end = float(seg["end"])
         seg_len = seg_end - seg_start
 
-        for w in words_for_clip(stem):
-            ws = float(w["start"])
-            we = float(w["end"])
-            if not word_in_segment(ws, we, seg_start, seg_end):
-                continue
-
-            dedupe_key = (stem, round(ws, 3), round(we, 3))
-            if dedupe_key in seen_source_words:
-                continue
-            seen_source_words.add(dedupe_key)
-
-            clip_start = max(ws, seg_start)
-            clip_end = min(we, seg_end)
-            if clip_end - clip_start < 0.03:
-                continue
-
-            remapped.append(
-                {
-                    "word": w.get("word", "").strip(),
-                    "start": round(output_cursor + (clip_start - seg_start), 3),
-                    "end": round(output_cursor + (clip_end - seg_start), 3),
-                    "_style": st,
-                    "_clip_id": seg.get("_clip_id"),
-                }
+        remapped.extend(
+            remap_words_for_source_trim(
+                stem,
+                seg_start,
+                seg_end,
+                timeline_start=output_cursor,
+                speed=1.0,
+                style=st,
+                clip_id=seg.get("_clip_id") if isinstance(seg.get("_clip_id"), str) else None,
+                seen_source_words=seen_source_words,
             )
+        )
         output_cursor += seg_len
 
     remapped.sort(key=lambda x: (x["start"], x["end"]))
@@ -226,6 +380,15 @@ def caption_events(
                 }
             )
     return events
+
+
+def get_caption_events(
+    words: list[dict],
+    plan_data: dict | list | None = None,
+    max_words_per_line: int | None = None,
+) -> list[dict]:
+    """Timed events for preview / burn-in (same as caption_events)."""
+    return caption_events(words, plan_data=plan_data, max_words_per_line=max_words_per_line)
 
 
 def sample_preview_ass(

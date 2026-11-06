@@ -231,7 +231,7 @@ def finalize_v2_plan(v1_plan: dict, brief: str, run_group_id: str) -> dict:
         raise ValueError(errors)
 
     v2 = v1_to_v2(v1_plan, created_by="ai", group_id=run_group_id)
-    v2_errors = validate_plan_data(v2, target)
+    v2_errors, _v2_warnings = validate_plan_data(v2, target)
     if v2_errors:
         raise ValueError(v2_errors)
     return v2

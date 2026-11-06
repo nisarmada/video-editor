@@ -18,6 +18,9 @@ from pathlib import Path
 
 TARGET_W, TARGET_H, FPS = 1080, 1920, 30
 AUDIO_FADE_SECONDS = 0.02
+EXPORT_AUDIO_RATE = 48000
+# FFmpeg amix: too many inputs can exceed filter graph limits; cap and fail clearly.
+AMIX_MAX_INPUTS = 64
 
 
 @dataclass(frozen=True)
@@ -30,6 +33,8 @@ class TimelinePiece:
     speed: float = 1.0
     volume: float = 1.0
     zoom: float | None = None
+    # When True, embedded video segment uses silence (detached audio or muted track).
+    embed_audio_silent: bool = False
 
     def is_gap(self) -> bool:
         return self.path is None
@@ -46,6 +51,25 @@ class TimelinePiece:
     def effective_speed(self) -> float:
         s = float(self.speed)
         return s if s > 0 else 1.0
+
+
+@dataclass(frozen=True)
+class AudioBranch:
+    """One audio-track clip positioned on the timeline (export mixer input)."""
+
+    path: Path
+    source_start: float
+    source_end: float
+    speed: float = 1.0
+    volume: float = 1.0
+    timeline_start: float = 0.0
+
+    def effective_speed(self) -> float:
+        s = float(self.speed)
+        return s if s > 0 else 1.0
+
+    def wall_duration(self) -> float:
+        return (self.source_end - self.source_start) / self.effective_speed()
 
 
 def ffprobe_json(path: Path) -> dict:
@@ -350,13 +374,12 @@ def _zoom_punch_filter(zoom: float) -> str:
     )
 
 
-def build_timeline_filter_graph(
+def _legacy_build_timeline_filter_graph(
     pieces: list[TimelinePiece],
 ) -> tuple[str, list[str]]:
     """
-    Trim each piece, normalize to 1080x1920 @ 30fps, optional zoom punch-in,
-    speed via setpts / atempo (timeline duration matches preview), volume on audio.
-    Gaps: lavfi black + silence.
+    Original single-bus audio: concat segment audio at 44.1 kHz (bit-compatible
+    with exports before multi-track audio).
     """
     parts: list[str] = []
     ffmpeg_inputs: list[str] = []
@@ -446,7 +469,6 @@ def build_timeline_filter_graph(
         else:
             v_pre_speed = v_after_norm
 
-        # setpts after geometry so duration scales (faster = shorter clip on timeline)
         if abs(speed - 1.0) > 1e-6:
             parts.append(f"[{v_pre_speed}]setpts=PTS/{sp}[pre{i}]")
             vlabels.append(f"[pre{i}]")
@@ -468,7 +490,8 @@ def build_timeline_filter_graph(
             )
         tail_s = ",".join(tail_audio)
 
-        if has_audio:
+        use_silent = piece.embed_audio_silent
+        if not use_silent and has_audio:
             head = f"atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS"
             parts.append(f"[{idx}:a]{head},{tail_s}[a{i}]")
         else:
@@ -481,6 +504,231 @@ def build_timeline_filter_graph(
     parts.append(f"{''.join(vlabels)}concat=n={n}:v=1:a=0[vout]")
     parts.append(f"{''.join(alabels)}concat=n={n}:v=0:a=1[aout]")
     return ";".join(parts), ffmpeg_inputs
+
+
+def _mixed_build_timeline_filter_graph(
+    pieces: list[TimelinePiece],
+    audio_branches: list[AudioBranch],
+    timeline_total: float,
+) -> tuple[str, list[str]]:
+    """Embedded bus (48 kHz) + timed audio-track branches, amix, limiter."""
+    parts: list[str] = []
+    ffmpeg_inputs: list[str] = []
+    vlabels: list[str] = []
+    emb_labels: list[str] = []
+
+    path_to_index: dict[Path, int] = {}
+    meta_cache: dict[Path, tuple[float, bool, int | None]] = {}
+    next_input = 0
+    sr = EXPORT_AUDIO_RATE
+
+    n = len(pieces)
+    for i, piece in enumerate(pieces):
+        seg_out = piece.output_duration()
+
+        if piece.is_gap():
+            ffmpeg_inputs.extend(
+                [
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    f"color=c=black:s={TARGET_W}x{TARGET_H}:r={FPS}:d={seg_out:.6f}",
+                ]
+            )
+            v_in = next_input
+            next_input += 1
+            ffmpeg_inputs.extend(
+                [
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    f"anullsrc=r={sr}:cl=stereo,atrim=duration={seg_out:.6f},"
+                    f"asetpts=PTS-STARTPTS",
+                ]
+            )
+            a_in = next_input
+            next_input += 1
+            parts.append(
+                f"[{v_in}:v]scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=decrease,"
+                f"pad={TARGET_W}:{TARGET_H}:(ow-iw)/2:(oh-ih)/2:black,"
+                f"setsar=1,fps={FPS},format=yuv420p[v{i}]"
+            )
+            vlabels.append(f"[v{i}]")
+
+            audio_filters = [
+                f"aformat=sample_rates={sr}:channel_layouts=stereo",
+            ]
+            if i > 0:
+                audio_filters.insert(0, f"afade=t=in:st=0:d={AUDIO_FADE_SECONDS}")
+            if i < n - 1:
+                fade_out_st = max(seg_out - AUDIO_FADE_SECONDS, 0)
+                audio_filters.append(
+                    f"afade=t=out:st={fade_out_st:.6f}:d={AUDIO_FADE_SECONDS}"
+                )
+            parts.append(f"[{a_in}:a]{','.join(audio_filters)}[emb{i}]")
+            emb_labels.append(f"[emb{i}]")
+            continue
+
+        path = piece.path
+        assert path is not None
+        resolved = path.resolve()
+        if resolved not in path_to_index:
+            path_to_index[resolved] = next_input
+            ffmpeg_inputs.extend(["-i", str(resolved)])
+            meta_cache[resolved] = clip_metadata(resolved)
+            next_input += 1
+        idx = path_to_index[resolved]
+        _duration, has_audio, rotation = meta_cache[resolved]
+
+        start = piece.source_start
+        end = piece.source_end
+        speed = piece.effective_speed()
+        sp = f"{speed:.8f}".rstrip("0").rstrip(".") if speed != 1.0 else "1"
+
+        rot = rotation_filter(rotation)
+        v_after_norm = f"vn{i}"
+        base_chain = (
+            f"[{idx}:v]trim=start={start:.6f}:end={end:.6f},setpts=PTS-STARTPTS,"
+            f"{rot}"
+            f"scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=decrease,"
+            f"pad={TARGET_W}:{TARGET_H}:(ow-iw)/2:(oh-ih)/2:black,"
+            f"setsar=1,fps={FPS},format=yuv420p[{v_after_norm}]"
+        )
+        parts.append(base_chain)
+
+        zoom_chain = _zoom_punch_filter(piece.zoom or 1.0)
+        if zoom_chain:
+            v_pre_speed = f"vz{i}"
+            parts.append(f"[{v_after_norm}]{zoom_chain}[{v_pre_speed}]")
+        else:
+            v_pre_speed = v_after_norm
+
+        if abs(speed - 1.0) > 1e-6:
+            parts.append(f"[{v_pre_speed}]setpts=PTS/{sp}[pre{i}]")
+            vlabels.append(f"[pre{i}]")
+        else:
+            vlabels.append(f"[{v_pre_speed}]")
+
+        tail_audio: list[str] = []
+        for fac in _atempo_chain_factors(speed):
+            tail_audio.append(f"atempo={fac:.8f}".rstrip("0").rstrip("."))
+        tail_audio.append(_volume_filter_expr(piece.volume))
+        tail_audio.append(
+            f"aformat=sample_rates={sr}:channel_layouts=stereo"
+        )
+        if i > 0:
+            tail_audio.insert(0, f"afade=t=in:st=0:d={AUDIO_FADE_SECONDS}")
+        if i < n - 1:
+            fade_out_st = max(seg_out - AUDIO_FADE_SECONDS, 0)
+            tail_audio.append(
+                f"afade=t=out:st={fade_out_st:.6f}:d={AUDIO_FADE_SECONDS}"
+            )
+        tail_s = ",".join(tail_audio)
+
+        use_silent = piece.embed_audio_silent or not has_audio
+        if not use_silent:
+            head = f"atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS"
+            parts.append(f"[{idx}:a]{head},{tail_s}[emb{i}]")
+        else:
+            parts.append(
+                f"anullsrc=r={sr}:cl=stereo,atrim=duration={seg_out:.6f},"
+                f"asetpts=PTS-STARTPTS,{tail_s}[emb{i}]"
+            )
+        emb_labels.append(f"[emb{i}]")
+
+    parts.append(f"{''.join(vlabels)}concat=n={n}:v=1:a=0[vout]")
+    parts.append(
+        f"{''.join(emb_labels)}concat=n={n}:v=0:a=1[aembedded]"
+    )
+
+    mix_labels: list[str] = ["[aembedded]"]
+    br_idx = 0
+    for br in audio_branches:
+        resolved = br.path.resolve()
+        if resolved not in path_to_index:
+            path_to_index[resolved] = next_input
+            ffmpeg_inputs.extend(["-i", str(resolved)])
+            meta_cache[resolved] = clip_metadata(resolved)
+            next_input += 1
+        bidx = path_to_index[resolved]
+        _d, has_stream, _rot = meta_cache[resolved]
+        if not has_stream:
+            continue
+
+        wall = br.wall_duration()
+        if wall <= 1e-6:
+            continue
+
+        t0 = float(br.timeline_start)
+        if t0 >= timeline_total - 1e-6:
+            continue
+
+        start = br.source_start
+        end = br.source_end
+        speed = br.effective_speed()
+        delay_ms = max(0, int(round(t0 * 1000)))
+
+        tb: list[str] = [
+            f"atrim=start={start:.6f}:end={end:.6f}",
+            "asetpts=PTS-STARTPTS",
+        ]
+        for fac in _atempo_chain_factors(speed):
+            tb.append(f"atempo={fac:.8f}".rstrip("0").rstrip("."))
+        tb.append(_volume_filter_expr(br.volume))
+        tb.append(f"afade=t=in:st=0:d={AUDIO_FADE_SECONDS}")
+        fo = max(wall - AUDIO_FADE_SECONDS, 0.0)
+        tb.append(f"afade=t=out:st={fo:.6f}:d={AUDIO_FADE_SECONDS}")
+        tb.append(f"adelay={delay_ms}|{delay_ms}")
+        tb.append(f"aformat=sample_rates={sr}:channel_layouts=stereo")
+        parts.append(f"[{bidx}:a]{','.join(tb)}[abr{br_idx}]")
+        mix_labels.append(f"[abr{br_idx}]")
+        br_idx += 1
+
+    n_in = len(mix_labels)
+    if n_in > AMIX_MAX_INPUTS:
+        raise RuntimeError(
+            f"Too many audio mixer inputs ({n_in}); FFmpeg amix is limited "
+            f"(soft cap {AMIX_MAX_INPUTS}). Render audio in a separate pass to WAV, "
+            "then mux with video, or reduce audio clips."
+        )
+
+    concat_s = "".join(mix_labels)
+    parts.append(
+        f"{concat_s}amix=inputs={n_in}:normalize=0:duration=longest[amixed]"
+    )
+    parts.append(
+        f"[amixed]atrim=duration={timeline_total:.6f},"
+        f"alimiter=limit=0.95,aformat=sample_rates={sr}:channel_layouts=stereo[aout]"
+    )
+
+    return ";".join(parts), ffmpeg_inputs
+
+
+def build_timeline_filter_graph(
+    pieces: list[TimelinePiece],
+    *,
+    audio_branches: list[AudioBranch] | None = None,
+    timeline_total: float | None = None,
+) -> tuple[str, list[str]]:
+    """
+    Trim each piece, normalize to 1080x1920 @ 30fps, optional zoom punch-in,
+    speed via setpts / atempo, embedded audio bus.
+    Gaps: lavfi black + silence.
+
+    Legacy path (default): concat audio only — identical to older exports when
+    there are no audio-track branches and no embed_audio_silent segments.
+
+    Mixed path: 48 kHz embedded bus + timed audio-track branches, amix, limiter.
+    """
+    branches = audio_branches or []
+    use_mix = bool(branches) or any(p.embed_audio_silent for p in pieces)
+    if not use_mix:
+        return _legacy_build_timeline_filter_graph(pieces)
+
+    total = timeline_total if timeline_total is not None else sum(
+        p.output_duration() for p in pieces
+    )
+    return _mixed_build_timeline_filter_graph(pieces, branches, total)
 
 
 def _ffmpeg_supports_filter(name: str) -> bool:
@@ -640,11 +888,17 @@ def render_timeline(
     pieces: list[TimelinePiece],
     output_path: Path,
     *,
+    audio_branches: list[AudioBranch] | None = None,
+    timeline_total: float | None = None,
     cancel_event: threading.Event | None = None,
     on_progress: Callable[[float | None], None] | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    filter_complex, ffmpeg_inputs = build_timeline_filter_graph(pieces)
+    filter_complex, ffmpeg_inputs = build_timeline_filter_graph(
+        pieces,
+        audio_branches=audio_branches,
+        timeline_total=timeline_total,
+    )
     cmd = [
         "ffmpeg",
         "-y",

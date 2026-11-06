@@ -13,6 +13,7 @@ from timeline_ops import (
     dispatch_operation,
     merge_clips,
     move_clip,
+    remove_track,
     set_clip_property,
     split_clip,
     trim_clip,
@@ -164,6 +165,80 @@ def test_add_clip_rejects_overlap():
                 "created_by": "user",
             },
         )
+
+
+def test_add_clip_without_track_id_uses_first_video_track():
+    tl = sample_timeline()
+    added = add_clip(
+        tl,
+        track_id=None,
+        clip={
+            "id": "clip-new",
+            "source": "footage/d.mp4",
+            "source_in": 0.0,
+            "source_out": 1.0,
+            "timeline_start": 12.0,
+            "created_by": "user",
+        },
+    )
+    vids = video_clips(added["timeline"])
+    assert any(c["id"] == "clip-new" for c in vids)
+
+
+def test_add_clip_without_track_id_creates_video_track_when_missing():
+    tl: dict = {
+        "schema_version": 2,
+        "tracks": [
+            {
+                "id": "track-audio-only",
+                "type": "audio",
+                "clips": [],
+            },
+        ],
+    }
+    added = add_clip(
+        tl,
+        track_id=None,
+        clip={
+            "id": "clip-v",
+            "source": "footage/d.mp4",
+            "source_in": 0.0,
+            "source_out": 1.0,
+            "timeline_start": 0.0,
+            "created_by": "user",
+        },
+    )
+    tracks = added["timeline"]["tracks"]
+    assert any(t.get("type") == "video" for t in tracks)
+    vtrack = next(t for t in tracks if t.get("type") == "video")
+    assert len(vtrack.get("clips") or []) == 1
+    assert added["undo"]["op"] == "remove_track"
+
+
+def test_remove_track_undo_restores():
+    tl: dict = {
+        "schema_version": 2,
+        "tracks": [
+            {
+                "id": "tv",
+                "type": "video",
+                "clips": [
+                    {
+                        "id": "c1",
+                        "source": "footage/a.mp4",
+                        "source_in": 0.0,
+                        "source_out": 1.0,
+                        "timeline_start": 0.0,
+                        "created_by": "user",
+                    },
+                ],
+            },
+        ],
+    }
+    rem = remove_track(tl, track_id="tv")
+    assert not any(t.get("id") == "tv" for t in rem["timeline"]["tracks"])
+    back = apply_undo(rem["timeline"], rem["undo"])
+    assert any(t.get("id") == "tv" for t in back["timeline"]["tracks"])
 
 
 def test_merge_requires_adjacent_same_source():

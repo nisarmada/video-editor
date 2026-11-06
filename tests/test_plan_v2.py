@@ -50,7 +50,10 @@ def test_finalize_v2_plan(monkeypatch):
         ],
     }
     monkeypatch.setattr("plan.validate_segments", lambda segs, target: [])
-    monkeypatch.setattr("plan.validate_plan_data", lambda data, target: [])
+    monkeypatch.setattr(
+        "plan.validate_plan_data",
+        lambda data, target: ([], []),
+    )
 
     v2 = finalize_v2_plan(v1, "10s test brief", "group-xyz")
     video = get_track(v2, "video")

@@ -16,9 +16,22 @@ export function parseApplyOpErrorMessage(detail: string): string {
   try {
     const j = JSON.parse(detail) as { detail?: unknown };
     const d = j.detail;
-    if (typeof d === "string") return d;
+    if (typeof d === "string") {
+      try {
+        const inner = JSON.parse(d) as { detail?: unknown };
+        if (typeof inner.detail === "string") return inner.detail;
+      } catch {
+        /* d is final message */
+      }
+      return d;
+    }
     if (Array.isArray(d)) return d.join("; ");
-    if (d && typeof d === "object") return JSON.stringify(d);
+    if (d && typeof d === "object") {
+      const o = d as { message?: unknown; errors?: unknown };
+      if (typeof o.message === "string") return o.message;
+      if (Array.isArray(o.errors)) return o.errors.join("; ");
+      return JSON.stringify(d);
+    }
   } catch {
     // plain text
   }

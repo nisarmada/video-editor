@@ -14,10 +14,26 @@ import {
   trackClipClass,
 } from "../timeline/duration";
 import {
+  clipLinkingEnabled,
+  copyClipPayload,
+  expandLinkedSelection,
+  findClipById,
+  linkedPartnerId,
+  orderedTracks,
+  playheadInsideClip,
+  readClipFromClipboard,
+} from "../timeline/selection";
+import { shortcutKeys, shortcutTitle } from "../timeline/shortcuts";
+import TimelineContextMenu, {
+  type ContextMenuState,
+} from "./TimelineContextMenu";
+import {
   FOOTAGE_DRAG_MIME,
+  FOOTAGE_DRAG_TEXT_TYPE,
   MIN_CLIP_SECONDS,
   TIMELINE_SNAP_SEC,
 } from "../timeline/dragConstants";
+import { isFootageFromBinDragging } from "../timeline/footageDragState";
 import {
   MAX_PX_PER_SEC,
   MIN_PX_PER_SEC,
@@ -76,6 +92,29 @@ function findTrackUnderPoint(
 
 type FootageDragPayload = Pick<FootageClip, "name" | "source" | "duration_seconds">;
 
+function readFootageDragPayload(e: React.DragEvent): FootageDragPayload | null {
+  let raw = e.dataTransfer.getData(FOOTAGE_DRAG_MIME);
+  if (!raw) {
+    raw = e.dataTransfer.getData(FOOTAGE_DRAG_TEXT_TYPE);
+  }
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as FootageDragPayload;
+  } catch {
+    return null;
+  }
+}
+
+function isFootageBinDrag(e: React.DragEvent): boolean {
+  const dt = e.dataTransfer;
+  if (!dt) return false;
+  const t = dt.types ?? [];
+  if (t.includes(FOOTAGE_DRAG_MIME) || t.includes(FOOTAGE_DRAG_TEXT_TYPE)) {
+    return true;
+  }
+  return isFootageFromBinDragging();
+}
+
 type PointerDragState = {
   clipId: string;
   originTrackId: string;
@@ -98,7 +137,9 @@ export default function TimelinePanel() {
   const currentPlanName = useTimelineStore((s) => s.currentPlanName);
 
   const selectedClipId = useTimelineStore((s) => s.selectedClipId);
+  const selectedClipIds = useTimelineStore((s) => s.selectedClipIds);
   const setSelectedClipId = useTimelineStore((s) => s.setSelectedClipId);
+  const setSelectedClipIds = useTimelineStore((s) => s.setSelectedClipIds);
   const undoStack = useTimelineStore((s) => s.undoStack);
   const redoStack = useTimelineStore((s) => s.redoStack);
   const applyInProgress = useTimelineStore((s) => s.applyOperationInProgress);
@@ -110,6 +151,10 @@ export default function TimelinePanel() {
   const redo = useTimelineStore((s) => s.redo);
   const splitAtPlayhead = useTimelineStore((s) => s.splitAtPlayhead);
   const deleteSelectedClip = useTimelineStore((s) => s.deleteSelectedClip);
+  const separateAudio = useTimelineStore((s) => s.separateAudio);
+  const reattachAudio = useTimelineStore((s) => s.reattachAudio);
+  const unlinkClipsAction = useTimelineStore((s) => s.unlinkClipsAction);
+  const toggleClipLinking = useTimelineStore((s) => s.toggleClipLinking);
   const applyOperation = useTimelineStore((s) => s.applyOperation);
 
   const rulerRef = useRef<HTMLDivElement>(null);
@@ -121,6 +166,8 @@ export default function TimelinePanel() {
 
   const [dropIndicatorSec, setDropIndicatorSec] = useState<number | null>(null);
   const [pointerDrag, setPointerDrag] = useState<PointerDragState | null>(null);
+  const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
+  const [hoverClipId, setHoverClipId] = useState<string | null>(null);
 
   const canUndo = undoStack.length > 0;
   const canRedo = redoStack.length > 0;
@@ -128,6 +175,20 @@ export default function TimelinePanel() {
     applyOperationInProgress: applyInProgress,
     dragInProgress,
   });
+
+  const setOpError = useCallback((msg: string) => {
+    useTimelineStore.setState({ opErrorMessage: msg });
+  }, []);
+
+  const runOp = useCallback(async (fn: () => Promise<unknown>) => {
+    try {
+      await fn();
+    } catch {
+      /* store sets opErrorMessage */
+    }
+  }, []);
+
+  const linkingEnabled = timeline?.settings?.clip_linking_enabled !== false;
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -153,6 +214,91 @@ export default function TimelinePanel() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [busy, undo, redo]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (
+        t &&
+        (t.tagName === "INPUT" ||
+          t.tagName === "TEXTAREA" ||
+          t.tagName === "SELECT" ||
+          t.isContentEditable)
+      ) {
+        return;
+      }
+      if (busy) return;
+
+      const isMod = e.metaKey || e.ctrlKey;
+      if (isMod && e.shiftKey && e.code === "KeyS") {
+        e.preventDefault();
+        void runOp(() => useTimelineStore.getState().separateAudio());
+        return;
+      }
+      if (isMod && !e.shiftKey && e.code === "KeyL") {
+        e.preventDefault();
+        void runOp(() => useTimelineStore.getState().toggleClipLinking());
+        return;
+      }
+      if (!isMod && e.code === "KeyM") {
+        e.preventDefault();
+        void runOp(() => useTimelineStore.getState().toggleSelectedTrackMute());
+        return;
+      }
+      if (isMod && e.code === "KeyC" && useTimelineStore.getState().selectedClipId) {
+        e.preventDefault();
+        const tl = useTimelineStore.getState().timeline;
+        const sid = useTimelineStore.getState().selectedClipId;
+        if (!tl || !sid) return;
+        const hit = findClipById(tl, sid);
+        if (hit) {
+          copyClipPayload({
+            clip: hit.clip,
+            sourceTrackId: hit.trackId,
+            sourceTrackType: hit.trackType,
+          });
+        }
+        return;
+      }
+      if (isMod && e.code === "KeyV") {
+        e.preventDefault();
+        const tl = useTimelineStore.getState().timeline;
+        const ph = useTimelineStore.getState().playheadSeconds;
+        const data = readClipFromClipboard();
+        if (!tl || !data) return;
+        const videoTr = tl.tracks.find((x) => x.type === "video");
+        const audioTr = tl.tracks.find((x) => x.type === "audio");
+        const capTr = tl.tracks.find((x) => x.type === "caption");
+        const st = data.sourceTrackType;
+        const targetId =
+          st === "audio" && audioTr
+            ? audioTr.id
+            : st === "caption" && capTr
+              ? capTr.id
+              : videoTr?.id;
+        const { group_id: _omitG, id: _omitId, ...clipRest } = data.clip;
+        const newClip: Record<string, unknown> = {
+          ...clipRest,
+          id: crypto.randomUUID(),
+          timeline_start: ph,
+          created_by: "user",
+        };
+        if (st === "video" || (!st && !targetId)) {
+          newClip.audio_source = "embedded";
+        }
+        const args: Record<string, unknown> = { clip: newClip };
+        if (targetId) args.track_id = targetId;
+        void runOp(() =>
+          useTimelineStore.getState().applyOperation({
+            operation: "add_clip",
+            arguments: args,
+          }),
+        );
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [busy, runOp]);
 
   const duration = useMemo(
     () => (timeline ? timelineEnd(timeline) : 0),
@@ -215,14 +361,32 @@ export default function TimelinePanel() {
   const onClipClick = useCallback(
     (e: React.MouseEvent, clipId: string) => {
       e.stopPropagation();
-      setSelectedClipId(clipId);
+      if (!timeline) return;
+      if (e.shiftKey) {
+        const cur = new Set(selectedClipIds);
+        if (cur.has(clipId)) cur.delete(clipId);
+        else cur.add(clipId);
+        let next = [...cur];
+        if (clipLinkingEnabled(timeline)) {
+          next = expandLinkedSelection(timeline, next);
+        }
+        setSelectedClipIds(next);
+      } else {
+        if (clipLinkingEnabled(timeline)) {
+          const expanded = expandLinkedSelection(timeline, [clipId]);
+          setSelectedClipIds(expanded);
+        } else {
+          setSelectedClipId(clipId);
+        }
+      }
     },
-    [setSelectedClipId],
+    [
+      timeline,
+      selectedClipIds,
+      setSelectedClipId,
+      setSelectedClipIds,
+    ],
   );
-
-  const setOpError = useCallback((msg: string) => {
-    useTimelineStore.setState({ opErrorMessage: msg });
-  }, []);
 
   const applyMoveClip = useCallback(
     async (
@@ -327,7 +491,12 @@ export default function TimelinePanel() {
         originTimelineStart: opts.timelineStart,
       });
       setDropIndicatorSec(opts.timelineStart);
-      setSelectedClipId(opts.clipId);
+      const tl = useTimelineStore.getState().timeline;
+      if (tl && clipLinkingEnabled(tl)) {
+        setSelectedClipIds(expandLinkedSelection(tl, [opts.clipId]));
+      } else {
+        setSelectedClipId(opts.clipId);
+      }
       setTimelinePlaying(false);
     },
     [
@@ -335,58 +504,51 @@ export default function TimelinePanel() {
       applyInProgress,
       setDragInProgress,
       setSelectedClipId,
+      setSelectedClipIds,
       setTimelinePlaying,
     ],
   );
 
-  const onLaneDragOver = useCallback(
-    (e: React.DragEvent<HTMLDivElement>, _trackId: string, trackType: TrackType) => {
-      if (busy || applyInProgress) return;
-      const types = e.dataTransfer?.types ?? [];
-      if (!types.includes(FOOTAGE_DRAG_MIME)) return;
-      if (trackType === "caption") {
-        e.preventDefault();
-        e.dataTransfer.dropEffect = "none";
-        setDropIndicatorSec(null);
-        return;
-      }
-      e.preventDefault();
-      e.dataTransfer.dropEffect = "copy";
-      const lane = e.currentTarget;
+  const timelineSecFromDragClientX = useCallback(
+    (clientX: number, laneEl: HTMLElement | null) => {
       const vp = viewportRef.current;
-      const xContent = laneContentXFromClient(e.clientX, lane, vp);
-      const sec = snapTimelineSec(xContent / pxPerSecond);
-      setDropIndicatorSec(sec);
+      if (!vp) return 0;
+      let xContent: number;
+      if (laneEl) {
+        xContent = laneContentXFromClient(clientX, laneEl, vp);
+      } else {
+        const canvas = vp.querySelector<HTMLElement>(".timeline-canvas");
+        if (!canvas) return 0;
+        const rect = canvas.getBoundingClientRect();
+        xContent = Math.max(0, clientX - rect.left - LABEL_WIDTH + vp.scrollLeft);
+      }
+      const sec = xContent / pxPerSecond;
+      if (!Number.isFinite(sec)) return 0;
+      return snapTimelineSec(sec);
     },
-    [busy, applyInProgress, pxPerSecond],
+    [pxPerSecond],
   );
 
-  const onLaneDrop = useCallback(
-    async (e: React.DragEvent<HTMLDivElement>, trackId: string, trackType: TrackType) => {
+  const dropFootageAtTimelineSec = useCallback(
+    async (
+      e: React.DragEvent,
+      payload: FootageDragPayload,
+      opts: { trackId?: string; trackType: TrackType } | null,
+      laneEl: HTMLElement | null,
+    ) => {
       setDropIndicatorSec(null);
-      if (busy || applyInProgress) return;
-      const raw = e.dataTransfer.getData(FOOTAGE_DRAG_MIME);
-      if (!raw) return;
       e.preventDefault();
-      if (trackType === "caption") {
-        setOpError("Cannot drop footage on the caption track.");
-        return;
-      }
-      let payload: FootageDragPayload;
-      try {
-        payload = JSON.parse(raw) as FootageDragPayload;
-      } catch {
-        setOpError("Invalid footage drag data.");
-        return;
-      }
+      if (busy || applyInProgress) return;
       if (!payload.source) {
         setOpError("Footage item has no source path.");
         return;
       }
-      const lane = e.currentTarget;
-      const vp = viewportRef.current;
-      const xContent = laneContentXFromClient(e.clientX, lane, vp);
-      const timelineStart = snapTimelineSec(xContent / pxPerSecond);
+      const trackType = opts?.trackType;
+      if (trackType === "caption") {
+        setOpError("Cannot drop footage on the caption track.");
+        return;
+      }
+      const timelineStart = timelineSecFromDragClientX(e.clientX, laneEl);
 
       const dur =
         typeof payload.duration_seconds === "number" &&
@@ -396,26 +558,121 @@ export default function TimelinePanel() {
           : MIN_CLIP_SECONDS;
       const sourceOut = Math.max(MIN_CLIP_SECONDS, dur);
 
+      const clip: Record<string, unknown> = {
+        id: crypto.randomUUID(),
+        source: payload.source,
+        source_in: 0,
+        source_out: sourceOut,
+        timeline_start: timelineStart,
+        created_by: "user",
+      };
+      if (!trackType || trackType === "video") {
+        clip.audio_source = "embedded";
+      }
+
+      const args: Record<string, unknown> = { clip };
+      if (opts?.trackId) {
+        args.track_id = opts.trackId;
+      }
       try {
         await applyOperation({
           operation: "add_clip",
-          arguments: {
-            track_id: trackId,
-            clip: {
-              id: crypto.randomUUID(),
-              source: payload.source,
-              source_in: 0,
-              source_out: sourceOut,
-              timeline_start: timelineStart,
-              created_by: "user",
-            },
-          },
+          arguments: args,
         });
       } catch {
-        /* store */
+        /* store sets opErrorMessage */
       }
     },
-    [busy, applyInProgress, applyOperation, setOpError],
+    [
+      applyOperation,
+      busy,
+      applyInProgress,
+      setOpError,
+      timelineSecFromDragClientX,
+    ],
+  );
+
+  const onLaneDragOver = useCallback(
+    (e: React.DragEvent<HTMLDivElement>, _trackId: string, trackType: TrackType) => {
+      if (busy || applyInProgress) return;
+      if (!isFootageBinDrag(e)) return;
+      if (trackType === "caption") {
+        e.preventDefault();
+        e.stopPropagation();
+        e.dataTransfer.dropEffect = "none";
+        setDropIndicatorSec(null);
+        return;
+      }
+      e.preventDefault();
+      e.stopPropagation();
+      e.dataTransfer.dropEffect = "copy";
+      const lane = e.currentTarget;
+      const sec = timelineSecFromDragClientX(e.clientX, lane);
+      setDropIndicatorSec(sec);
+    },
+    [busy, applyInProgress, timelineSecFromDragClientX],
+  );
+
+  const onLaneDrop = useCallback(
+    async (e: React.DragEvent<HTMLDivElement>, trackId: string, trackType: TrackType) => {
+      if (isFootageBinDrag(e)) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+      if (busy || applyInProgress) return;
+      const payload = readFootageDragPayload(e);
+      if (!payload) {
+        setOpError("Missing footage drag data (try again).");
+        return;
+      }
+      await dropFootageAtTimelineSec(e, payload, { trackId, trackType }, e.currentTarget);
+    },
+    [busy, applyInProgress, dropFootageAtTimelineSec, setOpError],
+  );
+
+  /** Drops on ruler / padded canvas (not on a track lane — those handle locally). */
+  const onCanvasFootageDragOver = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      if (busy || applyInProgress) return;
+      if (!isFootageBinDrag(e)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      e.dataTransfer.dropEffect = "copy";
+      const vp = viewportRef.current;
+      const hit = vp && findTrackUnderPoint(vp, e.clientY);
+      const sec = timelineSecFromDragClientX(e.clientX, null);
+      if (hit?.trackType === "caption") {
+        e.dataTransfer.dropEffect = "none";
+        setDropIndicatorSec(null);
+        return;
+      }
+      setDropIndicatorSec(sec);
+    },
+    [busy, applyInProgress, timelineSecFromDragClientX],
+  );
+
+  const onCanvasFootageDrop = useCallback(
+    async (e: React.DragEvent<HTMLDivElement>) => {
+      if (isFootageBinDrag(e)) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+      if (busy || applyInProgress) return;
+      const payload = readFootageDragPayload(e);
+      if (!payload) {
+        setOpError("Missing footage drag data (try again).");
+        return;
+      }
+      const vp = viewportRef.current;
+      const hit = vp ? findTrackUnderPoint(vp, e.clientY) : null;
+      await dropFootageAtTimelineSec(
+        e,
+        payload,
+        hit ? { trackId: hit.trackId, trackType: hit.trackType } : null,
+        null,
+      );
+    },
+    [busy, applyInProgress, dropFootageAtTimelineSec, setOpError],
   );
 
   const onLaneDragLeave = useCallback(() => {
@@ -443,6 +700,41 @@ export default function TimelinePanel() {
     }
   }, [timeline, ensureWaveform]);
 
+  const trackRows = useMemo(
+    () => (timeline ? orderedTracks(timeline) : []),
+    [timeline],
+  );
+
+  const setTrackVolume = useCallback(
+    (trackId: string, vol: number) => {
+      void runOp(() =>
+        applyOperation({
+          operation: "set_track_property",
+          arguments: {
+            track_id: trackId,
+            properties: { volume: Math.max(0, Math.min(2, vol)) },
+          },
+        }),
+      );
+    },
+    [applyOperation, runOp],
+  );
+
+  const toggleTrackMuted = useCallback(
+    (trackId: string, current: boolean | undefined) => {
+      void runOp(() =>
+        applyOperation({
+          operation: "set_track_property",
+          arguments: {
+            track_id: trackId,
+            properties: { muted: !current },
+          },
+        }),
+      );
+    },
+    [applyOperation, runOp],
+  );
+
   const playheadLeft = LABEL_WIDTH + playhead * pxPerSecond;
   const indicatorLeft =
     dropIndicatorSec !== null
@@ -461,7 +753,7 @@ export default function TimelinePanel() {
             className="timeline-toolbar__tool timeline-toolbar__tool--text"
             disabled={busy || !canUndo}
             onClick={() => void undo()}
-            title="Undo (⌘Z)"
+            title={shortcutTitle("undo")}
           >
             Undo
           </button>
@@ -470,7 +762,7 @@ export default function TimelinePanel() {
             className="timeline-toolbar__tool timeline-toolbar__tool--text"
             disabled={busy || !canRedo}
             onClick={() => void redo()}
-            title="Redo (⌘⇧Z)"
+            title={shortcutTitle("redo")}
           >
             Redo
           </button>
@@ -480,7 +772,7 @@ export default function TimelinePanel() {
             className="timeline-toolbar__tool timeline-toolbar__tool--text"
             disabled={busy || !selectedClipId}
             onClick={() => void splitAtPlayhead().catch(() => {})}
-            title="Split at playhead"
+            title={shortcutTitle("split")}
           >
             Split
           </button>
@@ -489,7 +781,7 @@ export default function TimelinePanel() {
             className="timeline-toolbar__tool timeline-toolbar__tool--text"
             disabled={busy || !selectedClipId}
             onClick={() => void deleteSelectedClip().catch(() => {})}
-            title="Delete selected clip"
+            title={shortcutTitle("delete")}
           >
             Del
           </button>
@@ -498,9 +790,18 @@ export default function TimelinePanel() {
           <span className="timeline-toolbar__stub" title="Not implemented">
             Snap
           </span>
-          <span className="timeline-toolbar__stub" title="Not implemented">
-            Link
-          </span>
+          <button
+            type="button"
+            className={
+              "timeline-toolbar__tool timeline-toolbar__tool--text" +
+              (linkingEnabled ? " timeline-toolbar__link-on" : "")
+            }
+            disabled={busy}
+            title={shortcutTitle("toggleLinking")}
+            onClick={() => void runOp(() => toggleClipLinking())}
+          >
+            Link {linkingEnabled ? "on" : "off"}
+          </button>
           <div className="timeline-toolbar__zoom">
             <span className="timeline-toolbar__zoom-label">Zoom</span>
             <input
@@ -556,7 +857,9 @@ export default function TimelinePanel() {
           <div
             ref={viewportRef}
             className="timeline-viewport"
-            onClick={() => setSelectedClipId(null)}
+            onClick={() => {
+              setSelectedClipIds([]);
+            }}
             role="presentation"
           >
             <div
@@ -568,6 +871,8 @@ export default function TimelinePanel() {
                   "--pps": `${pxPerSecond}px`,
                 } as CSSProperties
               }
+              onDragOver={onCanvasFootageDragOver}
+              onDrop={(e) => void onCanvasFootageDrop(e)}
             >
               <div
                 className="timeline-playhead"
@@ -621,96 +926,364 @@ export default function TimelinePanel() {
                 </div>
               </div>
 
-              {timeline.tracks.map((track) => (
-                <div className="track-row" key={track.id}>
-                  <div
-                    className="track-label track-label--sticky"
-                    style={{ width: LABEL_WIDTH }}
-                  >
-                    {track.label ?? track.type}
-                  </div>
-                  <div
-                    className="track-lane track-lane--timeline"
-                    style={{ width: laneWidth, height: TRACK_HEIGHT }}
-                    data-track-lane-id={track.id}
-                    data-track-type={track.type}
-                    onDragOver={(e) => onLaneDragOver(e, track.id, track.type)}
-                    onDragLeave={onLaneDragLeave}
-                    onDrop={(e) => void onLaneDrop(e, track.id, track.type)}
-                  >
-                    {(track.clips ?? []).map((clip) => {
-                      const start = clip.timeline_start;
-                      const dur = clipTimelineDuration(clip, track.type);
-                      const left = start * pxPerSecond;
-                      const width = Math.max(dur * pxPerSecond, 4);
-                      const selected = clip.id === selectedClipId;
-                      const src = clip.source;
-                      const si = clip.source_in ?? 0;
-                      const so = clip.source_out ?? si;
-                      const sp = clip.speed && clip.speed > 0 ? clip.speed : 1;
-                      const showWf =
-                        src &&
-                        (track.type === "video" || track.type === "audio");
-                      return (
-                        <div
-                          key={clip.id}
-                          role="button"
-                          tabIndex={0}
-                          className={
-                            trackClipClass(track.type) +
-                            (selected ? " tl-clip--selected" : "")
-                          }
-                          style={{ left, width, touchAction: "none" }}
-                          title={clipDisplayName(clip, track.type)}
-                          onClick={(e) => onClipClick(e, clip.id)}
-                          onPointerDown={(e) => {
-                            onClipPointerDown(e, {
-                              clipId: clip.id,
-                              trackId: track.id,
-                              trackType: track.type,
-                              timelineStart: clip.timeline_start,
-                            });
-                          }}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter" || e.key === " ") {
-                              e.preventDefault();
-                              setSelectedClipId(clip.id);
+              {trackRows.map((track) => {
+                const showTrackControls =
+                  track.type === "video" || track.type === "audio";
+                const tv = track.volume ?? 1;
+                return (
+                  <div className="track-row" key={track.id}>
+                    <div
+                      className={
+                        "track-label track-label--sticky track-label--with-controls" +
+                        (showTrackControls ? "" : "")
+                      }
+                      style={{ width: LABEL_WIDTH }}
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <span className="track-label__title">
+                        {track.label ?? track.type}
+                      </span>
+                      {showTrackControls ? (
+                        <div className="track-label__row">
+                          <button
+                            type="button"
+                            className={
+                              "track-mute-btn" +
+                              (track.muted ? " track-mute-btn--on" : "")
                             }
-                          }}
-                        >
-                          {showWf && (
-                            <ClipWaveformCanvas
-                              scrollRootRef={viewportRef}
-                              source={src}
-                              sourceIn={si}
-                              sourceOut={so}
-                              speed={sp}
-                              widthPx={width}
-                              heightPx={TRACK_HEIGHT}
-                              variant={
-                                track.type === "video" ? "video" : "audio"
+                            title={shortcutTitle("muteTrack")}
+                            aria-label={
+                              track.muted ? "Unmute track" : "Mute track"
+                            }
+                            disabled={busy}
+                            onClick={() =>
+                              toggleTrackMuted(track.id, track.muted)
+                            }
+                          >
+                            {track.muted ? "🔇" : "🔊"}
+                          </button>
+                          <label className="track-label__vol">
+                            <span className="sr-only">Track volume</span>
+                            <input
+                              type="range"
+                              min={0}
+                              max={2}
+                              step={0.05}
+                              value={tv}
+                              disabled={busy}
+                              title="Track volume (0–2×)"
+                              aria-label={`${track.label ?? track.type} volume`}
+                              onChange={(e) =>
+                                setTrackVolume(
+                                  track.id,
+                                  Number(e.target.value),
+                                )
                               }
                             />
-                          )}
-                          <span
-                            style={{
-                              position: "relative",
-                              zIndex: 1,
-                              pointerEvents: "none",
+                          </label>
+                        </div>
+                      ) : null}
+                    </div>
+                    <div
+                      className="track-lane track-lane--timeline"
+                      style={{ width: laneWidth, height: TRACK_HEIGHT }}
+                      data-track-lane-id={track.id}
+                      data-track-type={track.type}
+                      onDragOver={(e) =>
+                        onLaneDragOver(e, track.id, track.type)
+                      }
+                      onDragLeave={onLaneDragLeave}
+                      onDrop={(e) => void onLaneDrop(e, track.id, track.type)}
+                    >
+                      {(track.clips ?? []).map((clip) => {
+                        const start = clip.timeline_start;
+                        const dur = clipTimelineDuration(clip, track.type);
+                        const left = start * pxPerSecond;
+                        const width = Math.max(dur * pxPerSecond, 4);
+                        const selected =
+                          selectedClipIds.includes(clip.id) ||
+                          clip.id === selectedClipId;
+                        const partner =
+                          timeline && (track.type === "video" || track.type === "audio")
+                            ? linkedPartnerId(timeline, clip.id)
+                            : null;
+                        const linked = !!(clip.group_id && partner);
+                        const linkedHover =
+                          linked &&
+                          hoverClipId !== null &&
+                          (clip.id === hoverClipId || partner === hoverClipId);
+                        const src = clip.source;
+                        const si = clip.source_in ?? 0;
+                        const so = clip.source_out ?? si;
+                        const sp = clip.speed && clip.speed > 0 ? clip.speed : 1;
+                        const showWf =
+                          src &&
+                          (track.type === "video" || track.type === "audio");
+                        const detachedVid =
+                          track.type === "video" &&
+                          clip.audio_source === "detached";
+                        return (
+                          <div
+                            key={clip.id}
+                            role="button"
+                            tabIndex={0}
+                            className={
+                              trackClipClass(track.type) +
+                              (selected ? " tl-clip--selected" : "") +
+                              (linkedHover ? " tl-clip--linked-peer-hover" : "")
+                            }
+                            style={{ left, width, touchAction: "none" }}
+                            title={clipDisplayName(clip, track.type)}
+                            onClick={(e) => onClipClick(e, clip.id)}
+                            onMouseEnter={() => setHoverClipId(clip.id)}
+                            onMouseLeave={() => setHoverClipId(null)}
+                            onContextMenu={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              setContextMenu({
+                                x: e.clientX,
+                                y: e.clientY,
+                                clipId: clip.id,
+                                trackId: track.id,
+                                trackType: track.type,
+                              });
+                            }}
+                            onPointerDown={(e) => {
+                              onClipPointerDown(e, {
+                                clipId: clip.id,
+                                trackId: track.id,
+                                trackType: track.type,
+                                timelineStart: clip.timeline_start,
+                              });
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" || e.key === " ") {
+                                e.preventDefault();
+                                if (!timeline) return;
+                                const syn = new KeyboardEvent("keydown", {
+                                  shiftKey: e.shiftKey,
+                                });
+                                onClipClick(
+                                  syn as unknown as React.MouseEvent,
+                                  clip.id,
+                                );
+                              }
                             }}
                           >
-                            {clipDisplayName(clip, track.type)}
-                          </span>
-                        </div>
-                      );
-                    })}
+                            {showWf && (
+                              <ClipWaveformCanvas
+                                scrollRootRef={viewportRef}
+                                source={src}
+                                sourceIn={si}
+                                sourceOut={so}
+                                speed={sp}
+                                widthPx={width}
+                                heightPx={TRACK_HEIGHT}
+                                variant={
+                                  track.type === "video" ? "video" : "audio"
+                                }
+                              />
+                            )}
+                            <span
+                              className="tl-clip__row"
+                              style={{
+                                position: "relative",
+                                zIndex: 1,
+                                pointerEvents: "none",
+                              }}
+                            >
+                              {linked ? (
+                                <span className="tl-clip__link" title="Linked">
+                                  🔗
+                                </span>
+                              ) : null}
+                              {detachedVid ? (
+                                <span className="tl-clip__badge">No audio</span>
+                              ) : null}
+                              <span className="tl-clip__name">
+                                {clipDisplayName(clip, track.type)}
+                              </span>
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         )}
       </div>
+
+      <TimelineContextMenu
+        state={contextMenu}
+        onClose={() => setContextMenu(null)}
+        items={
+          contextMenu && timeline
+            ? (() => {
+                const hit = findClipById(timeline, contextMenu.clipId);
+                if (!hit) return [];
+                const { clip, trackType } = hit;
+                const c = clip;
+                const canSeparate =
+                  trackType === "video" && c.audio_source !== "detached";
+                const canReattach =
+                  (trackType === "video" && c.audio_source === "detached") ||
+                  (trackType === "audio" &&
+                    !!c.group_id &&
+                    timeline.tracks.some((tr) =>
+                      (tr.clips ?? []).some(
+                        (x) =>
+                          x.group_id === c.group_id &&
+                          x.audio_source === "detached",
+                      ),
+                    ));
+                const canUnlink = !!c.group_id;
+                const vol = c.volume !== undefined ? c.volume : 1;
+                const canPaste = !!readClipFromClipboard();
+                return [
+                  {
+                    label: "Separate audio",
+                    shortcut: shortcutKeys("separateAudio"),
+                    disabled: !canSeparate || busy,
+                    onSelect: () =>
+                      void runOp(async () => {
+                        useTimelineStore.setState({
+                          selectedClipId: c.id,
+                          selectedClipIds: [c.id],
+                        });
+                        await separateAudio();
+                      }),
+                  },
+                  {
+                    label: "Reattach audio",
+                    shortcut: shortcutKeys("reattachAudio"),
+                    disabled: !canReattach || busy,
+                    onSelect: () =>
+                      void runOp(async () => {
+                        useTimelineStore.setState({
+                          selectedClipId: c.id,
+                          selectedClipIds: [c.id],
+                        });
+                        await reattachAudio();
+                      }),
+                  },
+                  {
+                    label: "Unlink",
+                    shortcut: shortcutKeys("unlink"),
+                    disabled: !canUnlink || busy,
+                    onSelect: () =>
+                      void runOp(async () => {
+                        useTimelineStore.setState({
+                          selectedClipId: c.id,
+                          selectedClipIds: [c.id],
+                        });
+                        await unlinkClipsAction();
+                      }),
+                  },
+                  {
+                    label: "Split at playhead",
+                    shortcut: shortcutKeys("split"),
+                    disabled:
+                      busy ||
+                      !playheadInsideClip(c, trackType, playhead),
+                    onSelect: () =>
+                      void runOp(async () => {
+                        useTimelineStore.setState({
+                          selectedClipId: c.id,
+                          selectedClipIds: [c.id],
+                        });
+                        await splitAtPlayhead();
+                      }),
+                  },
+                  {
+                    label: "Delete",
+                    shortcut: shortcutKeys("delete"),
+                    disabled: busy,
+                    onSelect: () =>
+                      void runOp(async () => {
+                        useTimelineStore.setState({
+                          selectedClipId: c.id,
+                          selectedClipIds: [c.id],
+                        });
+                        await deleteSelectedClip();
+                      }),
+                  },
+                  {
+                    label: vol <= 0 ? "Unmute clip" : "Mute clip",
+                    shortcut: shortcutKeys("muteClip"),
+                    disabled: busy,
+                    onSelect: () =>
+                      void runOp(() =>
+                        applyOperation({
+                          operation: "set_clip_property",
+                          arguments: {
+                            clip_id: c.id,
+                            properties: { volume: vol <= 0 ? 1 : 0 },
+                          },
+                        }),
+                      ),
+                  },
+                  {
+                    label: "Copy",
+                    shortcut: shortcutKeys("copyClip"),
+                    disabled: busy,
+                    onSelect: () =>
+                      copyClipPayload({
+                        clip: c,
+                        sourceTrackId: contextMenu.trackId,
+                        sourceTrackType: contextMenu.trackType,
+                      }),
+                  },
+                  {
+                    label: "Paste at playhead",
+                    shortcut: shortcutKeys("pasteClip"),
+                    disabled: busy || !canPaste,
+                    onSelect: () => {
+                      const data = readClipFromClipboard();
+                      if (!data || !timeline) return;
+                      const videoTr = timeline.tracks.find(
+                        (x) => x.type === "video",
+                      );
+                      const audioTr = timeline.tracks.find(
+                        (x) => x.type === "audio",
+                      );
+                      const capTr = timeline.tracks.find(
+                        (x) => x.type === "caption",
+                      );
+                      const st = data.sourceTrackType;
+                      const targetId =
+                        st === "audio" && audioTr
+                          ? audioTr.id
+                          : st === "caption" && capTr
+                            ? capTr.id
+                            : videoTr?.id;
+                      const { group_id: _g, id: _i, ...rest } = data.clip;
+                      const newClip: Record<string, unknown> = {
+                        ...rest,
+                        id: crypto.randomUUID(),
+                        timeline_start: playhead,
+                        created_by: "user",
+                      };
+                      if (st === "video" || (!st && !targetId)) {
+                        newClip.audio_source = "embedded";
+                      }
+                      const args: Record<string, unknown> = { clip: newClip };
+                      if (targetId) args.track_id = targetId;
+                      void runOp(() =>
+                        applyOperation({
+                          operation: "add_clip",
+                          arguments: args,
+                        }),
+                      );
+                    },
+                  },
+                ];
+              })()
+            : []
+        }
+      />
     </div>
   );
 }

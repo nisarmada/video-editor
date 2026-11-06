@@ -43,13 +43,21 @@ const DEFAULT_CAPTION_STYLE: CaptionStyle = { preset: "bold_pop" };
 
 function ensureCaptionStyle(tl: TimelineV2): TimelineV2 {
   const s = tl.settings ?? {};
+  let next = tl;
   if (!s.caption_style) {
-    return {
-      ...tl,
-      settings: { ...s, caption_style: { ...DEFAULT_CAPTION_STYLE } },
+    next = {
+      ...next,
+      settings: { ...(next.settings ?? {}), caption_style: { ...DEFAULT_CAPTION_STYLE } },
     };
   }
-  return tl;
+  const s2 = next.settings ?? {};
+  if (s2.clip_linking_enabled === undefined) {
+    next = {
+      ...next,
+      settings: { ...s2, clip_linking_enabled: true },
+    };
+  }
+  return next;
 }
 
 export function newEmptyTimelineV2(): TimelineV2 {
@@ -78,6 +86,7 @@ export function newEmptyTimelineV2(): TimelineV2 {
       width: 1080,
       height: 1920,
       fps: 30,
+      clip_linking_enabled: true,
       caption_style: { ...DEFAULT_CAPTION_STYLE },
     },
   };
@@ -135,6 +144,8 @@ type TimelineViewState = {
 
   /** Selected clip on the timeline (UI); not necessarily validated server-side. */
   selectedClipId: string | null;
+  /** Multi-select (shift-click). `selectedClipId` stays the primary (last clicked). */
+  selectedClipIds: string[];
 
   /** Selected item in the media bin (footage filename stem). */
   selectedFootageName: string | null;
@@ -206,6 +217,7 @@ type TimelineViewState = {
   setTimelinePlaying: (playing: boolean) => void;
   toggleTimelinePlaying: () => void;
   setSelectedClipId: (id: string | null) => void;
+  setSelectedClipIds: (ids: string[]) => void;
   setDragInProgress: (v: boolean) => void;
   clearOpError: () => void;
 
@@ -227,6 +239,17 @@ type TimelineViewState = {
 
   /** Delete selected clip (delegates to applyOperation). */
   deleteSelectedClip: () => Promise<TimelineInverseOp>;
+
+  /** Detach embedded audio to audio track (video clip only). */
+  separateAudio: () => Promise<TimelineInverseOp | void>;
+  /** Merge paired audio back into video (selected video or linked audio clip). */
+  reattachAudio: () => Promise<TimelineInverseOp | void>;
+  /** Clear group_id on selected clip and its linked partner. */
+  unlinkClipsAction: () => Promise<TimelineInverseOp | void>;
+  /** Flip settings.clip_linking_enabled. */
+  toggleClipLinking: () => Promise<TimelineInverseOp | void>;
+  /** Toggle muted on the track that contains the selected clip (video/audio only). */
+  toggleSelectedTrackMute: () => Promise<TimelineInverseOp | void>;
 
   /** List footage from server. Pass `{ silent: true }` to refresh without clearing the list (polling). */
   fetchFootage: (opts?: { silent?: boolean }) => Promise<void>;
@@ -268,6 +291,7 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
   pxPerSecond: DEFAULT_PX_PER_SEC,
   timelinePlaying: false,
   selectedClipId: null,
+  selectedClipIds: [],
   selectedFootageName: null,
   footageClips: [],
   footageLoading: false,
@@ -438,6 +462,7 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
         playheadSeconds: 0,
         timelinePlaying: false,
         selectedClipId: null,
+        selectedClipIds: [],
         previewPanelMode: "timeline",
         undoStack: [],
         redoStack: [],
@@ -758,7 +783,16 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
         ...(next ? { previewPanelMode: "timeline" as PreviewPanelMode } : {}),
       };
     }),
-  setSelectedClipId: (id) => set({ selectedClipId: id }),
+  setSelectedClipId: (id) =>
+    set({
+      selectedClipId: id,
+      selectedClipIds: id ? [id] : [],
+    }),
+  setSelectedClipIds: (ids) =>
+    set({
+      selectedClipIds: ids,
+      selectedClipId: ids.length ? ids[ids.length - 1]! : null,
+    }),
   setDragInProgress: (v) => set({ dragInProgress: v }),
   clearOpError: () => set({ opErrorMessage: null }),
 
@@ -873,8 +907,62 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
       operation: "delete_clip",
       arguments: { clip_id: id },
     });
-    set({ selectedClipId: null });
+    set({ selectedClipId: null, selectedClipIds: [] });
     return undo;
+  },
+
+  separateAudio: async () => {
+    const id = get().selectedClipId;
+    if (!id) return;
+    return get().applyOperation({
+      operation: "separate_audio",
+      arguments: { clip_id: id },
+    });
+  },
+
+  reattachAudio: async () => {
+    const id = get().selectedClipId;
+    if (!id) return;
+    return get().applyOperation({
+      operation: "reattach_audio",
+      arguments: { clip_id: id },
+    });
+  },
+
+  unlinkClipsAction: async () => {
+    const id = get().selectedClipId;
+    if (!id) return;
+    return get().applyOperation({
+      operation: "unlink_clips",
+      arguments: { clip_id: id },
+    });
+  },
+
+  toggleClipLinking: async () => {
+    const tl = get().timeline;
+    if (!tl?.settings) return;
+    const cur = tl.settings.clip_linking_enabled;
+    const next = !(cur ?? true);
+    return get().applyOperation({
+      operation: "set_timeline_settings",
+      arguments: { properties: { clip_linking_enabled: next } },
+    });
+  },
+
+  toggleSelectedTrackMute: async () => {
+    const id = get().selectedClipId;
+    const tl = get().timeline;
+    if (!id || !tl) return;
+    for (const tr of tl.tracks ?? []) {
+      if (tr.type !== "video" && tr.type !== "audio") continue;
+      const hit = (tr.clips ?? []).some((c) => c.id === id);
+      if (!hit) continue;
+      const next = !(tr.muted ?? false);
+      return get().applyOperation({
+        operation: "set_track_property",
+        arguments: { track_id: tr.id, properties: { muted: next } },
+      });
+    }
   },
 
   runPlannerJob: async (brief, saveAsStem) => {

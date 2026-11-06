@@ -45,7 +45,11 @@ export type TimelineSettings = {
   height?: number;
   fps?: number;
   caption_style?: CaptionStyle;
+  /** When true, move/trim/split/delete follow group_id-linked clips. Default true if omitted. */
+  clip_linking_enabled?: boolean;
 };
+
+export type VideoAudioSource = "embedded" | "detached";
 
 export type TimelineClip = {
   id: string;
@@ -55,6 +59,8 @@ export type TimelineClip = {
   timeline_start: number;
   created_by?: string;
   group_id?: string;
+  /** Video clips: embedded timeline audio vs split to audio track. Default embedded if omitted. */
+  audio_source?: VideoAudioSource;
   speed?: number;
   volume?: number;
   zoom?: number;
@@ -67,6 +73,10 @@ export type TimelineTrack = {
   id: string;
   type: TrackType;
   label?: string;
+  /** Mute this video or audio track in the UI (export unchanged in this milestone). */
+  muted?: boolean;
+  /** Linear gain for preview/export mixing (default 1). */
+  volume?: number;
   clips: TimelineClip[];
 };
 

@@ -16,11 +16,13 @@ if str(_SCRIPTS_DIR) not in sys.path:
 from caption_style_resolve import fonts_bundle_dir  # noqa: E402
 from captions import build_ass, caption_events, load_plan_data, load_segments, remap_words  # noqa: E402
 from media import TimelinePiece, burn_captions, render_timeline  # noqa: E402
+from render_core import collect_audio_branches  # noqa: E402
 from timeline_format import (  # noqa: E402
     TIMELINE_GAP_SOURCE,
     is_v2,
     load_plan_file,
     v1_segments_from_data,
+    v2_timeline_duration,
 )
 from validate_plan import validate_plan  # noqa: E402
 
@@ -46,14 +48,31 @@ def parse_segments(segments_raw: list[dict]) -> list[TimelinePiece]:
         volume = float(seg["volume"]) if seg.get("volume") is not None else 1.0
         z = seg.get("zoom")
         zoom = float(z) if z is not None else None
+        embed_silent = bool(seg.get("embed_audio_silent"))
         if raw == TIMELINE_GAP_SOURCE:
             pieces.append(
-                TimelinePiece(None, start, end, speed=1.0, volume=1.0, zoom=None)
+                TimelinePiece(
+                    None,
+                    start,
+                    end,
+                    speed=1.0,
+                    volume=1.0,
+                    zoom=None,
+                    embed_audio_silent=False,
+                )
             )
             continue
         source = resolve_source(raw)
         pieces.append(
-            TimelinePiece(source, start, end, speed=speed, volume=volume, zoom=zoom)
+            TimelinePiece(
+                source,
+                start,
+                end,
+                speed=speed,
+                volume=volume,
+                zoom=zoom,
+                embed_audio_silent=embed_silent,
+            )
         )
     return pieces
 
@@ -89,12 +108,15 @@ def main() -> None:
         print(f"Error: plan not found: {plan_path}", file=sys.stderr)
         sys.exit(1)
 
-    errors = validate_plan(plan_path, args.max_length)
+    errors, warnings = validate_plan(plan_path, args.max_length)
     if errors:
         print("Plan validation failed:", file=sys.stderr)
         for err in errors:
             print(f"  - {err}", file=sys.stderr)
         sys.exit(1)
+    if warnings:
+        for w in warnings:
+            print(f"Warning: {w}", file=sys.stderr)
 
     plan_data = load_plan_file(plan_path)
     try:
@@ -127,8 +149,18 @@ def main() -> None:
         temp_video = Path(tempfile.mkdtemp()) / "render_nocap.mp4"
         render_target = temp_video
 
+    audio_branches = (
+        collect_audio_branches(plan_data, Path.cwd()) if is_v2(plan_data) else None
+    )
+    timeline_total = v2_timeline_duration(plan_data) if is_v2(plan_data) else None
+
     try:
-        render_timeline(pieces, render_target)
+        render_timeline(
+            pieces,
+            render_target,
+            audio_branches=audio_branches,
+            timeline_total=timeline_total,
+        )
     except RuntimeError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

@@ -11,12 +11,14 @@ from pathlib import Path
 
 from caption_style_resolve import fonts_bundle_dir
 from captions import build_ass, caption_events, load_plan_data, load_segments, remap_words
-from media import TimelinePiece, burn_captions, render_timeline
+from media import AudioBranch, TimelinePiece, burn_captions, render_timeline
 from timeline_format import (
     TIMELINE_GAP_SOURCE,
+    get_tracks,
     is_v2,
     load_plan_file,
     v1_segments_from_data,
+    v2_timeline_duration,
 )
 from validate_plan import validate_plan_data
 
@@ -45,19 +47,69 @@ def parse_segments(segments_raw: list[dict], root: Path) -> list[TimelinePiece]:
         start = float(seg["start"])
         end = float(seg["end"])
         raw = seg.get("source")
+        embed_silent = bool(seg.get("embed_audio_silent"))
         if raw == TIMELINE_GAP_SOURCE:
             pieces.append(
                 TimelinePiece(
-                    None, start, end, speed=1.0, volume=1.0, zoom=None
+                    None,
+                    start,
+                    end,
+                    speed=1.0,
+                    volume=1.0,
+                    zoom=None,
+                    embed_audio_silent=False,
                 )
             )
             continue
         speed, volume, zoom = _segment_transform(seg)
         source = resolve_source(raw, root)
         pieces.append(
-            TimelinePiece(source, start, end, speed=speed, volume=volume, zoom=zoom)
+            TimelinePiece(
+                source,
+                start,
+                end,
+                speed=speed,
+                volume=volume,
+                zoom=zoom,
+                embed_audio_silent=embed_silent,
+            )
         )
     return pieces
+
+
+def collect_audio_branches(plan_data: dict, root: Path) -> list[AudioBranch]:
+    """Non-muted audio-track clips, sorted by timeline_start."""
+    if not is_v2(plan_data):
+        return []
+    out: list[AudioBranch] = []
+    for tr in get_tracks(plan_data, "audio"):
+        if tr.get("muted"):
+            continue
+        clips = sorted(
+            tr.get("clips") or [],
+            key=lambda c: float(c["timeline_start"]),
+        )
+        for c in clips:
+            raw = c.get("source")
+            if not raw:
+                continue
+            try:
+                path = resolve_source(str(raw), root)
+            except FileNotFoundError:
+                continue
+            speed = float(c.get("speed") or 1.0) or 1.0
+            volume = float(c.get("volume")) if c.get("volume") is not None else 1.0
+            out.append(
+                AudioBranch(
+                    path=path,
+                    source_start=float(c["source_in"]),
+                    source_end=float(c["source_out"]),
+                    speed=speed,
+                    volume=volume,
+                    timeline_start=float(c["timeline_start"]),
+                )
+            )
+    return out
 
 
 def render_plan_data(
@@ -72,7 +124,7 @@ def render_plan_data(
     on_timeline_progress: Callable[[float | None], None] | None = None,
 ) -> None:
     """Validate and render v1 or v2 plan dict to output_path."""
-    errors = validate_plan_data(plan_data, max_length)
+    errors, _warnings = validate_plan_data(plan_data, max_length)
     if errors:
         raise ValueError(errors)
 
@@ -81,6 +133,10 @@ def render_plan_data(
         raise ValueError("Plan has no video segments.")
 
     segments = parse_segments(segments_raw, root)
+    audio_branches: list[AudioBranch] = (
+        collect_audio_branches(plan_data, root) if is_v2(plan_data) else []
+    )
+    timeline_total = v2_timeline_duration(plan_data) if is_v2(plan_data) else None
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     render_target = output_path
@@ -95,6 +151,8 @@ def render_plan_data(
     render_timeline(
         segments,
         render_target,
+        audio_branches=audio_branches if audio_branches else None,
+        timeline_total=timeline_total,
         cancel_event=cancel_event,
         on_progress=on_timeline_progress,
     )

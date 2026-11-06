@@ -4,7 +4,11 @@ import {
   FootageInUseError,
   uploadFootageFile,
 } from "../api/footage";
-import { FOOTAGE_DRAG_MIME } from "../timeline/dragConstants";
+import {
+  FOOTAGE_DRAG_MIME,
+  FOOTAGE_DRAG_TEXT_TYPE,
+} from "../timeline/dragConstants";
+import { setFootageFromBinDragging } from "../timeline/footageDragState";
 import { useTimelineStore } from "../store/timelineStore";
 import { formatDuration } from "../utils/timeFormat";
 
@@ -208,16 +212,17 @@ export default function MediaBin() {
                       e.preventDefault();
                       return;
                     }
-                    e.dataTransfer.setData(
-                      FOOTAGE_DRAG_MIME,
-                      JSON.stringify({
-                        name: clip.name,
-                        source: clip.source,
-                        duration_seconds: clip.duration_seconds,
-                      }),
-                    );
+                    const payload = JSON.stringify({
+                      name: clip.name,
+                      source: clip.source,
+                      duration_seconds: clip.duration_seconds,
+                    });
+                    e.dataTransfer.setData(FOOTAGE_DRAG_MIME, payload);
+                    e.dataTransfer.setData(FOOTAGE_DRAG_TEXT_TYPE, payload);
                     e.dataTransfer.effectAllowed = "copy";
+                    setFootageFromBinDragging(true);
                   }}
+                  onDragEnd={() => setFootageFromBinDragging(false)}
                 >
                   <div className="media-list__thumb-wrap">
                     {!failed ? (

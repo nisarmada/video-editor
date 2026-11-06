@@ -319,9 +319,9 @@ def captions_build_ass(body: CaptionsAssBody, paths: ProjectPaths = Depends(get_
         ass = sample_preview_ass(body.preview_preset, video_w=vw, video_h=vh)
         return {"ass": ass, "word_count": 3}
 
-    errs = validate_plan_data(body.timeline, None)
+    errs, wrns = validate_plan_data(body.timeline, None)
     if errs:
-        raise HTTPException(status_code=400, detail={"errors": errs})
+        raise HTTPException(status_code=400, detail={"errors": errs, "warnings": wrns})
     tl = dict(body.timeline)
     tw = th = None
     if isinstance(tl.get("settings"), dict):
@@ -642,11 +642,15 @@ def load_timeline(name: str, paths: ProjectPaths = Depends(get_paths)) -> dict[s
                 detail=f"Plan is not schema v2 and could not be auto-converted: {e}",
             ) from e
         with project_cwd(paths):
-            errors = validate_plan_data(data, None)
+            errors, warnings = validate_plan_data(data, None)
         if errors:
             raise HTTPException(
                 status_code=400,
-                detail={"errors": errors, "message": "Converted plan failed validation"},
+                detail={
+                    "errors": errors,
+                    "warnings": warnings,
+                    "message": "Converted plan failed validation",
+                },
             )
         log_event("info", f"Auto-converted v1 plan to v2 for load: {path.name}")
     return data
@@ -661,9 +665,12 @@ def save_timeline(
     if not is_v2(body.timeline):
         raise HTTPException(status_code=400, detail="timeline must be schema_version 2")
     with project_cwd(paths):
-        errors = validate_plan_data(body.timeline, None)
+        errors, warnings = validate_plan_data(body.timeline, None)
     if errors:
-        raise HTTPException(status_code=400, detail={"errors": errors})
+        raise HTTPException(
+            status_code=400,
+            detail={"errors": errors, "warnings": warnings},
+        )
     path = paths.plan_file(name)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(body.timeline, indent=2, ensure_ascii=False) + "\n")

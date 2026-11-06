@@ -80,6 +80,7 @@ describe("timeline undo/redo", () => {
       undoStack: [],
       redoStack: [],
       selectedClipId: null,
+      selectedClipIds: [],
       playheadSeconds: 0.5,
       applyOperationInProgress: false,
       dragInProgress: false,
@@ -165,7 +166,7 @@ describe("timeline undo/redo", () => {
 
     globalThis.fetch = fetchMock as unknown as typeof fetch;
 
-    useTimelineStore.setState({ selectedClipId: "c1" });
+    useTimelineStore.setState({ selectedClipId: "c1", selectedClipIds: ["c1"] });
     await useTimelineStore.getState().deleteSelectedClip();
     expect(useTimelineStore.getState().timeline?.tracks[0].clips).toHaveLength(
       1,
@@ -188,7 +189,11 @@ describe("timeline undo/redo", () => {
       2,
     );
 
-    useTimelineStore.setState({ selectedClipId: "c1", playheadSeconds: 1.0 });
+    useTimelineStore.setState({
+      selectedClipId: "c1",
+      selectedClipIds: ["c1"],
+      playheadSeconds: 1.0,
+    });
     await useTimelineStore.getState().splitAtPlayhead();
     expect(useTimelineStore.getState().timeline?.tracks[0].clips?.length).toBe(
       3,

@@ -65,6 +65,7 @@ def flatten_v2_to_v1_segments(data: dict) -> list[dict]:
     if video is None:
         return []
     ttype = "video"
+    track_muted = bool(video.get("muted"))
     clips = sorted(video.get("clips") or [], key=lambda c: float(c["timeline_start"]))
     segments: list[dict] = []
     timeline_cursor = 0.0
@@ -100,6 +101,9 @@ def flatten_v2_to_v1_segments(data: dict) -> list[dict]:
             seg["speed"] = float(c["speed"])
         if c.get("volume") is not None:
             seg["volume"] = float(c["volume"])
+        detached = c.get("audio_source") == "detached"
+        if track_muted or detached:
+            seg["embed_audio_silent"] = True
         segments.append(seg)
         timeline_cursor = t0 + dur
     return segments
@@ -110,6 +114,10 @@ def get_track(data: dict, track_type: str) -> dict | None:
         if t.get("type") == track_type:
             return t
     return None
+
+
+def get_tracks(data: dict, track_type: str) -> list[dict]:
+    return [t for t in data.get("tracks") or [] if t.get("type") == track_type]
 
 
 def plan_target_length(data: dict | list) -> float | None:
@@ -216,19 +224,29 @@ def validate_v2_clips_on_track(
     return errors
 
 
+AUDIO_SOURCE = frozenset({"embedded", "detached"})
+
+
 def validate_v2_data(
     data: dict,
     max_length: float | None,
     resolve_source,
     video_duration_fn,
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     errors: list[str] = []
+    warnings: list[str] = []
     if data.get("schema_version") != SCHEMA_V2:
         errors.append("schema_version must be 2.")
     tracks = data.get("tracks")
     if not isinstance(tracks, list) or not tracks:
         errors.append("v2 plan needs a non-empty 'tracks' array.")
-        return errors
+        return errors, warnings
+
+    settings = data.get("settings")
+    if isinstance(settings, dict):
+        cle = settings.get("clip_linking_enabled")
+        if cle is not None and not isinstance(cle, bool):
+            errors.append("settings.clip_linking_enabled must be a boolean if set.")
 
     has_video = False
     for track in tracks:
@@ -236,14 +254,34 @@ def validate_v2_data(
         if ttype not in TRACK_TYPES:
             errors.append(f"Unknown track type: {ttype!r}.")
             continue
+        tid = track.get("id", ttype)
+        mu = track.get("muted")
+        if mu is not None and not isinstance(mu, bool):
+            errors.append(f"Track {tid!r}: muted must be a boolean if set.")
+        tv = track.get("volume")
+        if tv is not None:
+            try:
+                float(tv)
+            except (TypeError, ValueError):
+                errors.append(f"Track {tid!r}: volume must be a number if set.")
+        if mu is not None and ttype == "caption":
+            errors.append(f"Track {tid!r}: caption track must not set muted.")
         if ttype == "video" and (track.get("clips") or []):
             has_video = True
         errors.extend(validate_v2_clips_on_track(track, resolve_source, video_duration_fn))
 
+        if ttype == "video":
+            for i, clip in enumerate(track.get("clips") or []):
+                label = f"Track {tid} video clip {i}"
+                asrc = clip.get("audio_source")
+                if asrc is not None and asrc not in AUDIO_SOURCE:
+                    errors.append(
+                        f"{label}: audio_source must be 'embedded' or 'detached' if set."
+                    )
+
     if not has_video:
         errors.append("v2 plan needs at least one clip on a video track.")
 
-    settings = data.get("settings")
     if isinstance(settings, dict) and "caption_style" in settings:
         cs = settings["caption_style"]
         if cs is not None and not isinstance(cs, dict):
@@ -254,11 +292,53 @@ def validate_v2_data(
     for track in tracks:
         if track.get("type") != "video":
             continue
+        tid = track.get("id", "video")
         for i, clip in enumerate(track.get("clips") or []):
             so = clip.get("style_override")
             if so is not None:
                 errors.extend(
                     validate_style_override(so, f"video clip {i} style_override"),
+                )
+
+    # Warn: detached video without a paired audio clip (same group_id, matching span)
+    audio_index: list[dict] = []
+    for tr in tracks:
+        if tr.get("type") != "audio":
+            continue
+        for c in tr.get("clips") or []:
+            audio_index.append(c)
+
+    for track in tracks:
+        if track.get("type") != "video":
+            continue
+        tid = track.get("id", "video")
+        for i, vclip in enumerate(track.get("clips") or []):
+            if vclip.get("audio_source") != "detached":
+                continue
+            gid = vclip.get("group_id")
+            if not isinstance(gid, str) or not gid.strip():
+                warnings.append(
+                    f"Track {tid} clip {i}: audio_source is detached but group_id is missing; "
+                    "pairing is ambiguous."
+                )
+                continue
+            matched = False
+            for aclip in audio_index:
+                if aclip.get("group_id") != gid:
+                    continue
+                if (
+                    float(aclip.get("timeline_start", -1))
+                    == float(vclip.get("timeline_start", -2))
+                    and aclip.get("source") == vclip.get("source")
+                    and float(aclip.get("source_in", 0)) == float(vclip.get("source_in", 0))
+                    and float(aclip.get("source_out", 0)) == float(vclip.get("source_out", 0))
+                ):
+                    matched = True
+                    break
+            if not matched:
+                warnings.append(
+                    f"Track {tid} clip {i}: audio_source=detached but no audio clip found "
+                    f"with group_id {gid!r} and matching timeline/source trim."
                 )
 
     total = v2_timeline_duration(data)
@@ -267,4 +347,4 @@ def validate_v2_data(
             f"Timeline duration {total:.2f}s exceeds max {max_length:.2f}s."
         )
 
-    return errors
+    return errors, warnings
