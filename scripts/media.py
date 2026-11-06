@@ -8,10 +8,39 @@ import json
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 TARGET_W, TARGET_H, FPS = 1080, 1920, 30
 AUDIO_FADE_SECONDS = 0.02
+
+
+@dataclass(frozen=True)
+class TimelinePiece:
+    """One concat unit: file trim (or gap), with optional speed / volume / zoom."""
+
+    path: Path | None
+    source_start: float
+    source_end: float
+    speed: float = 1.0
+    volume: float = 1.0
+    zoom: float | None = None
+
+    def is_gap(self) -> bool:
+        return self.path is None
+
+    def source_span(self) -> float:
+        return max(self.source_end - self.source_start, 0.001)
+
+    def output_duration(self) -> float:
+        """Wall-clock duration on the output timeline (matches preview)."""
+        if self.is_gap():
+            return self.source_span()
+        return self.source_span() / self.effective_speed()
+
+    def effective_speed(self) -> float:
+        s = float(self.speed)
+        return s if s > 0 else 1.0
 
 
 def ffprobe_json(path: Path) -> dict:
@@ -180,12 +209,56 @@ def join_files(input_paths: list[Path], output_path: Path) -> None:
     run_ffmpeg(cmd)
 
 
+def _atempo_chain_factors(speed: float) -> list[float]:
+    """Split speed into atempo factors in (0.5, 2.0] per filter."""
+    if speed <= 0:
+        return []
+    factors: list[float] = []
+    remaining = float(speed)
+    while remaining > 2.0 + 1e-9:
+        factors.append(2.0)
+        remaining /= 2.0
+    while remaining < 0.5 - 1e-9:
+        factors.append(0.5)
+        remaining /= 0.5
+    if abs(remaining - 1.0) > 1e-6:
+        factors.append(remaining)
+    return factors
+
+
+def _volume_filter_expr(volume: float) -> str:
+    """Linear gain; clamp non-positive to silence."""
+    v = float(volume)
+    if v <= 0:
+        return "volume=0"
+    if abs(v - 1.0) < 1e-9:
+        return "volume=1"
+    return f"volume={v:.8f}"
+
+
+def _zoom_punch_filter(zoom: float) -> str:
+    """
+    After 1080x1920 normalize: crop centered (1/zoom) fraction, scale back to frame.
+    zoom 1.0 = no-op; zoom > 1 punch in.
+    """
+    z = float(zoom)
+    if z <= 1.001:
+        return ""
+    # iw/ih are normalized frame dimensions (TARGET_W x TARGET_H)
+    return (
+        f"crop=w=iw/{z}:h=ih/{z}:x=(iw-iw/{z})/2:y=(ih-ih/{z})/2,"
+        f"scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=decrease,"
+        f"pad={TARGET_W}:{TARGET_H}:(ow-iw)/2:(oh-ih)/2:black"
+    )
+
+
 def build_timeline_filter_graph(
-    segments: list[tuple[Path, float, float]],
+    pieces: list[TimelinePiece],
 ) -> tuple[str, list[str]]:
     """
-    Each item is (source_path, start_sec, end_sec).
-    Trims, normalizes, applies short audio fades at cuts, then concats.
+    Trim each piece, normalize to 1080x1920 @ 30fps, optional zoom punch-in,
+    speed via setpts / atempo (timeline duration matches preview), volume on audio.
+    Gaps: lavfi black + silence.
     """
     parts: list[str] = []
     ffmpeg_inputs: list[str] = []
@@ -194,50 +267,116 @@ def build_timeline_filter_graph(
 
     path_to_index: dict[Path, int] = {}
     meta_cache: dict[Path, tuple[float, bool, int | None]] = {}
+    next_input = 0
 
-    for path, _start, _end in segments:
+    n = len(pieces)
+    for i, piece in enumerate(pieces):
+        seg_out = piece.output_duration()
+
+        if piece.is_gap():
+            ffmpeg_inputs.extend(
+                [
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    f"color=c=black:s={TARGET_W}x{TARGET_H}:r={FPS}:d={seg_out:.6f}",
+                ]
+            )
+            v_in = next_input
+            next_input += 1
+            ffmpeg_inputs.extend(
+                [
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    f"anullsrc=r=44100:cl=stereo,atrim=duration={seg_out:.6f},"
+                    f"asetpts=PTS-STARTPTS",
+                ]
+            )
+            a_in = next_input
+            next_input += 1
+            parts.append(
+                f"[{v_in}:v]scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=decrease,"
+                f"pad={TARGET_W}:{TARGET_H}:(ow-iw)/2:(oh-ih)/2:black,"
+                f"setsar=1,fps={FPS},format=yuv420p[v{i}]"
+            )
+            vlabels.append(f"[v{i}]")
+
+            audio_filters = ["aformat=sample_rates=44100:channel_layouts=stereo"]
+            if i > 0:
+                audio_filters.insert(0, f"afade=t=in:st=0:d={AUDIO_FADE_SECONDS}")
+            if i < n - 1:
+                fade_out_st = max(seg_out - AUDIO_FADE_SECONDS, 0)
+                audio_filters.append(
+                    f"afade=t=out:st={fade_out_st:.6f}:d={AUDIO_FADE_SECONDS}"
+                )
+            parts.append(f"[{a_in}:a]{','.join(audio_filters)}[a{i}]")
+            alabels.append(f"[a{i}]")
+            continue
+
+        path = piece.path
+        assert path is not None
         resolved = path.resolve()
         if resolved not in path_to_index:
-            path_to_index[resolved] = len(path_to_index)
+            path_to_index[resolved] = next_input
             ffmpeg_inputs.extend(["-i", str(resolved)])
             meta_cache[resolved] = clip_metadata(resolved)
+            next_input += 1
+        idx = path_to_index[resolved]
+        _duration, has_audio, rotation = meta_cache[resolved]
 
-    n = len(segments)
-    for i, (path, start, end) in enumerate(segments):
-        idx = path_to_index[path.resolve()]
-        duration, has_audio, rotation = meta_cache[path.resolve()]
-        seg_len = max(end - start, 0.001)
+        start = piece.source_start
+        end = piece.source_end
+        speed = piece.effective_speed()
+        sp = f"{speed:.8f}".rstrip("0").rstrip(".") if speed != 1.0 else "1"
 
         rot = rotation_filter(rotation)
-        parts.append(
+        v_after_norm = f"vn{i}"
+        base_chain = (
             f"[{idx}:v]trim=start={start:.6f}:end={end:.6f},setpts=PTS-STARTPTS,"
             f"{rot}"
             f"scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=decrease,"
             f"pad={TARGET_W}:{TARGET_H}:(ow-iw)/2:(oh-ih)/2:black,"
-            f"setsar=1,fps={FPS},format=yuv420p[v{i}]"
+            f"setsar=1,fps={FPS},format=yuv420p[{v_after_norm}]"
         )
-        vlabels.append(f"[v{i}]")
+        parts.append(base_chain)
 
-        audio_filters = [
-            f"atrim=start={start:.6f}:end={end:.6f}",
-            "asetpts=PTS-STARTPTS",
-            "aformat=sample_rates=44100:channel_layouts=stereo",
-        ]
+        zoom_chain = _zoom_punch_filter(piece.zoom or 1.0)
+        if zoom_chain:
+            v_pre_speed = f"vz{i}"
+            parts.append(f"[{v_after_norm}]{zoom_chain}[{v_pre_speed}]")
+        else:
+            v_pre_speed = v_after_norm
+
+        # setpts after geometry so duration scales (faster = shorter clip on timeline)
+        if abs(speed - 1.0) > 1e-6:
+            parts.append(f"[{v_pre_speed}]setpts=PTS/{sp}[pre{i}]")
+            vlabels.append(f"[pre{i}]")
+        else:
+            vlabels.append(f"[{v_pre_speed}]")
+
+        tail_audio: list[str] = []
+        for fac in _atempo_chain_factors(speed):
+            tail_audio.append(f"atempo={fac:.8f}".rstrip("0").rstrip("."))
+        tail_audio.append(_volume_filter_expr(piece.volume))
+        tail_audio.append("aformat=sample_rates=44100:channel_layouts=stereo")
+
         if i > 0:
-            audio_filters.append(f"afade=t=in:st=0:d={AUDIO_FADE_SECONDS}")
+            tail_audio.append(f"afade=t=in:st=0:d={AUDIO_FADE_SECONDS}")
         if i < n - 1:
-            fade_out_st = max(seg_len - AUDIO_FADE_SECONDS, 0)
-            audio_filters.append(
+            fade_out_st = max(seg_out - AUDIO_FADE_SECONDS, 0)
+            tail_audio.append(
                 f"afade=t=out:st={fade_out_st:.6f}:d={AUDIO_FADE_SECONDS}"
             )
+        tail_s = ",".join(tail_audio)
 
         if has_audio:
-            chain = ",".join(audio_filters)
-            parts.append(f"[{idx}:a]{chain}[a{i}]")
+            head = f"atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS"
+            parts.append(f"[{idx}:a]{head},{tail_s}[a{i}]")
         else:
             parts.append(
-                f"anullsrc=r=44100:cl=stereo,atrim=duration={seg_len:.6f},"
-                f"asetpts=PTS-STARTPTS[a{i}]"
+                f"anullsrc=r=44100:cl=stereo,atrim=duration={seg_out:.6f},"
+                f"asetpts=PTS-STARTPTS,{tail_s}[a{i}]"
             )
         alabels.append(f"[a{i}]")
 
@@ -348,17 +487,17 @@ def _burn_captions_png_overlay(
             cmd.extend(
                 ["-loop", "1", "-t", f"{video_duration:.3f}", "-i", str(png)]
             )
-        parts: list[str] = []
+        parts_fc: list[str] = []
         last = "[0:v]"
         for i, event in enumerate(events):
             out = f"[v{i + 1}]"
             t0 = event["start"]
             t1 = event["end"]
-            parts.append(
+            parts_fc.append(
                 f"{last}[{i + 1}:v]overlay=0:0:enable='between(t,{t0:.3f},{t1:.3f})'{out}"
             )
             last = out
-        filter_complex = ";".join(parts)
+        filter_complex = ";".join(parts_fc)
         cmd.extend(
             [
                 "-filter_complex",
@@ -381,9 +520,9 @@ def _burn_captions_png_overlay(
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def render_timeline(segments: list[tuple[Path, float, float]], output_path: Path) -> None:
+def render_timeline(pieces: list[TimelinePiece], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    filter_complex, ffmpeg_inputs = build_timeline_filter_graph(segments)
+    filter_complex, ffmpeg_inputs = build_timeline_filter_graph(pieces)
     cmd = [
         "ffmpeg",
         "-y",

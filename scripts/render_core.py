@@ -8,8 +8,13 @@ import tempfile
 from pathlib import Path
 
 from captions import build_ass, caption_events, load_segments, remap_words
-from media import burn_captions, render_timeline
-from timeline_format import is_v2, load_plan_file, v1_segments_from_data
+from media import TimelinePiece, burn_captions, render_timeline
+from timeline_format import (
+    TIMELINE_GAP_SOURCE,
+    is_v2,
+    load_plan_file,
+    v1_segments_from_data,
+)
 from validate_plan import validate_plan_data
 
 
@@ -23,14 +28,33 @@ def resolve_source(raw: str, root: Path) -> Path:
     raise FileNotFoundError(f"Source not found: {raw}")
 
 
-def parse_segments(segments_raw: list[dict], root: Path) -> list[tuple[Path, float, float]]:
-    segments: list[tuple[Path, float, float]] = []
+def _segment_transform(seg: dict) -> tuple[float, float, float | None]:
+    speed = float(seg["speed"]) if seg.get("speed") is not None else 1.0
+    volume = float(seg["volume"]) if seg.get("volume") is not None else 1.0
+    z = seg.get("zoom")
+    zoom = float(z) if z is not None else None
+    return speed, volume, zoom
+
+
+def parse_segments(segments_raw: list[dict], root: Path) -> list[TimelinePiece]:
+    pieces: list[TimelinePiece] = []
     for seg in segments_raw:
-        source = resolve_source(seg["source"], root)
         start = float(seg["start"])
         end = float(seg["end"])
-        segments.append((source, start, end))
-    return segments
+        raw = seg.get("source")
+        if raw == TIMELINE_GAP_SOURCE:
+            pieces.append(
+                TimelinePiece(
+                    None, start, end, speed=1.0, volume=1.0, zoom=None
+                )
+            )
+            continue
+        speed, volume, zoom = _segment_transform(seg)
+        source = resolve_source(raw, root)
+        pieces.append(
+            TimelinePiece(source, start, end, speed=speed, volume=volume, zoom=zoom)
+        )
+    return pieces
 
 
 def render_plan_data(

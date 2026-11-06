@@ -15,6 +15,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 from media import video_duration_seconds  # noqa: E402
 from timeline_format import (  # noqa: E402
+    TIMELINE_GAP_SOURCE,
     is_v2,
     load_plan_file,
     validate_v2_data,
@@ -70,6 +71,9 @@ def validate_segments(
                 f"{label}: length {length:.3f}s is under minimum {MIN_SEGMENT_SECONDS}s."
             )
         total_out += max(end - start, 0)
+
+        if seg.get("source") == TIMELINE_GAP_SOURCE:
+            continue
 
         try:
             source = resolve_source(seg["source"])

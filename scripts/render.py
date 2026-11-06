@@ -14,9 +14,16 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from captions import build_ass, caption_events, load_segments, remap_words  # noqa: E402
-from media import burn_captions, render_timeline  # noqa: E402
-from timeline_format import is_v2, load_plan_file, v1_segments_from_data  # noqa: E402
+from media import TimelinePiece, burn_captions, render_timeline  # noqa: E402
+from timeline_format import (  # noqa: E402
+    TIMELINE_GAP_SOURCE,
+    is_v2,
+    load_plan_file,
+    v1_segments_from_data,
+)
 from validate_plan import validate_plan  # noqa: E402
+
+_GAP_LABEL = "black+silence (gap)"
 
 
 def resolve_source(raw: str) -> Path:
@@ -28,14 +35,26 @@ def resolve_source(raw: str) -> Path:
     return path
 
 
-def parse_segments(segments_raw: list[dict]) -> list[tuple[Path, float, float]]:
-    segments: list[tuple[Path, float, float]] = []
-    for i, seg in enumerate(segments_raw):
-        source = resolve_source(seg["source"])
+def parse_segments(segments_raw: list[dict]) -> list[TimelinePiece]:
+    pieces: list[TimelinePiece] = []
+    for seg in segments_raw:
         start = float(seg["start"])
         end = float(seg["end"])
-        segments.append((source, start, end))
-    return segments
+        raw = seg.get("source")
+        speed = float(seg["speed"]) if seg.get("speed") is not None else 1.0
+        volume = float(seg["volume"]) if seg.get("volume") is not None else 1.0
+        z = seg.get("zoom")
+        zoom = float(z) if z is not None else None
+        if raw == TIMELINE_GAP_SOURCE:
+            pieces.append(
+                TimelinePiece(None, start, end, speed=1.0, volume=1.0, zoom=None)
+            )
+            continue
+        source = resolve_source(raw)
+        pieces.append(
+            TimelinePiece(source, start, end, speed=speed, volume=volume, zoom=zoom)
+        )
+    return pieces
 
 
 def load_timeline(plan_path: Path) -> list[dict]:
@@ -88,17 +107,18 @@ def main() -> None:
         sys.exit(1)
 
     if is_v2(plan_data):
-        print("Timeline schema v2 (rendering video track; gaps not filled yet).")
+        print("Timeline schema v2 (video track; gaps filled with black + silence).")
 
     try:
-        segments = parse_segments(segments_raw)
+        pieces = parse_segments(segments_raw)
     except (KeyError, TypeError, ValueError, FileNotFoundError) as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Rendering {len(segments)} segment(s) -> {output_path}")
-    for i, (src, start, end) in enumerate(segments):
-        print(f"  [{i + 1}/{len(segments)}] {src.name}  {start:.2f}s - {end:.2f}s")
+    print(f"Rendering {len(pieces)} segment(s) -> {output_path}")
+    for i, piece in enumerate(pieces):
+        label = _GAP_LABEL if piece.is_gap() else piece.path.name
+        print(f"  [{i + 1}/{len(pieces)}] {label}  {piece.source_start:.2f}s - {piece.source_end:.2f}s")
 
     render_target = output_path
     temp_video: Path | None = None
@@ -107,7 +127,7 @@ def main() -> None:
         render_target = temp_video
 
     try:
-        render_timeline(segments, render_target)
+        render_timeline(pieces, render_target)
     except RuntimeError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

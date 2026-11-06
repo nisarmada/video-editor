@@ -33,7 +33,11 @@ def load_segments(plan_path: Path) -> list[dict]:
     _SCRIPTS = Path(__file__).resolve().parent
     if str(_SCRIPTS) not in sys.path:
         sys.path.insert(0, str(_SCRIPTS))
-    from timeline_format import load_plan_file, v1_segments_from_data
+    from timeline_format import (  # noqa: WPS433
+        TIMELINE_GAP_SOURCE,
+        load_plan_file,
+        v1_segments_from_data,
+    )
 
     data = load_plan_file(plan_path)
     return v1_segments_from_data(data)
@@ -71,6 +75,10 @@ def remap_words(plan_segments: list[dict]) -> list[dict]:
 
     for seg in plan_segments:
         src = seg["source"]
+        if src == TIMELINE_GAP_SOURCE:
+            seg_len = float(seg["end"]) - float(seg["start"])
+            output_cursor += seg_len
+            continue
         stem = source_stem(src)
         seg_start = float(seg["start"])
         seg_end = float(seg["end"])

@@ -13,6 +13,9 @@ MIN_CLIP_SECONDS = 0.3
 TRACK_TYPES = frozenset({"video", "audio", "caption"})
 CREATED_BY = frozenset({"user", "ai"})
 
+# Marker source for v1-style segments that stand for timeline gaps (export / captions cursor).
+TIMELINE_GAP_SOURCE = "__timeline_gap__"
+
 
 def load_plan_data(data: dict | list) -> dict | list:
     """Parse JSON already loaded."""
@@ -53,14 +56,29 @@ def clip_timeline_duration(clip: dict, track_type: str) -> float:
 def flatten_v2_to_v1_segments(data: dict) -> list[dict]:
     """
     Flatten v2 video track to v1-style segments for render/captions.
-    Sorted by timeline_start; gaps are not inserted (concat back-to-back).
+    Sorted by timeline_start; gaps become synthetic segments (TIMELINE_GAP_SOURCE)
+    so export matches preview duration (black video + silence).
     """
     video = get_track(data, "video")
     if video is None:
         return []
+    ttype = "video"
     clips = sorted(video.get("clips") or [], key=lambda c: float(c["timeline_start"]))
     segments: list[dict] = []
+    timeline_cursor = 0.0
     for c in clips:
+        t0 = float(c["timeline_start"])
+        dur = clip_timeline_duration(c, ttype)
+        gap = t0 - timeline_cursor
+        if gap > 0.001:
+            segments.append(
+                {
+                    "source": TIMELINE_GAP_SOURCE,
+                    "start": 0.0,
+                    "end": gap,
+                    "_gap": True,
+                }
+            )
         seg = {
             "source": c["source"],
             "start": float(c["source_in"]),
@@ -72,7 +90,12 @@ def flatten_v2_to_v1_segments(data: dict) -> list[dict]:
             seg["caption"] = c.get("text")
         if c.get("zoom") is not None:
             seg["zoom"] = c["zoom"]
+        if c.get("speed") is not None:
+            seg["speed"] = float(c["speed"])
+        if c.get("volume") is not None:
+            seg["volume"] = float(c["volume"])
         segments.append(seg)
+        timeline_cursor = t0 + dur
     return segments
 
 
