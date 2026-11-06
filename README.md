@@ -22,6 +22,8 @@ uvicorn backend.main:app --reload --app-dir .
 
 See `backend/README.md` for endpoints (footage, timelines, edit ops, planner, render).
 
+**Web UI:** `frontend/README.md` — run FastAPI + Vite together (`npm run dev` proxies `/api`).
+
 Requires [FFmpeg](https://ffmpeg.org/) (`ffmpeg` and `ffprobe` on your PATH).  
 **Captions:** Homebrew’s minimal `ffmpeg` often lacks `libass`/`drawtext`. The renderer falls back to PNG overlays automatically. For native ASS burn-in, install a build with libass.
 

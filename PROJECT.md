@@ -16,7 +16,7 @@ editing style.
 - faster-whisper for transcripts (local)
 - PySceneDetect for shot boundaries
 - Anthropic API (Claude) for planning and captioning keyframes
-- No web framework, no database. Everything is files and JSON.
+- Local FastAPI API (`backend/`) + Vite/React frontend (`frontend/`); otherwise no database. Everything stays files and JSON.
 
 ## Pipeline (one script per stage, each reads/writes JSON)
 1. ingest: per clip, make proxy, transcript with word timestamps,
@@ -41,6 +41,8 @@ index/      analysis JSON per clip
 plans/      timeline JSONs
 output/     rendered videos
 scripts/    pipeline code
+frontend/   local web UI (Vite + React + TypeScript)
+backend/    FastAPI server for UI and tools
 
 ## Rules
 - Build one milestone at a time; each must run on its own before moving on.
@@ -50,7 +52,7 @@ scripts/    pipeline code
 - Print clear progress messages and readable errors.
 
 ## Current milestone
-Milestone 5: Claude timeline planning (`scripts/plan.py`). Local API: `backend/` (FastAPI). Next: render + review loop.
+**UI playback** — local web editor (`frontend/`) with media bin + proxy preview + read-only v2 timeline; `backend/` serves footage and plans. Next: timeline editing, then render + review loop.
 
 ## Later ideas (don't build yet)
 Style profile from reference creators, beat-synced cuts, music, captions
