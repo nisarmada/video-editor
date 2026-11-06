@@ -30,6 +30,7 @@ export default function TimelineVideoPreview() {
   const safeAreaGuide = useTimelineStore((s) => s.captionSafeAreaGuide);
 
   const videoRef = useRef<HTMLVideoElement>(null);
+  const prevClipIdRef = useRef<string | null>(null);
   const [audioMasterVolume, setAudioMasterVolume] = useState(1);
   const [audioMasterMuted, setAudioMasterMuted] = useState(false);
 
@@ -95,6 +96,8 @@ export default function TimelineVideoPreview() {
 
     const absUrl = new URL(proxyUrl, window.location.origin).href;
     const needNewSrc = !video.src || video.src !== absUrl;
+    const clipChanged = clipId !== prevClipIdRef.current;
+    prevClipIdRef.current = clipId;
 
     const doSeek = () => {
       if (Math.abs(video.currentTime - clamped) > 0.04) {
@@ -106,10 +109,6 @@ export default function TimelineVideoPreview() {
       video.pause();
     }
 
-    if (playing && !needNewSrc) {
-      return;
-    }
-
     if (needNewSrc) {
       video.src = proxyUrl;
       video.load();
@@ -119,7 +118,12 @@ export default function TimelineVideoPreview() {
       };
       video.addEventListener("loadedmetadata", onReady);
     } else {
-      doSeek();
+      // Same proxy URL: still seek when scrubbing (paused) or when the active clip changed
+      // (e.g. two timeline clips from the same file). Avoid seeking every frame while playing
+      // and the clip is unchanged — timeupdate keeps the playhead in sync.
+      if (!playing || clipChanged) {
+        doSeek();
+      }
     }
   }, [timeline, clipId, proxyUrl, playing, playhead, activeClip]);
 

@@ -44,32 +44,46 @@ export function clipDisplayName(clip: TimelineClip, trackType: string): string {
   return clip.id.slice(0, 8);
 }
 
-/** First video track's clips, sorted by timeline_start. */
+/**
+ * All clips from every video track, sorted by timeline_start then track order.
+ * Multiple video tracks are allowed (e.g. overlay); later tracks win on overlap (see activeVideoClipAt).
+ */
 export function getSortedVideoClips(timeline: TimelineV2 | null): TimelineClip[] {
   if (!timeline) return [];
-  const videoTrack = timeline.tracks.find((tr) => tr.type === "video");
-  const clips = [...(videoTrack?.clips ?? [])];
-  clips.sort((a, b) => a.timeline_start - b.timeline_start);
-  return clips;
+  const tagged: { clip: TimelineClip; trackIndex: number }[] = [];
+  timeline.tracks.forEach((tr, trackIndex) => {
+    if (tr.type !== "video") return;
+    for (const c of tr.clips ?? []) {
+      tagged.push({ clip: c, trackIndex });
+    }
+  });
+  tagged.sort((a, b) => {
+    const d = a.clip.timeline_start - b.clip.timeline_start;
+    if (d !== 0) return d;
+    return a.trackIndex - b.trackIndex;
+  });
+  return tagged.map((x) => x.clip);
 }
 
 /**
  * Active video clip at timeline time t, or null in a gap.
  * Clips are half-open [start, end) so adjacent clips meet at boundaries.
+ * If two video clips overlap (different tracks), the clip on the later track wins (top layer).
  */
 export function activeVideoClipAt(
   clips: TimelineClip[],
   t: number,
 ): TimelineClip | null {
+  let hit: TimelineClip | null = null;
   for (const clip of clips) {
     const dur = clipTimelineDuration(clip, "video");
     const start = clip.timeline_start;
     const end = start + dur;
     if (t >= start - 1e-9 && t < end - 1e-9) {
-      return clip;
+      hit = clip;
     }
   }
-  return null;
+  return hit;
 }
 
 /** Map timeline time to source media time (seconds). */

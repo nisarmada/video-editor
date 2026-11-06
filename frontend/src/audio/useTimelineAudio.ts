@@ -53,17 +53,26 @@ function activeVideoClipAtTime(
   timeline: TimelineV2,
   t: number,
 ): TimelineClip | null {
-  const tr = timeline.tracks.find((x) => x.type === "video");
-  const clips = [...(tr?.clips ?? [])].sort(
-    (a, b) => a.timeline_start - b.timeline_start,
-  );
-  for (const c of clips) {
+  const tagged: { clip: TimelineClip; trackIndex: number }[] = [];
+  timeline.tracks.forEach((tr, trackIndex) => {
+    if (tr.type !== "video") return;
+    for (const c of tr.clips ?? []) {
+      tagged.push({ clip: c, trackIndex });
+    }
+  });
+  tagged.sort((a, b) => {
+    const d = a.clip.timeline_start - b.clip.timeline_start;
+    if (d !== 0) return d;
+    return a.trackIndex - b.trackIndex;
+  });
+  let hit: TimelineClip | null = null;
+  for (const { clip: c } of tagged) {
     const dur = clipTimelineDuration(c, "video");
     if (t >= c.timeline_start - 1e-9 && t < c.timeline_start + dur - 1e-9) {
-      return c;
+      hit = c;
     }
   }
-  return null;
+  return hit;
 }
 
 function activeAudioVoices(

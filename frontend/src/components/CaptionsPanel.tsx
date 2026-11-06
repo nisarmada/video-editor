@@ -53,9 +53,11 @@ function findVideoClipById(
   clipId: string | null,
 ): TimelineClip | null {
   if (!clipId) return null;
-  const vt = timeline.tracks.find((t) => t.type === "video");
-  for (const c of vt?.clips ?? []) {
-    if (c.id === clipId) return c;
+  for (const tr of timeline.tracks) {
+    if (tr.type !== "video") continue;
+    for (const c of tr.clips ?? []) {
+      if (c.id === clipId) return c;
+    }
   }
   return null;
 }
