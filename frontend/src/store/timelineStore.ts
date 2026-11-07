@@ -12,10 +12,13 @@ import {
 import {
   PlannerAnalysisRequiredError,
   estimatePlanner,
+  fetchPlannerTakeReview,
   formatPlannerEstimate,
   formatPlannerUsage,
+  isPlannerPreflightResponse,
   readStringList,
   runPlanner as callPlanner,
+  type TakeReviewGroup,
 } from "../api/planner";
 import { listStyles, type StyleListItem } from "../api/styles";
 import {
@@ -262,12 +265,33 @@ type TimelineViewState = {
   plannerRunning: boolean;
   plannerError: string | null;
   /** Sub-step: gathering context vs waiting on Claude vs applying timeline. */
-  plannerPhase: "idle" | "context" | "planning" | "applying" | "saving";
+  plannerPhase: "idle" | "context" | "planning" | "applying" | "saving" | "review";
   plannerProgressMessage: string | null;
   /** Shown briefly after success (and in toast). */
   plannerSuccessSummary: string | null;
   /** Files left out of the last estimate or run because analysis is missing. */
   plannerUnanalyzed: string[];
+  /** Pre-flight take review groups (when plannerPhase is review). */
+  plannerTakeReviewGroups: TakeReviewGroup[] | null;
+  cancelPlannerTakeReview: () => void;
+  confirmPlannerTakeReview: (excludedTakeIds: string[]) => Promise<void>;
+  /** @internal Pending planner job while take review modal is open. */
+  _plannerPendingRun: {
+    brief: string;
+    stem: string;
+    clipFilter?: string[];
+    imitateId?: string;
+    primarySourceFile?: string | null;
+  } | null;
+  /** @internal Runs planner after take review (or direct path). */
+  _finishPlannerRun: (pending: {
+    brief: string;
+    stem: string;
+    clipFilter?: string[];
+    imitateId?: string;
+    primarySourceFile?: string | null;
+    excludedTakeIds?: string[];
+  }) => Promise<void>;
 
   /** Saved style profiles (plans/styles/*.json) for AI planner imitate. */
   styleProfiles: StyleListItem[];
@@ -305,6 +329,8 @@ type TimelineViewState = {
       clipNames?: string[];
       imitateStyleId?: string | null;
       mode?: "draft" | "full";
+      reviewTakesFirst?: boolean;
+      primarySourceFile?: string | null;
     },
   ) => Promise<void>;
   /** Save if dirty, then POST /api/render using plan file on disk. */
@@ -473,6 +499,158 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
   plannerProgressMessage: null,
   plannerSuccessSummary: null,
   plannerUnanalyzed: [],
+  plannerTakeReviewGroups: null,
+  cancelPlannerTakeReview: () =>
+    set({
+      plannerPhase: "idle",
+      plannerTakeReviewGroups: null,
+      plannerProgressMessage: null,
+      plannerRunning: false,
+    }),
+  confirmPlannerTakeReview: async (excludedTakeIds) => {
+    const groups = get().plannerTakeReviewGroups;
+    if (!groups) return;
+    const pending = get()._plannerPendingRun;
+    if (!pending) {
+      set({ plannerTakeReviewGroups: null, plannerPhase: "idle" });
+      return;
+    }
+    set({
+      plannerTakeReviewGroups: null,
+      plannerRunning: true,
+      plannerPhase: "planning",
+      plannerProgressMessage: "Running planner with your take choices…",
+      _plannerPendingRun: null,
+    });
+    try {
+      await get()._finishPlannerRun({
+        ...pending,
+        excludedTakeIds,
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Planner failed";
+      set({
+        plannerRunning: false,
+        plannerError: msg,
+        plannerPhase: "idle",
+        plannerProgressMessage: null,
+        uiBannerError: msg,
+      });
+    }
+  },
+  _plannerPendingRun: null as null | {
+    brief: string;
+    stem: string;
+    clipFilter?: string[];
+    imitateId?: string;
+    primarySourceFile?: string | null;
+  },
+  _finishPlannerRun: async (pending: {
+    brief: string;
+    stem: string;
+    clipFilter?: string[];
+    imitateId?: string;
+    primarySourceFile?: string | null;
+    excludedTakeIds?: string[];
+  }) => {
+    const { brief, stem, clipFilter, imitateId, primarySourceFile, excludedTakeIds } =
+      pending;
+    let result: Awaited<ReturnType<typeof callPlanner>>;
+    try {
+      result = await callPlanner({
+        brief,
+        save_as: stem,
+        mode: "draft",
+        review_takes_first: false,
+        ...(clipFilter?.length ? { clip_filenames: clipFilter } : {}),
+        ...(imitateId ? { imitate_style_id: imitateId } : {}),
+        ...(primarySourceFile ? { primary_source_file: primarySourceFile } : {}),
+        ...(excludedTakeIds?.length ? { excluded_take_ids: excludedTakeIds } : {}),
+      });
+    } catch (firstErr) {
+      if (firstErr instanceof PlannerAnalysisRequiredError) {
+        const need = firstErr.unanalyzed;
+        set({
+          plannerUnanalyzed: need,
+          plannerRunning: false,
+          plannerPhase: "idle",
+          plannerProgressMessage: null,
+          plannerError: need.length
+            ? `No analyzed files to plan with. Analyze now: ${need.join(", ")}`
+            : "No analyzed files to plan with.",
+        });
+        return;
+      }
+      throw firstErr;
+    }
+    if (isPlannerPreflightResponse(result)) {
+      throw new Error("Planner returned preflight instead of a plan.");
+    }
+    await get().refreshAvailablePlans();
+    const stemFromFile = normalizePlanStem(result.plan_name);
+    const merged = ensureCaptionStyle(result.timeline);
+
+    const activeStem = normalizePlanStem(get().currentPlanName);
+    if (activeStem && stemFromFile === activeStem && get().timeline) {
+      set({
+        plannerPhase: "applying",
+        plannerProgressMessage: "Applying plan to timeline…",
+      });
+      await get().applyOperation({
+        operation: "replace_timeline",
+        arguments: { timeline_data: merged as unknown as Record<string, unknown> },
+      });
+      set({ plannerPhase: "saving", plannerProgressMessage: "Saving plan file…" });
+      await savePlanToServer(stemFromFile, get().timeline!);
+      const doneTl = get().timeline!;
+      const sum = summarizePlannerTimeline(
+        doneTl,
+        result.cut_quality_warnings,
+        result.speech_edit_warnings,
+      );
+      const usageLine = formatPlannerUsage(result.usage);
+      const fromRun = readStringList(result.usage?.unanalyzed);
+      set({
+        plannerRunning: false,
+        plannerError: null,
+        plannerPhase: "idle",
+        plannerProgressMessage: null,
+        isDirty: false,
+        saveStatus: "saved",
+        saveError: null,
+        plannerSuccessSummary: usageLine ? `${sum} ${usageLine}` : sum,
+        plannerUnanalyzed: fromRun ?? get().plannerUnanalyzed,
+        selectedClipId: null,
+        selectedClipIds: [],
+      });
+      get().setShortcutToast(sum);
+      window.setTimeout(() => get().setShortcutToast(null), 6000);
+      return;
+    }
+
+    await get().loadPlan(stemFromFile, { skipDirtyConfirm: true });
+    const tl2 = get().timeline;
+    const sum2 = tl2 ? summarizePlannerTimeline(tl2) : "";
+    const usageLine2 = formatPlannerUsage(result.usage);
+    const fromRun2 = readStringList(result.usage?.unanalyzed);
+    set({
+      plannerRunning: false,
+      plannerError: null,
+      plannerPhase: "idle",
+      plannerProgressMessage: null,
+      plannerUnanalyzed: fromRun2 ?? get().plannerUnanalyzed,
+      ...(sum2
+        ? {
+            plannerSuccessSummary: usageLine2 ? `${sum2} ${usageLine2}` : sum2,
+          }
+        : {}),
+    });
+    if (tl2) {
+      const line = summarizePlannerTimeline(tl2);
+      get().setShortcutToast(line);
+      window.setTimeout(() => get().setShortcutToast(null), 6000);
+    }
+  },
   styleProfiles: [],
   styleProfilesLoading: false,
   styleProfilesError: null,
@@ -1625,96 +1803,41 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
         });
         return;
       }
+      const primarySourceFile = opts?.primarySourceFile?.trim() || undefined;
+      if (opts?.reviewTakesFirst) {
+        set({
+          plannerProgressMessage: "Loading take groups for review…",
+        });
+        const pf = await fetchPlannerTakeReview({
+          ...(clipFilter ? { clip_filenames: clipFilter } : {}),
+          ...(primarySourceFile ? { primary_source_file: primarySourceFile } : {}),
+        });
+        set({
+          plannerRunning: false,
+          plannerPhase: "review",
+          plannerProgressMessage: null,
+          plannerTakeReviewGroups: pf.take_groups,
+          _plannerPendingRun: {
+            brief: trimmed,
+            stem,
+            clipFilter,
+            imitateId,
+            primarySourceFile: primarySourceFile ?? null,
+          },
+        });
+        return;
+      }
       set({
         plannerPhase: "planning",
         plannerProgressMessage: `${line}. Sending to planner…`,
       });
-      let result: Awaited<ReturnType<typeof callPlanner>>;
-      try {
-        result = await callPlanner({
-          brief: trimmed,
-          save_as: stem,
-          mode: "draft",
-          ...(clipFilter ? { clip_filenames: clipFilter } : {}),
-          ...(imitateId ? { imitate_style_id: imitateId } : {}),
-        });
-      } catch (firstErr) {
-        if (firstErr instanceof PlannerAnalysisRequiredError) {
-          const need = firstErr.unanalyzed;
-          set({
-            plannerUnanalyzed: need,
-            plannerRunning: false,
-            plannerPhase: "idle",
-            plannerProgressMessage: null,
-            plannerError: need.length
-              ? `No analyzed files to plan with. Analyze now: ${need.join(", ")}`
-              : "No analyzed files to plan with.",
-          });
-          return;
-        }
-        throw firstErr;
-      }
-      await get().refreshAvailablePlans();
-      const stemFromFile = normalizePlanStem(result.plan_name);
-      const merged = ensureCaptionStyle(result.timeline);
-
-      const activeStem = normalizePlanStem(get().currentPlanName);
-      if (activeStem && stemFromFile === activeStem && get().timeline) {
-        set({ plannerPhase: "applying", plannerProgressMessage: "Applying plan to timeline…" });
-        await get().applyOperation({
-          operation: "replace_timeline",
-          arguments: { timeline_data: merged as unknown as Record<string, unknown> },
-        });
-        set({ plannerPhase: "saving", plannerProgressMessage: "Saving plan file…" });
-        await savePlanToServer(stemFromFile, get().timeline!);
-        const doneTl = get().timeline!;
-        const sum = summarizePlannerTimeline(
-          doneTl,
-          result.cut_quality_warnings,
-          result.speech_edit_warnings,
-        );
-        const usageLine = formatPlannerUsage(result.usage);
-        const fromRun = readStringList(result.usage?.unanalyzed);
-        set({
-          plannerRunning: false,
-          plannerError: null,
-          plannerPhase: "idle",
-          plannerProgressMessage: null,
-          isDirty: false,
-          saveStatus: "saved",
-          saveError: null,
-          plannerSuccessSummary: usageLine ? `${sum} ${usageLine}` : sum,
-          plannerUnanalyzed: fromRun ?? get().plannerUnanalyzed,
-          selectedClipId: null,
-          selectedClipIds: [],
-        });
-        get().setShortcutToast(sum);
-        window.setTimeout(() => get().setShortcutToast(null), 6000);
-        return;
-      }
-
-      await get().loadPlan(stemFromFile, { skipDirtyConfirm: true });
-      const tl2 = get().timeline;
-      const sum2 = tl2 ? summarizePlannerTimeline(tl2) : "";
-      const usageLine2 = formatPlannerUsage(result.usage);
-      const fromRun2 = readStringList(result.usage?.unanalyzed);
-      set({
-        plannerRunning: false,
-        plannerError: null,
-        plannerPhase: "idle",
-        plannerProgressMessage: null,
-        plannerUnanalyzed: fromRun2 ?? get().plannerUnanalyzed,
-        ...(sum2
-          ? {
-              plannerSuccessSummary: usageLine2 ? `${sum2} ${usageLine2}` : sum2,
-            }
-          : {}),
+      await get()._finishPlannerRun({
+        brief: trimmed,
+        stem,
+        clipFilter,
+        imitateId,
+        primarySourceFile: primarySourceFile ?? null,
       });
-      if (tl2) {
-        const line = summarizePlannerTimeline(tl2);
-        get().setShortcutToast(line);
-        window.setTimeout(() => get().setShortcutToast(null), 6000);
-      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Planner failed";
       set({

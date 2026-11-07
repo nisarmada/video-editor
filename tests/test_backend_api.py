@@ -211,7 +211,22 @@ def test_planner_full_mode_is_refused(client: TestClient, monkeypatch):
         json={"brief": "10s test", "save_as": "auto", "mode": "full"},
     )
     assert r.status_code == 400
-    assert "Draft" in r.text
+    assert "single_shot" in r.text or "agentic" in r.text
+
+
+def test_planner_agentic_mode(client: TestClient, monkeypatch):
+    tl = _minimal_v2()
+
+    def fake_agent(*_args, **_kwargs):
+        return tl, "agent-group", {"mode": "agentic", "tool_calls": 4}
+
+    monkeypatch.setattr("backend.main.run_agentic_plan", fake_agent)
+    r = client.post(
+        "/api/planner/run",
+        json={"brief": "voice reel", "save_as": "agent_plan", "mode": "agentic"},
+    )
+    assert r.status_code == 200
+    assert r.json()["group_id"] == "agent-group"
 
 
 def test_planner_estimate_does_not_call_the_model(client: TestClient, monkeypatch):

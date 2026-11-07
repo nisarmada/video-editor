@@ -9,6 +9,7 @@ import {
 import { analyzeStyle } from "../api/styles";
 import { useTimelineStore } from "../store/timelineStore";
 import { nextAutoPlanStem } from "../utils/planStem";
+import TakeReviewModal from "./TakeReviewModal";
 
 type FootageScope = "all" | "selected";
 type PlannerMode = "draft" | "full";
@@ -37,6 +38,9 @@ export default function AICommandBar() {
   const selectedFootageNames = useTimelineStore((s) => s.selectedFootageNames);
   const availablePlans = useTimelineStore((s) => s.availablePlans);
   const runPlannerJob = useTimelineStore((s) => s.runPlannerJob);
+  const plannerTakeReviewGroups = useTimelineStore((s) => s.plannerTakeReviewGroups);
+  const cancelPlannerTakeReview = useTimelineStore((s) => s.cancelPlannerTakeReview);
+  const confirmPlannerTakeReview = useTimelineStore((s) => s.confirmPlannerTakeReview);
   const styleProfiles = useTimelineStore((s) => s.styleProfiles);
   const refreshStyleProfiles = useTimelineStore((s) => s.refreshStyleProfiles);
 
@@ -45,6 +49,7 @@ export default function AICommandBar() {
   const [saveAs, setSaveAs] = useState(() => nextAutoPlanStem([]));
   const [footageScope, setFootageScope] = useState<FootageScope>("all");
   const [plannerMode, setPlannerMode] = useState<PlannerMode>("draft");
+  const [reviewTakesFirst, setReviewTakesFirst] = useState(false);
   const [analyzeNote, setAnalyzeNote] = useState<string | null>(null);
   const [barCollapsed, setBarCollapsed] = useState(() => {
     if (typeof window === "undefined") return false;
@@ -282,6 +287,15 @@ export default function AICommandBar() {
                 </button>
               </div>
             </div>
+            <label className="ai-command-bar__review-takes">
+              <input
+                type="checkbox"
+                checked={reviewTakesFirst}
+                disabled={plannerRunning}
+                onChange={(e) => setReviewTakesFirst(e.target.checked)}
+              />
+              <span>Review takes before planning</span>
+            </label>
             <div className="ai-command-bar__scope" role="group" aria-label="Planner mode">
               <span className="ai-command-bar__label">Mode</span>
               <div className="ai-command-bar__segment">
@@ -377,6 +391,7 @@ export default function AICommandBar() {
                       : undefined,
                   imitateStyleId: imitateStyleId || null,
                   mode: plannerMode,
+                  reviewTakesFirst,
                 })
               }
             >
@@ -453,6 +468,13 @@ export default function AICommandBar() {
           </div>
         )}
       </div>
+      {plannerTakeReviewGroups && (
+        <TakeReviewModal
+          groups={plannerTakeReviewGroups}
+          onCancel={() => cancelPlannerTakeReview()}
+          onConfirm={(excluded) => void confirmPlannerTakeReview(excluded)}
+        />
+      )}
     </section>
   );
 }

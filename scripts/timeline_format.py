@@ -181,6 +181,8 @@ def v2_timeline_duration(data: dict) -> float:
     for track in data.get("tracks") or []:
         ttype = track.get("type", "video")
         for clip in track.get("clips") or []:
+            if "timeline_start" not in clip:
+                continue
             start = float(clip["timeline_start"])
             dur = clip_timeline_duration(clip, ttype)
             end = max(end, start + dur)
@@ -377,9 +379,13 @@ def validate_v2_data(
             audio_index.append(c)
 
     try:
-        from speech_layout import validate_timeline_speech_layout
+        from speech_layout import (
+            validate_primary_video_packing,
+            validate_timeline_speech_layout,
+        )
 
         errors.extend(validate_timeline_speech_layout(data))
+        errors.extend(validate_primary_video_packing(data))
     except ImportError:
         pass
 

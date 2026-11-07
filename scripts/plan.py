@@ -432,6 +432,12 @@ def finalize_v2_direct(plan: dict, brief: str, run_group_id: str) -> dict:
 def validate_plan_parsed(plan: dict, brief: str, target: float | None) -> list[str]:
     """Unified validation errors for fix-pass."""
     if is_v2(plan):
+        # Speech EDL clips omit timeline_start until layout is built (same as finalize).
+        detect_and_normalize_edl(plan)
+        acfg = load_settings(Path.cwd())
+        if acfg.get("enabled", True):
+            plan, _report = refine_timeline_audio_cuts(plan, settings=acfg)
+        build_speech_layout(plan)
         errs, _ = validate_plan_data(plan, target)
         return errs
     return validate_segments(plan.get("segments") or [], target)
@@ -568,10 +574,38 @@ def _parse_or_retry_plan(
             ) from retry_error
 
 
+def _excluded_takes_prompt(excluded_take_ids: list[str] | None) -> str:
+    if not excluded_take_ids:
+        return ""
+    from planner_preflight import excluded_time_ranges
+
+    ranges = excluded_time_ranges(Path.cwd(), excluded_take_ids)
+    if not ranges:
+        return ""
+    lines = [
+        "## User-discarded take attempts (never use these source time ranges)",
+    ]
+    for name in sorted(ranges.keys()):
+        for t0, t1 in ranges[name]:
+            lines.append(f"- footage/{name}: {t0:.2f}s–{t1:.2f}s")
+    return "\n".join(lines)
+
+
+def resolve_planner_clip_scope(
+    clip_filenames: list[str] | None,
+    primary_source_file: str | None,
+) -> list[str] | None:
+    """When primary_source_file is set, catalog and agent are restricted to that basename."""
+    if primary_source_file and str(primary_source_file).strip():
+        return [Path(primary_source_file.strip()).name]
+    return clip_filenames
+
+
 def prepare_planner_context(
     brief: str,
     *,
     clip_filenames: list[str] | None = None,
+    primary_source_file: str | None = None,
     imitate_style_id: str | None = None,
     root: Path | None = None,
 ) -> dict:
@@ -585,11 +619,12 @@ def prepare_planner_context(
     if imitate_style_id:
         imitate_profile = load_style_profile(project, imitate_style_id)
     system_prompt = build_system_prompt(imitate_profile=imitate_profile)
-    scope = "selected" if clip_filenames else "all"
+    effective_clips = resolve_planner_clip_scope(clip_filenames, primary_source_file)
+    scope = "selected" if effective_clips else "all"
     catalog, cat_warnings = build_media_catalog(
         project,
         scope=scope,
-        only_basenames=clip_filenames,
+        only_basenames=effective_clips,
     )
     if not catalog:
         raise RuntimeError(
@@ -665,6 +700,8 @@ def generate_plan(
     *,
     api_key: str | None = None,
     clip_filenames: list[str] | None = None,
+    primary_source_file: str | None = None,
+    excluded_take_ids: list[str] | None = None,
     imitate_style_id: str | None = None,
     require_merged_index: bool = True,
     mode: str = "draft",
@@ -683,9 +720,14 @@ def generate_plan(
             "Full mode is not available yet. Use Draft. The agent loop is a later step."
         )
 
+    brief_for_model = brief
+    excluded_block = _excluded_takes_prompt(excluded_take_ids)
+    if excluded_block:
+        brief_for_model = f"{brief.rstrip()}\n\n{excluded_block}"
     ctx = prepare_planner_context(
-        brief,
+        brief_for_model,
         clip_filenames=clip_filenames,
+        primary_source_file=primary_source_file,
         imitate_style_id=imitate_style_id,
     )
     if not ctx["rows"]:

@@ -11,6 +11,25 @@ export class PlannerAnalysisRequiredError extends Error {
   }
 }
 
+export type TakeReviewAttempt = {
+  id: string;
+  source_file: string;
+  take_index: number;
+  text: string;
+  start?: number;
+  end?: number;
+  is_restart?: boolean;
+  abandoned_sentence?: boolean;
+  default_keep: boolean;
+};
+
+export type TakeReviewGroup = {
+  id: string;
+  source_file: string;
+  phrase_label: string;
+  attempts: TakeReviewAttempt[];
+};
+
 export type RunPlannerRequest = {
   brief: string;
   /** Plan filename without path, e.g. draft1 — backend writes plans/{save_as}.json */
@@ -22,8 +41,34 @@ export type RunPlannerRequest = {
   /** Allow planner to run with incomplete merged indexes (not recommended). */
   allow_without_merged_index?: boolean;
   /** draft = one compact call. full is refused until a later step. */
-  mode?: "draft" | "full";
+  mode?: "draft" | "full" | "agentic";
+  primary_source_file?: string | null;
+  /** When true without excluded_take_ids, API returns preflight take groups only. */
+  review_takes_first?: boolean;
+  /** Take attempt ids discarded in pre-flight review (e.g. voice.m4a:2). */
+  excluded_take_ids?: string[];
 };
+
+export type PlannerPreflightResponse = {
+  take_groups: TakeReviewGroup[];
+  group_count: number;
+};
+
+export type RunPlannerPreflightOnlyResponse = {
+  preflight: true;
+  take_groups: TakeReviewGroup[];
+  group_count: number;
+};
+
+export function isPlannerPreflightResponse(
+  body: unknown,
+): body is RunPlannerPreflightOnlyResponse {
+  return (
+    body !== null &&
+    typeof body === "object" &&
+    (body as RunPlannerPreflightOnlyResponse).preflight === true
+  );
+}
 
 export type PlannerEstimate = {
   file_count: number;
@@ -122,7 +167,27 @@ export type RunPlannerResponse = {
 /**
  * POST /api/planner/run — synchronous; blocks until Claude + validation + write completes.
  */
-export async function runPlanner(body: RunPlannerRequest): Promise<RunPlannerResponse> {
+export async function fetchPlannerTakeReview(body: {
+  clip_filenames?: string[];
+  primary_source_file?: string | null;
+}): Promise<PlannerPreflightResponse> {
+  const res = await fetch("/api/planner/preflight-takes", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(
+      parseFastApiErrorBody(text) || `Take review failed (${res.status})`,
+    );
+  }
+  return JSON.parse(text) as PlannerPreflightResponse;
+}
+
+export async function runPlanner(
+  body: RunPlannerRequest,
+): Promise<RunPlannerResponse | RunPlannerPreflightOnlyResponse> {
   const res = await fetch("/api/planner/run", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -155,7 +220,11 @@ export async function runPlanner(body: RunPlannerRequest): Promise<RunPlannerRes
       parseFastApiErrorBody(text) || `Planner failed (${res.status})`,
     );
   }
-  return JSON.parse(text) as RunPlannerResponse;
+  const parsed = JSON.parse(text) as RunPlannerResponse | RunPlannerPreflightOnlyResponse;
+  if (isPlannerPreflightResponse(parsed)) {
+    return parsed;
+  }
+  return parsed as RunPlannerResponse;
 }
 
 /** POST /api/planner/estimate — local catalog math, no model call. */

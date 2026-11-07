@@ -19,7 +19,7 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -73,7 +73,9 @@ from backend.storage_cache import (  # noqa: E402
     storage_stats,
 )
 from analyze_style import analyze_reference_video  # noqa: E402
+from agent_planner import run_agentic_plan  # noqa: E402
 from plan import generate_plan, prepare_planner_context  # noqa: E402
+from planner_preflight import build_take_review_groups  # noqa: E402
 from proxy_media import (  # noqa: E402
     ensure_proxy,
     ensure_thumbnail,
@@ -136,6 +138,13 @@ class PlannerRequest(BaseModel):
     save_as: str = Field(description="Plan filename without path, e.g. draft1")
     # If set, only these footage basenames are considered. Unanalyzed files are still omitted.
     clip_filenames: list[str] | None = None
+    primary_source_file: str | None = Field(
+        default=None,
+        description=(
+            "Optional footage basename or path. Restricts catalog and agent speech "
+            "to this file (single-source edit: prune false starts on one stream)."
+        ),
+    )
     allow_without_merged_index: bool = Field(
         default=False,
         description="Kept for older clients. Unanalyzed files are never sent.",
@@ -146,13 +155,34 @@ class PlannerRequest(BaseModel):
     )
     mode: str = Field(
         default="draft",
-        description="draft = one compact call. full is not available yet.",
+        description="single_shot|draft = one model call. agentic = tool loop. full is not available.",
     )
+    stream: bool = Field(
+        default=False,
+        description="When true and mode is agentic, response is text/event-stream progress.",
+    )
+    review_takes_first: bool = Field(
+        default=False,
+        description=(
+            "When true and excluded_take_ids is omitted, returns take review groups "
+            "instead of running the planner. Re-run with excluded_take_ids after review."
+        ),
+    )
+    excluded_take_ids: list[str] | None = Field(
+        default=None,
+        description="Take attempt ids to exclude (file.m4a:3), from pre-flight review.",
+    )
+
+
+class PlannerPreflightRequest(BaseModel):
+    clip_filenames: list[str] | None = None
+    primary_source_file: str | None = None
 
 
 class PlannerEstimateRequest(BaseModel):
     brief: str
     clip_filenames: list[str] | None = None
+    primary_source_file: str | None = None
     imitate_style_id: str | None = None
 
 
@@ -743,6 +773,21 @@ def _unanalyzed_names_from_message(msg: str) -> list[str]:
     ]
 
 
+@app.post("/api/planner/preflight-takes")
+def planner_preflight_takes(
+    body: PlannerPreflightRequest,
+    paths: ProjectPaths = Depends(get_paths),
+) -> dict[str, Any]:
+    """Grouped sentence attempts for optional take review before planning."""
+    with project_cwd(paths):
+        groups = build_take_review_groups(
+            paths.root,
+            clip_filenames=body.clip_filenames,
+            primary_source_file=body.primary_source_file,
+        )
+    return {"take_groups": groups, "group_count": len(groups)}
+
+
 @app.post("/api/planner/estimate")
 def estimate_planner(
     body: PlannerEstimateRequest,
@@ -754,6 +799,7 @@ def estimate_planner(
             ctx = prepare_planner_context(
                 body.brief,
                 clip_filenames=body.clip_filenames,
+                primary_source_file=body.primary_source_file,
                 imitate_style_id=body.imitate_style_id,
             )
         except RuntimeError as e:
@@ -1159,31 +1205,145 @@ async def analyze_style(
     }
 
 
+def _normalize_planner_mode(mode: str | None) -> str:
+    m = (mode or "draft").strip().lower()
+    if m in ("draft", "single_shot"):
+        return "single_shot"
+    if m == "agentic":
+        return "agentic"
+    return m
+
+
+def _planner_run_payload(
+    paths: ProjectPaths,
+    plan_v2: dict,
+    group_id: str,
+    usage: dict,
+    *,
+    save_as: str,
+) -> dict[str, Any]:
+    path = paths.plan_file(save_as)
+    if not path.is_file():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(plan_v2, indent=2, ensure_ascii=False) + "\n")
+    log_event("info", f"Planner wrote {path.name}")
+    with project_cwd(paths):
+        from audio_cut_refine import check_word_clipped_at_cuts
+        from speech_edit_quality import assemble_readback, mechanical_speech_warnings
+
+        cut_warnings = check_word_clipped_at_cuts(plan_v2, root=paths.root)
+        speech_warnings = mechanical_speech_warnings(plan_v2, root=paths.root)
+        readback_blocks = assemble_readback(plan_v2, root=paths.root)
+    return {
+        "plan_name": path.name,
+        "group_id": group_id,
+        "usage": usage,
+        "timeline": plan_v2,
+        "cut_quality_warnings": cut_warnings,
+        "speech_edit_warnings": speech_warnings,
+        "speech_readback_preview": readback_blocks,
+    }
+
+
 @app.post("/api/planner/run")
 def run_planner(
     body: PlannerRequest,
     paths: ProjectPaths = Depends(get_paths),
-) -> dict[str, Any]:
-    mode = (body.mode or "draft").strip().lower()
-    if mode != "draft":
+):
+    if body.review_takes_first and not body.excluded_take_ids:
+        with project_cwd(paths):
+            groups = build_take_review_groups(
+                paths.root,
+                clip_filenames=body.clip_filenames,
+                primary_source_file=body.primary_source_file,
+            )
+        return {
+            "preflight": True,
+            "take_groups": groups,
+            "group_count": len(groups),
+        }
+
+    mode = _normalize_planner_mode(body.mode)
+    if mode == "full":
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Full mode is not available yet. Use Draft. "
-                "The agent loop is a later step."
-            ),
+            detail="Full mode is not available yet. Use single_shot or agentic.",
         )
+    if mode not in ("single_shot", "agentic"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown planner mode: {body.mode!r}",
+        )
+
     api_key = effective_planner_api_key(paths.root)
+    progress_log: list[str] = []
+
+    def on_progress(message: str) -> None:
+        progress_log.append(message)
+        log_event("info", f"agent: {message}", source="planner")
+
+    if mode == "agentic" and body.stream:
+
+        def sse_stream():
+            plan_v2: dict | None = None
+            group_id = ""
+            usage: dict = {}
+            err: str | None = None
+            try:
+                with project_cwd(paths):
+                    plan_v2, group_id, usage = run_agentic_plan(
+                        body.brief,
+                        save_as=body.save_as,
+                        root=paths.root,
+                        clip_filenames=body.clip_filenames,
+                        primary_source_file=body.primary_source_file,
+                        excluded_take_ids=body.excluded_take_ids,
+                        api_key=api_key,
+                        on_progress=on_progress,
+                    )
+            except (FileNotFoundError, RuntimeError, ValueError) as e:
+                err = str(e)
+                if isinstance(e, ValueError) and e.args and isinstance(e.args[0], list):
+                    err = str(e.args[0])
+            except Exception as e:  # noqa: BLE001
+                err = str(e)
+            for msg in progress_log:
+                yield f"data: {json.dumps({'event': 'progress', 'message': msg})}\n\n"
+            if err:
+                yield f"data: {json.dumps({'event': 'error', 'message': err})}\n\n"
+                return
+            payload = _planner_run_payload(
+                paths, plan_v2 or {}, group_id, usage, save_as=body.save_as
+            )
+            yield f"data: {json.dumps({'event': 'done', **payload}, default=str)}\n\n"
+
+        return StreamingResponse(sse_stream(), media_type="text/event-stream")
+
     with project_cwd(paths):
         try:
-            plan_v2, group_id, usage = generate_plan(
-                body.brief,
-                api_key=api_key,
-                clip_filenames=body.clip_filenames,
-                imitate_style_id=body.imitate_style_id,
-                require_merged_index=False,
-                mode=mode,
-            )
+            if mode == "agentic":
+                plan_v2, group_id, usage = run_agentic_plan(
+                    body.brief,
+                    save_as=body.save_as,
+                    root=paths.root,
+                    clip_filenames=body.clip_filenames,
+                    primary_source_file=body.primary_source_file,
+                    excluded_take_ids=body.excluded_take_ids,
+                    api_key=api_key,
+                    on_progress=on_progress,
+                )
+            else:
+                plan_v2, group_id, usage = generate_plan(
+                    body.brief,
+                    api_key=api_key,
+                    clip_filenames=body.clip_filenames,
+                    primary_source_file=body.primary_source_file,
+                    excluded_take_ids=body.excluded_take_ids,
+                    imitate_style_id=body.imitate_style_id,
+                    require_merged_index=False,
+                    mode="draft",
+                )
+                usage = {**usage, "mode": "single_shot"}
         except FileNotFoundError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
         except RuntimeError as e:
@@ -1204,26 +1364,14 @@ def run_planner(
             detail = e.args[0] if e.args and isinstance(e.args[0], list) else str(e)
             raise HTTPException(status_code=400, detail=detail)
 
-    path = paths.plan_file(body.save_as)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(plan_v2, indent=2, ensure_ascii=False) + "\n")
-    log_event("info", f"Planner wrote {path.name}")
-    with project_cwd(paths):
-        from audio_cut_refine import check_word_clipped_at_cuts
-        from speech_edit_quality import assemble_readback, mechanical_speech_warnings
+    if mode == "single_shot":
+        path = paths.plan_file(body.save_as)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(plan_v2, indent=2, ensure_ascii=False) + "\n")
 
-        cut_warnings = check_word_clipped_at_cuts(plan_v2, root=paths.root)
-        speech_warnings = mechanical_speech_warnings(plan_v2, root=paths.root)
-        readback_blocks = assemble_readback(plan_v2, root=paths.root)
-    return {
-        "plan_name": path.name,
-        "group_id": group_id,
-        "usage": usage,
-        "timeline": plan_v2,
-        "cut_quality_warnings": cut_warnings,
-        "speech_edit_warnings": speech_warnings,
-        "speech_readback_preview": readback_blocks,
-    }
+    return _planner_run_payload(
+        paths, plan_v2, group_id, usage, save_as=body.save_as
+    )
 
 
 @app.post("/api/planner/speech-readback")
