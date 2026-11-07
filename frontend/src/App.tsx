@@ -8,6 +8,8 @@ import MediaBin from "./components/MediaBin";
 import OutputManagerPanel from "./components/OutputManagerPanel";
 import SettingsPanel from "./components/SettingsPanel";
 import SourcePreview from "./components/SourcePreview";
+import CanvasControls from "./components/CanvasControls";
+import ExportDialog from "./components/ExportDialog";
 import TimelineVideoPreview from "./components/TimelineVideoPreview";
 import TimelinePanel from "./components/TimelinePanel";
 import EditorPanelErrorBoundary from "./components/EditorPanelErrorBoundary";
@@ -35,7 +37,7 @@ export default function App() {
   const saveStatus = useTimelineStore((s) => s.saveStatus);
   const saveError = useTimelineStore((s) => s.saveError);
   const savePlan = useTimelineStore((s) => s.savePlan);
-  const exportPlan = useTimelineStore((s) => s.exportPlan);
+  const [exportOpen, setExportOpen] = useState(false);
   const renderStatus = useTimelineStore((s) => s.renderStatus);
   const renderError = useTimelineStore((s) => s.renderError);
   const outputDownloadUrl = useTimelineStore((s) => s.outputDownloadUrl);
@@ -198,10 +200,11 @@ export default function App() {
             className="btn btn--export"
             disabled={!canExport}
             title={exportTitle}
-            onClick={() => void exportPlan()}
+            onClick={() => setExportOpen(true)}
           >
             Export
           </button>
+          <ExportDialog open={exportOpen} onClose={() => setExportOpen(false)} />
           <span className="top-bar__render">
             {rendering ? "Export running…" : null}
             {!rendering &&
@@ -318,6 +321,7 @@ export default function App() {
                   Source
                 </button>
               </div>
+              {previewPanelMode === "timeline" ? <CanvasControls /> : null}
             </div>
             <div className="panel__body panel__body--preview">
               <EditorPanelErrorBoundary name="Player">

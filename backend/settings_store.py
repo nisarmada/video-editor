@@ -72,6 +72,9 @@ def get_public_settings(root: Path) -> dict[str, Any]:
         "render_defaults": {
             "captions": bool(render_defaults.get("captions", False)),
             "max_length": render_defaults.get("max_length"),
+            "video_crf": int(render_defaults.get("video_crf", 23))
+            if render_defaults.get("video_crf") is not None
+            else 23,
         },
         "user_caption_styles": user_presets,
         "keybindings": keybindings,
@@ -112,6 +115,13 @@ def merge_settings(root: Path, body: dict[str, Any]) -> dict[str, Any]:
             raw["render_defaults"]["max_length"] = (
                 float(ml) if ml is not None else None
             )
+        if "video_crf" in rd and rd["video_crf"] is not None:
+            try:
+                raw["render_defaults"]["video_crf"] = max(
+                    0, min(int(rd["video_crf"]), 51)
+                )
+            except (TypeError, ValueError):
+                pass
     if "user_caption_styles" in body and isinstance(body["user_caption_styles"], list):
         raw["user_caption_styles"] = body["user_caption_styles"]
     if "keybindings" in body:
@@ -159,7 +169,13 @@ def effective_render_defaults(root: Path) -> dict[str, Any]:
     raw = load_raw(root)
     rd = raw.get("render_defaults") if isinstance(raw.get("render_defaults"), dict) else {}
     ml = rd.get("max_length")
+    crf_raw = rd.get("video_crf", 23)
+    try:
+        crf = max(0, min(int(crf_raw), 51))
+    except (TypeError, ValueError):
+        crf = 23
     return {
         "captions": bool(rd.get("captions", False)),
         "max_length": float(ml) if isinstance(ml, (int, float)) else None,
+        "video_crf": crf,
     }

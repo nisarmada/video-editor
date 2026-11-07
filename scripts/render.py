@@ -154,12 +154,20 @@ def main() -> None:
     )
     timeline_total = v2_timeline_duration(plan_data) if is_v2(plan_data) else None
 
+    from canvas_settings import resolve_canvas
+
+    settings_raw = (
+        plan_data.get("settings") if isinstance(plan_data.get("settings"), dict) else {}
+    )
+    canvas = resolve_canvas(settings_raw)
+
     try:
         render_timeline(
             pieces,
             render_target,
             audio_branches=audio_branches,
             timeline_total=timeline_total,
+            canvas=canvas,
         )
     except RuntimeError as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -175,13 +183,11 @@ def main() -> None:
         segs = load_segments(plan_path)
         words = remap_words(segs, plan_data=pdata)
         events = caption_events(words, plan_data=pdata)
-        tw = th = None
-        if isinstance(pdata, dict) and isinstance(pdata.get("settings"), dict):
-            s = pdata["settings"]
-            tw = s.get("width")
-            th = s.get("height")
-        vw = int(tw) if isinstance(tw, (int, float)) else 1080
-        vh = int(th) if isinstance(th, (int, float)) else 1920
+        from canvas_settings import resolve_canvas
+
+        s = pdata.get("settings") if isinstance(pdata.get("settings"), dict) else {}
+        cap = resolve_canvas(s)
+        vw, vh = cap.width, cap.height
         if not ass_path.is_file():
             print(f"Generating captions -> {ass_path}")
             ass_path.write_text(

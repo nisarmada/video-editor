@@ -596,6 +596,44 @@ export default function ClipDetails() {
           </div>
         </>
       )}
+      {isVideoTrack && clip ? (
+        <>
+          <div className="props-row">
+            <label>canvas fit</label>
+            <select
+              value={clip.canvas_fit ?? ""}
+              disabled={applyInProgress}
+              onChange={(e) => {
+                const v = e.target.value;
+                void applyProps({
+                  canvas_fit: v === "" ? null : v,
+                });
+              }}
+            >
+              <option value="">Project default</option>
+              <option value="contain">Contain</option>
+              <option value="cover">Cover</option>
+            </select>
+          </div>
+          <div className="props-row">
+            <label>letterbox</label>
+            <select
+              value={clip.canvas_bar_fill ?? ""}
+              disabled={applyInProgress}
+              onChange={(e) => {
+                const v = e.target.value;
+                void applyProps({
+                  canvas_bar_fill: v === "" ? null : v,
+                });
+              }}
+            >
+              <option value="">Project default</option>
+              <option value="black">Black bars</option>
+              <option value="blur">Blur bars</option>
+            </select>
+          </div>
+        </>
+      ) : null}
       <div className="props-row">
         <label>zoom</label>
         {isVideoTrack ? (

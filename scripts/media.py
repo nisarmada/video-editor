@@ -16,6 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from canvas_settings import CanvasSettings, piece_fit_settings, resolve_canvas  # noqa: E402
 from edit_vocab import (  # noqa: E402
     AUDIO_FADE_SECONDS,
     append_audio_afade_filters,
@@ -47,6 +48,10 @@ class TimelinePiece:
     transition_out: dict | None = None
     # When True, embedded video segment uses silence (detached audio or muted track).
     embed_audio_silent: bool = False
+    canvas_fit: str | None = None
+    canvas_bar_fill: str | None = None
+    canvas_fit_x: float | None = None
+    canvas_fit_y: float | None = None
 
     def is_gap(self) -> bool:
         return self.path is None
@@ -151,14 +156,46 @@ def rotation_filter(degrees: int | None) -> str:
     return ""
 
 
-def normalize_video_chain(rotation: int | None, label_in: str, label_out: str) -> str:
-    rot = rotation_filter(rotation)
+def _fit_to_frame_filters(
+    canvas: CanvasSettings,
+    *,
+    fit: str,
+    bar_fill: str,
+    pos_x: float,
+    pos_y: float,
+) -> str:
+    w, h, fps = canvas.width, canvas.height, canvas.fps
+    if fit == "cover":
+        return (
+            f"scale={w}:{h}:force_original_aspect_ratio=increase,"
+            f"crop={w}:{h}:(iw-{w})*{pos_x:.4f}:(ih-{h})*{pos_y:.4f},"
+            f"setsar=1,fps={fps},format=yuv420p"
+        )
+    if bar_fill == "blur":
+        return (
+            f"split=2[fg][bg];[bg]scale={w}:{h}:force_original_aspect_ratio=increase,"
+            f"crop={w}:{h},gblur=sigma=20[bl];[fg]scale={w}:{h}:force_original_aspect_ratio=decrease[sm];"
+            f"[bl][sm]overlay=(W-w)/2:(H-h)/2,setsar=1,fps={fps},format=yuv420p"
+        )
     return (
-        f"{label_in}{rot}"
-        f"scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=decrease,"
-        f"pad={TARGET_W}:{TARGET_H}:(ow-iw)/2:(oh-ih)/2:black,"
-        f"setsar=1,fps={FPS},format=yuv420p{label_out}"
+        f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black,"
+        f"setsar=1,fps={fps},format=yuv420p"
     )
+
+
+def normalize_video_chain(
+    rotation: int | None,
+    label_in: str,
+    label_out: str,
+    canvas: CanvasSettings | None = None,
+) -> str:
+    c = canvas or resolve_canvas(None)
+    rot = rotation_filter(rotation)
+    fit_f = _fit_to_frame_filters(
+        c, fit=c.fit, bar_fill=c.bar_fill, pos_x=c.fit_position_x, pos_y=c.fit_position_y
+    )
+    return f"{label_in}{rot}{fit_f}{label_out}"
 
 
 def run_ffmpeg(cmd: list[str]) -> None:
@@ -375,20 +412,37 @@ def _volume_filter_expr(volume: float) -> str:
     return f"volume={v:.8f}"
 
 
-def _zoom_punch_filter(zoom: float) -> str:
+def _zoom_punch_filter(zoom: float, canvas: CanvasSettings) -> str:
     """
-    After 1080x1920 normalize: crop centered (1/zoom) fraction, scale back to frame.
+    After frame normalize: crop centered (1/zoom) fraction, scale back to frame.
     zoom 1.0 = no-op; zoom > 1 punch in.
     """
     z = float(zoom)
     if z <= 1.001:
         return ""
-    # iw/ih are normalized frame dimensions (TARGET_W x TARGET_H)
+    w, h = canvas.width, canvas.height
     return (
         f"crop=w=iw/{z}:h=ih/{z}:x=(iw-iw/{z})/2:y=(ih-ih/{z})/2,"
-        f"scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=decrease,"
-        f"pad={TARGET_W}:{TARGET_H}:(ow-iw)/2:(oh-ih)/2:black"
+        f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black"
     )
+
+
+def _video_after_trim_chain(
+    canvas: CanvasSettings,
+    piece: TimelinePiece,
+    rotation: int | None,
+) -> str:
+    """Rotation + fit-to-canvas (per-clip fit overrides project default)."""
+    fit, bar, px, py = piece_fit_settings(
+        piece.canvas_fit,
+        piece.canvas_bar_fill,
+        piece.canvas_fit_x,
+        piece.canvas_fit_y,
+        canvas,
+    )
+    rot = rotation_filter(rotation)
+    return rot + _fit_to_frame_filters(canvas, fit=fit, bar_fill=bar, pos_x=px, pos_y=py)
 
 
 def _timeline_overlap_br(a: AudioBranch, b: AudioBranch) -> bool:
@@ -449,6 +503,7 @@ def _apply_video_transitions(
 
 def _legacy_build_timeline_filter_graph(
     pieces: list[TimelinePiece],
+    canvas: CanvasSettings,
 ) -> tuple[str, list[str]]:
     """
     Original single-bus audio: concat segment audio at 44.1 kHz (bit-compatible
@@ -462,6 +517,7 @@ def _legacy_build_timeline_filter_graph(
     path_to_index: dict[Path, int] = {}
     meta_cache: dict[Path, tuple[float, bool, int | None]] = {}
     next_input = 0
+    W, H, FPS_OUT = canvas.width, canvas.height, canvas.fps
 
     n = len(pieces)
     for i, piece in enumerate(pieces):
@@ -473,7 +529,7 @@ def _legacy_build_timeline_filter_graph(
                     "-f",
                     "lavfi",
                     "-i",
-                    f"color=c=black:s={TARGET_W}x{TARGET_H}:r={FPS}:d={seg_out:.6f}",
+                    f"color=c=black:s={W}x{H}:r={FPS_OUT}:d={seg_out:.6f}",
                 ]
             )
             v_in = next_input
@@ -490,9 +546,9 @@ def _legacy_build_timeline_filter_graph(
             a_in = next_input
             next_input += 1
             parts.append(
-                f"[{v_in}:v]scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=decrease,"
-                f"pad={TARGET_W}:{TARGET_H}:(ow-iw)/2:(oh-ih)/2:black,"
-                f"setsar=1,fps={FPS},format=yuv420p[v{i}]"
+                f"[{v_in}:v]scale={W}:{H}:force_original_aspect_ratio=decrease,"
+                f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:black,"
+                f"setsar=1,fps={FPS_OUT},format=yuv420p[v{i}]"
             )
             vlabels.append(f"[v{i}]")
 
@@ -523,18 +579,15 @@ def _legacy_build_timeline_filter_graph(
         speed = piece.effective_speed()
         sp = f"{speed:.8f}".rstrip("0").rstrip(".") if speed != 1.0 else "1"
 
-        rot = rotation_filter(rotation)
         v_after_norm = f"vn{i}"
+        fit_tail = _video_after_trim_chain(canvas, piece, rotation)
         base_chain = (
             f"[{idx}:v]trim=start={start:.6f}:end={end:.6f},setpts=PTS-STARTPTS,"
-            f"{rot}"
-            f"scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=decrease,"
-            f"pad={TARGET_W}:{TARGET_H}:(ow-iw)/2:(oh-ih)/2:black,"
-            f"setsar=1,fps={FPS},format=yuv420p[{v_after_norm}]"
+            f"{fit_tail}[{v_after_norm}]"
         )
         parts.append(base_chain)
 
-        zoom_chain = _zoom_punch_filter(piece.zoom or 1.0)
+        zoom_chain = _zoom_punch_filter(piece.zoom or 1.0, canvas)
         if zoom_chain:
             v_pre_speed = f"vz{i}"
             parts.append(f"[{v_after_norm}]{zoom_chain}[{v_pre_speed}]")
@@ -594,6 +647,7 @@ def _mixed_build_timeline_filter_graph(
     pieces: list[TimelinePiece],
     audio_branches: list[AudioBranch],
     timeline_total: float,
+    canvas: CanvasSettings,
 ) -> tuple[str, list[str]]:
     """Embedded bus (48 kHz) + timed audio-track branches, amix, limiter."""
     parts: list[str] = []
@@ -605,6 +659,7 @@ def _mixed_build_timeline_filter_graph(
     meta_cache: dict[Path, tuple[float, bool, int | None]] = {}
     next_input = 0
     sr = EXPORT_AUDIO_RATE
+    W, H, FPS_OUT = canvas.width, canvas.height, canvas.fps
 
     n = len(pieces)
     for i, piece in enumerate(pieces):
@@ -616,7 +671,7 @@ def _mixed_build_timeline_filter_graph(
                     "-f",
                     "lavfi",
                     "-i",
-                    f"color=c=black:s={TARGET_W}x{TARGET_H}:r={FPS}:d={seg_out:.6f}",
+                    f"color=c=black:s={W}x{H}:r={FPS_OUT}:d={seg_out:.6f}",
                 ]
             )
             v_in = next_input
@@ -633,9 +688,9 @@ def _mixed_build_timeline_filter_graph(
             a_in = next_input
             next_input += 1
             parts.append(
-                f"[{v_in}:v]scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=decrease,"
-                f"pad={TARGET_W}:{TARGET_H}:(ow-iw)/2:(oh-ih)/2:black,"
-                f"setsar=1,fps={FPS},format=yuv420p[v{i}]"
+                f"[{v_in}:v]scale={W}:{H}:force_original_aspect_ratio=decrease,"
+                f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:black,"
+                f"setsar=1,fps={FPS_OUT},format=yuv420p[v{i}]"
             )
             vlabels.append(f"[v{i}]")
 
@@ -668,18 +723,15 @@ def _mixed_build_timeline_filter_graph(
         speed = piece.effective_speed()
         sp = f"{speed:.8f}".rstrip("0").rstrip(".") if speed != 1.0 else "1"
 
-        rot = rotation_filter(rotation)
         v_after_norm = f"vn{i}"
+        fit_tail = _video_after_trim_chain(canvas, piece, rotation)
         base_chain = (
             f"[{idx}:v]trim=start={start:.6f}:end={end:.6f},setpts=PTS-STARTPTS,"
-            f"{rot}"
-            f"scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=decrease,"
-            f"pad={TARGET_W}:{TARGET_H}:(ow-iw)/2:(oh-ih)/2:black,"
-            f"setsar=1,fps={FPS},format=yuv420p[{v_after_norm}]"
+            f"{fit_tail}[{v_after_norm}]"
         )
         parts.append(base_chain)
 
-        zoom_chain = _zoom_punch_filter(piece.zoom or 1.0)
+        zoom_chain = _zoom_punch_filter(piece.zoom or 1.0, canvas)
         if zoom_chain:
             v_pre_speed = f"vz{i}"
             parts.append(f"[{v_after_norm}]{zoom_chain}[{v_pre_speed}]")
@@ -808,9 +860,10 @@ def build_timeline_filter_graph(
     *,
     audio_branches: list[AudioBranch] | None = None,
     timeline_total: float | None = None,
+    canvas: CanvasSettings | None = None,
 ) -> tuple[str, list[str]]:
     """
-    Trim each piece, normalize to 1080x1920 @ 30fps, optional zoom punch-in,
+    Trim each piece, normalize to project canvas size/fps/fit, optional zoom punch-in,
     speed via setpts / atempo, embedded audio bus.
     Gaps: lavfi black + silence.
 
@@ -819,15 +872,16 @@ def build_timeline_filter_graph(
 
     Mixed path: 48 kHz embedded bus + timed audio-track branches, amix, limiter.
     """
+    c = canvas or resolve_canvas(None)
     branches = audio_branches or []
     use_mix = bool(branches) or any(p.embed_audio_silent for p in pieces)
     if not use_mix:
-        return _legacy_build_timeline_filter_graph(pieces)
+        return _legacy_build_timeline_filter_graph(pieces, c)
 
     total = timeline_total if timeline_total is not None else sum(
         p.output_duration() for p in pieces
     )
-    return _mixed_build_timeline_filter_graph(pieces, branches, total)
+    return _mixed_build_timeline_filter_graph(pieces, branches, total, c)
 
 
 def _ffmpeg_supports_filter(name: str) -> bool:
@@ -989,15 +1043,20 @@ def render_timeline(
     *,
     audio_branches: list[AudioBranch] | None = None,
     timeline_total: float | None = None,
+    canvas: CanvasSettings | None = None,
+    video_crf: int | None = None,
     cancel_event: threading.Event | None = None,
     on_progress: Callable[[float | None], None] | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    c = canvas or resolve_canvas(None)
     filter_complex, ffmpeg_inputs = build_timeline_filter_graph(
         pieces,
         audio_branches=audio_branches,
         timeline_total=timeline_total,
+        canvas=c,
     )
+    crf = 23 if video_crf is None else max(0, min(int(video_crf), 51))
     cmd = [
         "ffmpeg",
         "-y",
@@ -1012,6 +1071,8 @@ def render_timeline(
         "libx264",
         "-preset",
         "medium",
+        "-crf",
+        str(crf),
         "-c:a",
         "aac",
         "-b:a",

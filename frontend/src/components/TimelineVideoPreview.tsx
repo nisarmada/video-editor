@@ -12,6 +12,7 @@ import {
 } from "../timeline/duration";
 import { useCaptionPreviewOverlay } from "../hooks/useCaptionPreviewOverlay";
 import { useTimelineStore } from "../store/timelineStore";
+import { canvasAspectRatio, resolveProjectCanvas } from "../timeline/canvas";
 import { previewPunchInScale } from "../timeline/exportZoomPreview";
 import { videoFadeOpacityAt } from "../timeline/previewFades";
 import { formatTimecode } from "../utils/timeFormat";
@@ -69,6 +70,11 @@ export default function TimelineVideoPreview() {
   const activeClip = useMemo(
     () => activeVideoClipAt(sortedClips, playhead),
     [sortedClips, playhead],
+  );
+
+  const projectCanvas = useMemo(
+    () => resolveProjectCanvas(timeline?.settings),
+    [timeline?.settings],
   );
 
   const clipId = activeClip?.id ?? null;
@@ -223,6 +229,13 @@ export default function TimelineVideoPreview() {
     proxyErrorSource &&
     activeClip?.source === proxyErrorSource;
 
+  const aspect = canvasAspectRatio(projectCanvas);
+  const clipFit = activeClip?.canvas_fit ?? projectCanvas.fit ?? "contain";
+  const barFill =
+    activeClip?.canvas_bar_fill ?? projectCanvas.bar_fill ?? "black";
+  const objectFit = clipFit === "cover" ? "cover" : "contain";
+  const useBlurBars = clipFit === "contain" && barFill === "blur";
+
   return (
     <div className="timeline-video-preview">
       <div className="source-preview__meta">
@@ -254,7 +267,18 @@ export default function TimelineVideoPreview() {
             `preview-video-wrap${safeAreaGuide ? " preview-video-wrap--safe" : ""}` +
             (punchScale > 1 ? " preview-video-wrap--punch" : "")
           }
+          style={{ aspectRatio: `${aspect}` }}
         >
+          {useBlurBars && !inGap && !showProxyError && proxyUrl ? (
+            <video
+              className="preview-video preview-video--blur-bg"
+              src={proxyUrl}
+              playsInline
+              muted
+              aria-hidden
+              style={{ objectFit: "cover", filter: "blur(24px)" }}
+            />
+          ) : null}
           <video
             ref={videoRef}
             className={`preview-video${inGap || showProxyError ? " preview-video--hidden" : ""}`}
@@ -264,6 +288,7 @@ export default function TimelineVideoPreview() {
             onClick={onToggle}
             onError={onVideoError}
             style={{
+              objectFit,
               ...(punchScale > 1
                 ? {
                     transform: `scale(${punchScale})`,

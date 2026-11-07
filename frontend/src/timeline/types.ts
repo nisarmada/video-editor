@@ -39,11 +39,26 @@ export type CaptionStyle = {
   active_word_scale?: number;
 };
 
-/** Optional project output defaults; render still uses fixed 1080×1920 @ 30 until wired. */
+export type CanvasFitMode = "contain" | "cover";
+export type CanvasBarFill = "black" | "blur";
+
+/** Project output frame (preview, captions, export). */
+export type ProjectCanvas = {
+  width?: number;
+  height?: number;
+  fps?: number;
+  fit?: CanvasFitMode;
+  bar_fill?: CanvasBarFill;
+  /** Cover crop anchor 0–1. */
+  fit_position_x?: number;
+  fit_position_y?: number;
+};
+
 export type TimelineSettings = {
   width?: number;
   height?: number;
   fps?: number;
+  canvas?: ProjectCanvas;
   caption_style?: CaptionStyle;
   /** When true, move/trim/split/delete follow group_id-linked clips. Default true if omitted. */
   clip_linking_enabled?: boolean;
@@ -75,6 +90,11 @@ export type TimelineClip = {
   video_fade_in?: number;
   video_fade_out?: number;
   transition_out?: { type: "dissolve" | "crossfade"; duration: number };
+  /** Per-clip override of project canvas fit (video export only). */
+  canvas_fit?: CanvasFitMode;
+  canvas_bar_fill?: CanvasBarFill;
+  canvas_fit_x?: number;
+  canvas_fit_y?: number;
   text?: string;
   caption?: string;
   style_override?: Partial<CaptionStyle>;

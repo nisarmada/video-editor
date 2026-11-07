@@ -145,6 +145,10 @@ class RenderRequest(BaseModel):
     output: str = Field(description="Output filename under output/, e.g. export.mp4")
     captions: bool | None = None
     max_length: float | None = None
+    video_crf: int | None = Field(
+        default=None,
+        description="libx264 CRF (lower = higher quality). Uses project default when omitted.",
+    )
 
 
 class SettingsUpdate(BaseModel):
@@ -1039,6 +1043,12 @@ def _run_render_job(
                 if body.max_length is not None
                 else defaults.get("max_length")
             )
+            crf = body.video_crf
+            if crf is None and defaults.get("video_crf") is not None:
+                try:
+                    crf = int(defaults["video_crf"])
+                except (TypeError, ValueError):
+                    crf = None
             if body.timeline is not None:
                 plan_path = None
                 if caps and body.plan_name:
@@ -1052,6 +1062,7 @@ def _run_render_job(
                     plan_path_for_captions=plan_path,
                     cancel_event=cancel_ev,
                     on_timeline_progress=tick,
+                    video_crf=crf,
                 )
             else:
                 assert body.plan_name
@@ -1063,6 +1074,7 @@ def _run_render_job(
                     max_length=max_len,
                     cancel_event=cancel_ev,
                     on_timeline_progress=tick,
+                    video_crf=crf,
                 )
     except RuntimeError as e:
         err = str(e)

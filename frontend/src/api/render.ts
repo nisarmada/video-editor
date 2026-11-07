@@ -6,6 +6,7 @@ export type RenderPlanRequest = {
   output: string;
   captions?: boolean;
   max_length?: number | null;
+  video_crf?: number;
 };
 
 export type RenderJobPublic = {
@@ -37,6 +38,7 @@ export async function startRender(
       output: body.output,
       captions: body.captions ?? false,
       max_length: body.max_length ?? undefined,
+      video_crf: body.video_crf ?? undefined,
     }),
   });
   if (!res.ok) return readError(res);

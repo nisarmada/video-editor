@@ -9,6 +9,7 @@ import threading
 from collections.abc import Callable
 from pathlib import Path
 
+from canvas_settings import resolve_canvas, settings_with_canvas_sync
 from caption_style_resolve import fonts_bundle_dir
 from captions import build_ass, caption_events, load_plan_data, load_segments, remap_words
 from media import AudioBranch, TimelinePiece, burn_captions, render_timeline
@@ -55,6 +56,23 @@ def _segment_transform(seg: dict) -> tuple[float, float, float | None]:
     return speed, volume, zoom
 
 
+def _optional_str(seg: dict, key: str) -> str | None:
+    v = seg.get(key)
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    return s if s else None
+
+
+def _optional_norm_float(seg: dict, key: str) -> float | None:
+    if seg.get(key) is None:
+        return None
+    try:
+        return float(seg[key])
+    except (TypeError, ValueError):
+        return None
+
+
 def parse_segments(segments_raw: list[dict], root: Path) -> list[TimelinePiece]:
     pieces: list[TimelinePiece] = []
     for seg in segments_raw:
@@ -91,6 +109,10 @@ def parse_segments(segments_raw: list[dict], root: Path) -> list[TimelinePiece]:
                 video_fade_out=_optional_float(seg, "video_fade_out"),
                 transition_out=_optional_transition(seg),
                 embed_audio_silent=embed_silent,
+                canvas_fit=_optional_str(seg, "canvas_fit"),
+                canvas_bar_fill=_optional_str(seg, "canvas_bar_fill"),
+                canvas_fit_x=_optional_norm_float(seg, "canvas_fit_x"),
+                canvas_fit_y=_optional_norm_float(seg, "canvas_fit_y"),
             )
         )
     return pieces
@@ -158,11 +180,17 @@ def render_plan_data(
     plan_path_for_captions: Path | None = None,
     cancel_event: threading.Event | None = None,
     on_timeline_progress: Callable[[float | None], None] | None = None,
+    video_crf: int | None = None,
 ) -> None:
     """Validate and render v1 or v2 plan dict to output_path."""
     errors, _warnings = validate_plan_data(plan_data, max_length)
     if errors:
         raise ValueError(errors)
+
+    settings_raw = (
+        plan_data.get("settings") if isinstance(plan_data.get("settings"), dict) else {}
+    )
+    canvas = resolve_canvas(settings_raw)
 
     segments_raw = v1_segments_from_data(plan_data)
     if not segments_raw:
@@ -189,6 +217,8 @@ def render_plan_data(
         render_target,
         audio_branches=audio_branches if audio_branches else None,
         timeline_total=timeline_total,
+        canvas=canvas,
+        video_crf=video_crf,
         cancel_event=cancel_event,
         on_progress=on_timeline_progress,
     )
@@ -202,15 +232,15 @@ def render_plan_data(
         segs = load_segments(cap_plan)
         words = remap_words(segs, plan_data=plan_file_data)
         events = caption_events(words, plan_data=plan_file_data)
-        tw = th = None
-        if isinstance(plan_file_data, dict) and isinstance(
-            plan_file_data.get("settings"), dict
-        ):
-            s = plan_file_data["settings"]
-            tw = s.get("width")
-            th = s.get("height")
-        vw = int(tw) if isinstance(tw, (int, float)) else 1080
-        vh = int(th) if isinstance(th, (int, float)) else 1920
+        cap_settings = (
+            plan_file_data.get("settings")
+            if isinstance(plan_file_data, dict)
+            and isinstance(plan_file_data.get("settings"), dict)
+            else {}
+        )
+        synced = settings_with_canvas_sync(cap_settings)
+        cap_canvas = resolve_canvas(synced)
+        vw, vh = cap_canvas.width, cap_canvas.height
         if not ass_path.is_file():
             ass_path.write_text(
                 build_ass(words, plan_data=plan_file_data, video_w=vw, video_h=vh),
@@ -238,6 +268,7 @@ def render_plan_file(
     max_length: float | None = None,
     cancel_event: threading.Event | None = None,
     on_timeline_progress: Callable[[float | None], None] | None = None,
+    video_crf: int | None = None,
 ) -> None:
     root = root or Path.cwd()
     plan_data = load_plan_file(plan_path)
@@ -250,4 +281,5 @@ def render_plan_file(
         plan_path_for_captions=plan_path if captions else None,
         cancel_event=cancel_event,
         on_timeline_progress=on_timeline_progress,
+        video_crf=video_crf,
     )

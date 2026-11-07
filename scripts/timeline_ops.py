@@ -33,6 +33,10 @@ ALLOWED_CLIP_PROPERTIES = frozenset(
         "video_fade_in",
         "video_fade_out",
         "transition_out",
+        "canvas_fit",
+        "canvas_bar_fill",
+        "canvas_fit_x",
+        "canvas_fit_y",
     }
 )
 

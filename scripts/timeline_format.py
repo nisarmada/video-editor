@@ -138,6 +138,14 @@ def flatten_v2_to_v1_segments(data: dict) -> list[dict]:
                 seg[fk] = float(c[fk])
         if isinstance(c.get("transition_out"), dict):
             seg["transition_out"] = c["transition_out"]
+        for fk in (
+            "canvas_fit",
+            "canvas_bar_fill",
+            "canvas_fit_x",
+            "canvas_fit_y",
+        ):
+            if c.get(fk) is not None:
+                seg[fk] = c[fk]
         detached = c.get("audio_source") == "detached"
         if track_muted or detached:
             seg["embed_audio_silent"] = True

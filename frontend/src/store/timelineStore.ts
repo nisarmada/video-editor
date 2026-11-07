@@ -120,6 +120,15 @@ export function newEmptyTimelineV2(): TimelineV2 {
       width: 1080,
       height: 1920,
       fps: 30,
+      canvas: {
+        width: 1080,
+        height: 1920,
+        fps: 30,
+        fit: "contain",
+        bar_fill: "black",
+        fit_position_x: 0.5,
+        fit_position_y: 0.5,
+      },
       clip_linking_enabled: true,
       caption_style: { ...DEFAULT_CAPTION_STYLE },
     },
@@ -268,7 +277,15 @@ type TimelineViewState = {
     },
   ) => Promise<void>;
   /** Save if dirty, then POST /api/render using plan file on disk. */
-  exportPlan: () => Promise<void>;
+  exportPlan: (opts?: {
+    captions?: boolean;
+    video_crf?: number;
+  }) => Promise<void>;
+  /** Same as exportPlan (export dialog passes explicit options). */
+  exportPlanWithOptions: (opts?: {
+    captions?: boolean;
+    video_crf?: number;
+  }) => Promise<void>;
   cancelExport: () => Promise<void>;
   setRenderLogVisible: (v: boolean) => void;
   revealOutputInFinder: () => Promise<void>;
@@ -667,7 +684,7 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
     }
   },
 
-  exportPlan: async () => {
+  exportPlan: async (opts) => {
     const s0 = get();
     if (!s0.timeline || s0.timelineLoading || s0.renderStatus === "rendering") {
       return;
@@ -721,8 +738,9 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
       const { job_id: jobId } = await startRender({
         plan_name: currentPlanName,
         output: outputStem,
-        captions: rd.captions,
+        captions: opts?.captions ?? rd.captions,
         max_length: rd.max_length,
+        video_crf: opts?.video_crf ?? rd.video_crf ?? 23,
       });
 
       set({ renderJobId: jobId });
@@ -765,6 +783,8 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
       });
     }
   },
+
+  exportPlanWithOptions: async (opts) => get().exportPlan(opts),
 
   cancelExport: async () => {
     const id = get().renderJobId;
