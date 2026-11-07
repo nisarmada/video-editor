@@ -1541,6 +1541,22 @@
   margin: 0 auto;
 }
 
+/* Match export punch-in: scale centered, clip overflow (see exportZoomPreview.ts). */
+.preview-video-wrap--punch {
+  overflow: hidden;
+  aspect-ratio: 9 / 16;
+  max-height: min(100%, 360px);
+  width: 100%;
+  max-width: calc(min(100%, 360px) * 9 / 16);
+}
+
+.preview-video-wrap--punch .preview-video {
+  width: 100%;
+  height: 100%;
+  max-height: none;
+  object-fit: contain;
+}
+
 /* TikTok/Reels-style rough safe zones (preview guide only) */
 .preview-safe-area {
   position: absolute;

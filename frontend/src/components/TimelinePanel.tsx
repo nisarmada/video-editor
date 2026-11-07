@@ -148,6 +148,7 @@ export default function TimelinePanel() {
   const undo = useTimelineStore((s) => s.undo);
   const redo = useTimelineStore((s) => s.redo);
   const splitAtPlayhead = useTimelineStore((s) => s.splitAtPlayhead);
+  const refineSelectedAudioCuts = useTimelineStore((s) => s.refineSelectedAudioCuts);
   const deleteSelectedClip = useTimelineStore((s) => s.deleteSelectedClip);
   const separateAudio = useTimelineStore((s) => s.separateAudio);
   const reattachAudio = useTimelineStore((s) => s.reattachAudio);
@@ -971,6 +972,15 @@ export default function TimelinePanel() {
           >
             Del
           </button>
+          <button
+            type="button"
+            className="timeline-toolbar__tool timeline-toolbar__tool--text"
+            disabled={busy || selectionCount === 0}
+            onClick={() => void refineSelectedAudioCuts().catch(() => {})}
+            title="Refine narration in/out to word-safe edges (one undo)"
+          >
+            Refine cuts
+          </button>
         </div>
         <div className="timeline-toolbar__right">
           <span className="timeline-toolbar__stub" title="Not implemented">
@@ -1172,14 +1182,6 @@ export default function TimelinePanel() {
                       <span className="track-label__title">
                         {track.label ?? track.type}
                       </span>
-                      {track.type === "caption" &&
-                      (track.clips?.length ?? 0) === 0 ? (
-                        <p className="track-label__caption-hint">
-                          Speech captions are generated from the transcript on export
-                          (Captions tab). Editable caption clips appear here when the
-                          plan includes a caption track.
-                        </p>
-                      ) : null}
                       {showTrackControls ? (
                         <div className="track-label__row">
                           <button

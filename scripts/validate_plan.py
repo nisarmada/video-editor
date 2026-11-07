@@ -104,14 +104,24 @@ def validate_segments(
 def validate_plan_data(
     data: dict | list,
     max_length: float | None = None,
+    *,
+    project_root: Path | None = None,
 ) -> tuple[list[str], list[str]]:
     if isinstance(data, dict) and is_v2(data):
-        return validate_v2_data(
+        errors, warnings = validate_v2_data(
             data,
             max_length,
             resolve_source,
             video_duration_seconds,
         )
+        root = project_root or Path.cwd()
+        try:
+            from audio_cut_refine import check_word_clipped_at_cuts
+
+            warnings.extend(check_word_clipped_at_cuts(data, root=root))
+        except Exception:
+            pass
+        return errors, warnings
     se = validate_segments(v1_segments_from_data(data), max_length)
     return se, []
 

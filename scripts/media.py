@@ -16,8 +16,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from edit_vocab import (  # noqa: E402
+    AUDIO_FADE_SECONDS,
+    append_audio_afade_filters,
+    audio_fades_for_branch,
+    audio_fades_for_segment,
+    video_fade_chain,
+)
+
 TARGET_W, TARGET_H, FPS = 1080, 1920, 30
-AUDIO_FADE_SECONDS = 0.02
 EXPORT_AUDIO_RATE = 48000
 # FFmpeg amix: too many inputs can exceed filter graph limits; cap and fail clearly.
 AMIX_MAX_INPUTS = 64
@@ -33,6 +40,11 @@ class TimelinePiece:
     speed: float = 1.0
     volume: float = 1.0
     zoom: float | None = None
+    audio_fade_in: float | None = None
+    audio_fade_out: float | None = None
+    video_fade_in: float | None = None
+    video_fade_out: float | None = None
+    transition_out: dict | None = None
     # When True, embedded video segment uses silence (detached audio or muted track).
     embed_audio_silent: bool = False
 
@@ -63,6 +75,11 @@ class AudioBranch:
     speed: float = 1.0
     volume: float = 1.0
     timeline_start: float = 0.0
+    audio_fade_in: float | None = None
+    audio_fade_out: float | None = None
+    source_track_id: str = ""
+    duck_under_track_id: str | None = None
+    duck_gain: float | None = None
 
     def effective_speed(self) -> float:
         s = float(self.speed)
@@ -374,6 +391,62 @@ def _zoom_punch_filter(zoom: float) -> str:
     )
 
 
+def _timeline_overlap_br(a: AudioBranch, b: AudioBranch) -> bool:
+    a0, a1 = a.timeline_start, a.timeline_start + a.wall_duration()
+    b0, b1 = b.timeline_start, b.timeline_start + b.wall_duration()
+    return a0 < b1 - 1e-6 and b0 < a1 - 1e-6
+
+
+def _branch_effective_volume(br: AudioBranch, branches: list[AudioBranch]) -> float:
+    vol = float(br.volume)
+    if not br.duck_under_track_id:
+        return vol
+    for other in branches:
+        if other.source_track_id != br.duck_under_track_id:
+            continue
+        if _timeline_overlap_br(br, other):
+            gain = br.duck_gain if br.duck_gain is not None else 0.25
+            return vol * gain
+    return vol
+
+
+def _apply_video_transitions(
+    parts: list[str],
+    vlabels: list[str],
+    pieces: list[TimelinePiece],
+) -> list[str]:
+    if not vlabels:
+        return vlabels
+    out: list[str] = []
+    i = 0
+    xfi = 0
+    while i < len(vlabels):
+        if (
+            i + 1 < len(vlabels)
+            and i < len(pieces)
+            and pieces[i].transition_out
+        ):
+            tr = pieces[i].transition_out or {}
+            try:
+                d = float(tr.get("duration", 0))
+            except (TypeError, ValueError):
+                d = 0.0
+            if d > 1e-6:
+                off = max(pieces[i].output_duration() - d, 0.0)
+                label = f"vxf{xfi}"
+                xfi += 1
+                parts.append(
+                    f"{vlabels[i]}{vlabels[i + 1]}xfade=transition=fade:"
+                    f"duration={d:.6f}:offset={off:.6f}[{label}]"
+                )
+                out.append(f"[{label}]")
+                i += 2
+                continue
+        out.append(vlabels[i])
+        i += 1
+    return out
+
+
 def _legacy_build_timeline_filter_graph(
     pieces: list[TimelinePiece],
 ) -> tuple[str, list[str]]:
@@ -424,13 +497,12 @@ def _legacy_build_timeline_filter_graph(
             vlabels.append(f"[v{i}]")
 
             audio_filters = ["aformat=sample_rates=44100:channel_layouts=stereo"]
-            if i > 0:
-                audio_filters.insert(0, f"afade=t=in:st=0:d={AUDIO_FADE_SECONDS}")
-            if i < n - 1:
-                fade_out_st = max(seg_out - AUDIO_FADE_SECONDS, 0)
-                audio_filters.append(
-                    f"afade=t=out:st={fade_out_st:.6f}:d={AUDIO_FADE_SECONDS}"
-                )
+            fin, fout = audio_fades_for_segment(
+                None, None, index=i, piece_count=n, seg_duration=seg_out
+            )
+            append_audio_afade_filters(
+                audio_filters, seg_duration=seg_out, fade_in=fin, fade_out=fout
+            )
             parts.append(f"[{a_in}:a]{','.join(audio_filters)}[a{i}]")
             alabels.append(f"[a{i}]")
             continue
@@ -469,25 +541,35 @@ def _legacy_build_timeline_filter_graph(
         else:
             v_pre_speed = v_after_norm
 
+        vfade = video_fade_chain(
+            piece.video_fade_in, piece.video_fade_out, seg_duration=seg_out
+        )
+        v_after_fade = v_pre_speed
+        if vfade:
+            v_after_fade = f"vf{i}"
+            parts.append(f"[{v_pre_speed}]{vfade}[{v_after_fade}]")
+
         if abs(speed - 1.0) > 1e-6:
-            parts.append(f"[{v_pre_speed}]setpts=PTS/{sp}[pre{i}]")
+            parts.append(f"[{v_after_fade}]setpts=PTS/{sp}[pre{i}]")
             vlabels.append(f"[pre{i}]")
         else:
-            vlabels.append(f"[{v_pre_speed}]")
+            vlabels.append(f"[{v_after_fade}]")
 
         tail_audio: list[str] = []
         for fac in _atempo_chain_factors(speed):
             tail_audio.append(f"atempo={fac:.8f}".rstrip("0").rstrip("."))
         tail_audio.append(_volume_filter_expr(piece.volume))
         tail_audio.append("aformat=sample_rates=44100:channel_layouts=stereo")
-
-        if i > 0:
-            tail_audio.append(f"afade=t=in:st=0:d={AUDIO_FADE_SECONDS}")
-        if i < n - 1:
-            fade_out_st = max(seg_out - AUDIO_FADE_SECONDS, 0)
-            tail_audio.append(
-                f"afade=t=out:st={fade_out_st:.6f}:d={AUDIO_FADE_SECONDS}"
-            )
+        fin, fout = audio_fades_for_segment(
+            piece.audio_fade_in,
+            piece.audio_fade_out,
+            index=i,
+            piece_count=n,
+            seg_duration=seg_out,
+        )
+        append_audio_afade_filters(
+            tail_audio, seg_duration=seg_out, fade_in=fin, fade_out=fout
+        )
         tail_s = ",".join(tail_audio)
 
         use_silent = piece.embed_audio_silent
@@ -501,7 +583,9 @@ def _legacy_build_timeline_filter_graph(
             )
         alabels.append(f"[a{i}]")
 
-    parts.append(f"{''.join(vlabels)}concat=n={n}:v=1:a=0[vout]")
+    vlabels = _apply_video_transitions(parts, vlabels, pieces)
+    vn = len(vlabels)
+    parts.append(f"{''.join(vlabels)}concat=n={vn}:v=1:a=0[vout]")
     parts.append(f"{''.join(alabels)}concat=n={n}:v=0:a=1[aout]")
     return ";".join(parts), ffmpeg_inputs
 
@@ -558,13 +642,12 @@ def _mixed_build_timeline_filter_graph(
             audio_filters = [
                 f"aformat=sample_rates={sr}:channel_layouts=stereo",
             ]
-            if i > 0:
-                audio_filters.insert(0, f"afade=t=in:st=0:d={AUDIO_FADE_SECONDS}")
-            if i < n - 1:
-                fade_out_st = max(seg_out - AUDIO_FADE_SECONDS, 0)
-                audio_filters.append(
-                    f"afade=t=out:st={fade_out_st:.6f}:d={AUDIO_FADE_SECONDS}"
-                )
+            fin, fout = audio_fades_for_segment(
+                None, None, index=i, piece_count=n, seg_duration=seg_out
+            )
+            append_audio_afade_filters(
+                audio_filters, seg_duration=seg_out, fade_in=fin, fade_out=fout
+            )
             parts.append(f"[{a_in}:a]{','.join(audio_filters)}[emb{i}]")
             emb_labels.append(f"[emb{i}]")
             continue
@@ -603,11 +686,19 @@ def _mixed_build_timeline_filter_graph(
         else:
             v_pre_speed = v_after_norm
 
+        vfade = video_fade_chain(
+            piece.video_fade_in, piece.video_fade_out, seg_duration=seg_out
+        )
+        v_after_fade = v_pre_speed
+        if vfade:
+            v_after_fade = f"vf{i}"
+            parts.append(f"[{v_pre_speed}]{vfade}[{v_after_fade}]")
+
         if abs(speed - 1.0) > 1e-6:
-            parts.append(f"[{v_pre_speed}]setpts=PTS/{sp}[pre{i}]")
+            parts.append(f"[{v_after_fade}]setpts=PTS/{sp}[pre{i}]")
             vlabels.append(f"[pre{i}]")
         else:
-            vlabels.append(f"[{v_pre_speed}]")
+            vlabels.append(f"[{v_after_fade}]")
 
         tail_audio: list[str] = []
         for fac in _atempo_chain_factors(speed):
@@ -616,13 +707,16 @@ def _mixed_build_timeline_filter_graph(
         tail_audio.append(
             f"aformat=sample_rates={sr}:channel_layouts=stereo"
         )
-        if i > 0:
-            tail_audio.insert(0, f"afade=t=in:st=0:d={AUDIO_FADE_SECONDS}")
-        if i < n - 1:
-            fade_out_st = max(seg_out - AUDIO_FADE_SECONDS, 0)
-            tail_audio.append(
-                f"afade=t=out:st={fade_out_st:.6f}:d={AUDIO_FADE_SECONDS}"
-            )
+        fin, fout = audio_fades_for_segment(
+            piece.audio_fade_in,
+            piece.audio_fade_out,
+            index=i,
+            piece_count=n,
+            seg_duration=seg_out,
+        )
+        append_audio_afade_filters(
+            tail_audio, seg_duration=seg_out, fade_in=fin, fade_out=fout
+        )
         tail_s = ",".join(tail_audio)
 
         use_silent = piece.embed_audio_silent or not has_audio
@@ -636,7 +730,8 @@ def _mixed_build_timeline_filter_graph(
             )
         emb_labels.append(f"[emb{i}]")
 
-    parts.append(f"{''.join(vlabels)}concat=n={n}:v=1:a=0[vout]")
+    vlabels = _apply_video_transitions(parts, vlabels, pieces)
+    parts.append(f"{''.join(vlabels)}concat=n={len(vlabels)}:v=1:a=0[vout]")
     parts.append(
         f"{''.join(emb_labels)}concat=n={n}:v=0:a=1[aembedded]"
     )
@@ -674,10 +769,14 @@ def _mixed_build_timeline_filter_graph(
         ]
         for fac in _atempo_chain_factors(speed):
             tb.append(f"atempo={fac:.8f}".rstrip("0").rstrip("."))
-        tb.append(_volume_filter_expr(br.volume))
-        tb.append(f"afade=t=in:st=0:d={AUDIO_FADE_SECONDS}")
-        fo = max(wall - AUDIO_FADE_SECONDS, 0.0)
-        tb.append(f"afade=t=out:st={fo:.6f}:d={AUDIO_FADE_SECONDS}")
+        eff_vol = _branch_effective_volume(br, audio_branches)
+        tb.append(_volume_filter_expr(eff_vol))
+        fin, fout = audio_fades_for_branch(
+            br.audio_fade_in, br.audio_fade_out, wall_duration=wall
+        )
+        append_audio_afade_filters(
+            tb, seg_duration=wall, fade_in=fin, fade_out=fout
+        )
         tb.append(f"adelay={delay_ms}|{delay_ms}")
         tb.append(f"aformat=sample_rates={sr}:channel_layouts=stereo")
         parts.append(f"[{bidx}:a]{','.join(tb)}[abr{br_idx}]")

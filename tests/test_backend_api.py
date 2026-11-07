@@ -126,7 +126,7 @@ def test_replace_timeline_undo(client: TestClient):
 def test_apply_undo_restores_delete(client: TestClient, monkeypatch):
     monkeypatch.setattr(
         "backend.main.validate_plan_data",
-        lambda data, ml: ([], []),
+        lambda data, ml, **kwargs: ([], []),
     )
 
     tl = _minimal_v2()
@@ -160,7 +160,7 @@ def test_apply_undo_restores_delete(client: TestClient, monkeypatch):
 def test_save_and_load_plan(client: TestClient, monkeypatch):
     monkeypatch.setattr(
         "backend.main.validate_plan_data",
-        lambda data, ml: ([], []),
+        lambda data, ml, **kwargs: ([], []),
     )
 
     tl = _minimal_v2()
@@ -258,7 +258,7 @@ def test_render_mock(client: TestClient, monkeypatch):
 
     monkeypatch.setattr(
         "backend.main.validate_plan_data",
-        lambda data, ml: ([], []),
+        lambda data, ml, **kwargs: ([], []),
     )
     tl = _minimal_v2()
     save = client.put("/api/plans/myedit", json={"timeline": tl})

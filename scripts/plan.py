@@ -26,6 +26,7 @@ if str(_REPO_ROOT) not in sys.path:
 from convert_v1_to_v2 import convert as v1_to_v2  # noqa: E402
 from style_profile import format_style_for_prompt, load_style_profile  # noqa: E402
 from timeline_format import get_track, is_v2  # noqa: E402
+from audio_cut_refine import load_settings, refine_timeline_audio_cuts  # noqa: E402
 from validate_plan import validate_plan_data, validate_segments  # noqa: E402
 
 from backend.media_catalog import build_media_catalog  # noqa: E402
@@ -40,7 +41,7 @@ OUTPUT_USD_PER_TOKEN = 15.0 / 1_000_000
 
 BASE_SYSTEM_PROMPT = """You help build a timeline for a local video editor. Output area is typically 1080x1920 at 30 fps unless settings say otherwise.
 
-You receive a JSON **media catalog**: one object per file in footage/. Each entry includes kind (video or audio), duration, stream flags, analysis status, transcript segments (or a note), silences, and for video files shots / keyframes / optional AI frame captions. Entries marked "not analyzed" for some fields mean that data was not produced yet — still use what is available.
+You receive a JSON **media catalog**: one object per file in footage/. Each entry includes kind (video or audio), duration, stream flags, analysis status, transcript segments (or a note), **transcript_words** (flat word start/end times — use these for narration trims), silences, and for video files shots / keyframes / optional AI frame captions. Entries marked "not analyzed" for some fields mean that data was not produced yet — still use what is available.
 
 You cannot see pixels or waveforms directly; rely on the catalog text and numbers.
 
@@ -57,6 +58,11 @@ The project uses **multi-track** timelines:
   - `created_by` — use `"ai"`
   - Optional: `group_id` (string) to link related clips
   - Optional: `speed`, `volume`, `zoom` (video)
+  - Optional audio fades (seconds): `audio_fade_in`, `audio_fade_out` on video and audio clips
+  - Optional video fades (seconds): `video_fade_in`, `video_fade_out` on video clips only
+  - Optional cut to next shot: `transition_out`: `{ "type": "dissolve" | "crossfade", "duration": <seconds> }` on a video clip (dissolve/crossfade use the same export)
+  - Optional on **audio tracks** (not clips): `duck_under_track_id` (another audio track id), `duck_gain` (0–1, default 0.25 when ducking applies) — lowers this track's clips when they overlap clips on the duck-under track
+  - Do **not** use fade, transition, or ducking fields you were not told are supported; omit when unsure
   - Optional on **video** clips: `audio_source` — `"embedded"` (default) or `"detached"`:
     - `embedded`: mix the clip's own audio in the usual way.
     - `detached`: mute embedded audio for that video segment (use when audio comes only from another track).
@@ -207,6 +213,9 @@ def finalize_v2_from_segments(v1_plan: dict, brief: str, run_group_id: str) -> d
         raise ValueError(errors)
 
     v2 = v1_to_v2(v1_plan, created_by="ai", group_id=run_group_id)
+    acfg = load_settings(Path.cwd())
+    if acfg.get("enabled", True):
+        v2, _report = refine_timeline_audio_cuts(v2, settings=acfg)
     v2_errors, _v2_warnings = validate_plan_data(v2, target)
     if v2_errors:
         raise ValueError(v2_errors)
@@ -222,6 +231,9 @@ def finalize_v2_direct(plan: dict, brief: str, run_group_id: str) -> dict:
     plan = ensure_ai_v2_plan(plan, brief, run_group_id)
     target = plan.get("target_length_seconds")
     target = float(target) if isinstance(target, (int, float)) else None
+    acfg = load_settings(Path.cwd())
+    if acfg.get("enabled", True):
+        plan, _report = refine_timeline_audio_cuts(plan, settings=acfg)
     errors, _warn = validate_plan_data(plan, target)
     if errors:
         raise ValueError(errors)

@@ -2,10 +2,20 @@ import type { TimelineV2 } from "../timeline/types";
 import { parseFastApiErrorBody } from "./httpError";
 
 /** Response from POST /api/timeline/apply-op */
+export type AudioRefinementReport = {
+  summary?: string;
+  moves?: {
+    clip_id: string;
+    delta_in_ms: number;
+    delta_out_ms: number;
+  }[];
+};
+
 export type ApplyOpResult = {
   timeline: TimelineV2;
   /** Inverse op payload from the server (`docs/commands.md`). */
   undo: Record<string, unknown>;
+  refinement_report?: AudioRefinementReport;
 };
 
 export async function applyTimelineOperation(

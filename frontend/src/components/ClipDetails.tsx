@@ -64,6 +64,13 @@ export default function ClipDetails() {
   const [zoomIn, setZoomIn] = useState("");
   const [textIn, setTextIn] = useState("");
   const [captionIn, setCaptionIn] = useState("");
+  const [audioFadeInIn, setAudioFadeInIn] = useState("");
+  const [audioFadeOutIn, setAudioFadeOutIn] = useState("");
+  const [videoFadeInIn, setVideoFadeInIn] = useState("");
+  const [videoFadeOutIn, setVideoFadeOutIn] = useState("");
+  const [transitionDurIn, setTransitionDurIn] = useState("");
+  const [duckUnderIn, setDuckUnderIn] = useState("");
+  const [duckGainIn, setDuckGainIn] = useState("");
   useEffect(() => {
     setError(null);
     if (!clip) {
@@ -89,6 +96,27 @@ export default function ClipDetails() {
     );
     setTextIn(clip.text ?? "");
     setCaptionIn(clip.caption ?? "");
+    setAudioFadeInIn(
+      clip.audio_fade_in != null ? String(clip.audio_fade_in) : "",
+    );
+    setAudioFadeOutIn(
+      clip.audio_fade_out != null ? String(clip.audio_fade_out) : "",
+    );
+    setVideoFadeInIn(
+      clip.video_fade_in != null ? String(clip.video_fade_in) : "",
+    );
+    setVideoFadeOutIn(
+      clip.video_fade_out != null ? String(clip.video_fade_out) : "",
+    );
+    setTransitionDurIn(
+      clip.transition_out?.duration != null
+        ? String(clip.transition_out.duration)
+        : "",
+    );
+    setDuckUnderIn(track?.duck_under_track_id ?? "");
+    setDuckGainIn(
+      track?.duck_gain != null ? String(track.duck_gain) : "",
+    );
   }, [
     clip?.id,
     clip?.speed,
@@ -96,6 +124,13 @@ export default function ClipDetails() {
     clip?.zoom,
     clip?.text,
     clip?.caption,
+    clip?.audio_fade_in,
+    clip?.audio_fade_out,
+    clip?.video_fade_in,
+    clip?.video_fade_out,
+    clip?.transition_out,
+    track?.duck_under_track_id,
+    track?.duck_gain,
   ]);
 
   const duration = clip && track ? clipTimelineDuration(clip, trackType) : 0;
@@ -194,7 +229,89 @@ export default function ClipDetails() {
       props.caption = cap;
     }
 
+    const parseOpt = (s: string, key: string) => {
+      if (s.trim() === "") return { [key]: null };
+      const n = Number(s);
+      if (!Number.isFinite(n) || n < 0) {
+        setError(`${key} must be a non-negative number.`);
+        throw new Error("bad");
+      }
+      return { [key]: n };
+    };
+
+    try {
+      Object.assign(props, parseOpt(audioFadeInIn, "audio_fade_in"));
+      Object.assign(props, parseOpt(audioFadeOutIn, "audio_fade_out"));
+      if (isVideoTrack) {
+        Object.assign(props, parseOpt(videoFadeInIn, "video_fade_in"));
+        Object.assign(props, parseOpt(videoFadeOutIn, "video_fade_out"));
+        const td = transitionDurIn.trim();
+        if (td === "") {
+          props.transition_out = null;
+        } else {
+          const n = Number(td);
+          if (!Number.isFinite(n) || n <= 0) {
+            setError("Transition duration must be > 0.");
+            return;
+          }
+          props.transition_out = { type: "dissolve", duration: n };
+        }
+      }
+    } catch {
+      return;
+    }
+
     await applyProps(props);
+  }
+
+  async function submitAudioClipProps() {
+    if (!clip || trackType !== "audio") return;
+    const props: Record<string, unknown> = {};
+    const vol = volIn.trim();
+    if (vol === "") props.volume = null;
+    else {
+      const n = Number(vol);
+      if (!Number.isFinite(n) || n < MIN_VOLUME || n > MAX_VOLUME) {
+        setError(`Volume must be between ${MIN_VOLUME} and ${MAX_VOLUME}.`);
+        return;
+      }
+      props.volume = n;
+    }
+    const parseOpt = (s: string, key: string) => {
+      if (s.trim() === "") return { [key]: null };
+      const n = Number(s);
+      if (!Number.isFinite(n) || n < 0) {
+        setError(`${key} must be a non-negative number.`);
+        throw new Error("bad");
+      }
+      return { [key]: n };
+    };
+    try {
+      Object.assign(props, parseOpt(audioFadeInIn, "audio_fade_in"));
+      Object.assign(props, parseOpt(audioFadeOutIn, "audio_fade_out"));
+    } catch {
+      return;
+    }
+    await applyProps(props);
+  }
+
+  async function submitTrackDuck() {
+    if (!track || trackType !== "audio") return;
+    const duckProps: Record<string, unknown> = {};
+    duckProps.duck_under_track_id = duckUnderIn.trim() || null;
+    if (duckGainIn.trim() === "") duckProps.duck_gain = null;
+    else {
+      const n = Number(duckGainIn);
+      if (!Number.isFinite(n) || n < 0 || n > 1) {
+        setError("duck_gain must be between 0 and 1.");
+        return;
+      }
+      duckProps.duck_gain = n;
+    }
+    await applyOperation({
+      operation: "set_track_property",
+      arguments: { track_id: track.id, properties: duckProps },
+    });
   }
 
   if (!timeline) {
@@ -369,7 +486,7 @@ export default function ClipDetails() {
       </div>
       <div className="props-row">
         <label>volume</label>
-        {isVideoTrack ? (
+        {isVideoTrack || trackType === "audio" ? (
           <input
             type="text"
             inputMode="decimal"
@@ -381,6 +498,104 @@ export default function ClipDetails() {
           <span>{dash(clip.volume)}</span>
         )}
       </div>
+      {(isVideoTrack || trackType === "audio") && (
+        <>
+          <div className="props-row">
+            <label>audio_fade_in (s)</label>
+            <input
+              type="text"
+              inputMode="decimal"
+              value={audioFadeInIn}
+              onChange={(e) => setAudioFadeInIn(e.target.value)}
+              disabled={applyInProgress}
+              placeholder="default"
+            />
+          </div>
+          <div className="props-row">
+            <label>audio_fade_out (s)</label>
+            <input
+              type="text"
+              inputMode="decimal"
+              value={audioFadeOutIn}
+              onChange={(e) => setAudioFadeOutIn(e.target.value)}
+              disabled={applyInProgress}
+              placeholder="default"
+            />
+          </div>
+        </>
+      )}
+      {isVideoTrack && (
+        <>
+          <div className="props-row">
+            <label>video_fade_in (s)</label>
+            <input
+              type="text"
+              inputMode="decimal"
+              value={videoFadeInIn}
+              onChange={(e) => setVideoFadeInIn(e.target.value)}
+              disabled={applyInProgress}
+              placeholder="none"
+            />
+          </div>
+          <div className="props-row">
+            <label>video_fade_out (s)</label>
+            <input
+              type="text"
+              inputMode="decimal"
+              value={videoFadeOutIn}
+              onChange={(e) => setVideoFadeOutIn(e.target.value)}
+              disabled={applyInProgress}
+              placeholder="none"
+            />
+          </div>
+          <div className="props-row">
+            <label>transition_out (s)</label>
+            <input
+              type="text"
+              inputMode="decimal"
+              value={transitionDurIn}
+              onChange={(e) => setTransitionDurIn(e.target.value)}
+              disabled={applyInProgress}
+              placeholder="dissolve duration"
+            />
+          </div>
+        </>
+      )}
+      {trackType === "audio" && (
+        <>
+          <div className="props-row">
+            <label>duck_under_track_id</label>
+            <input
+              type="text"
+              value={duckUnderIn}
+              onChange={(e) => setDuckUnderIn(e.target.value)}
+              disabled={applyInProgress}
+              placeholder="voice track id"
+            />
+          </div>
+          <div className="props-row">
+            <label>duck_gain</label>
+            <input
+              type="text"
+              inputMode="decimal"
+              value={duckGainIn}
+              onChange={(e) => setDuckGainIn(e.target.value)}
+              disabled={applyInProgress}
+              placeholder="0.25"
+            />
+          </div>
+          <div className="props-row">
+            <button
+              type="button"
+              className="btn"
+              disabled={applyInProgress}
+              onClick={() => void submitTrackDuck()}
+            >
+              Apply track ducking
+            </button>
+          </div>
+        </>
+      )}
       <div className="props-row">
         <label>zoom</label>
         {isVideoTrack ? (
@@ -431,7 +646,19 @@ export default function ClipDetails() {
             disabled={applyInProgress}
             onClick={() => void submitVideoRenderAndCaption()}
           >
-            Apply speed / volume / zoom / text / caption
+            Apply clip effects
+          </button>
+        </div>
+      )}
+      {trackType === "audio" && !multi && (
+        <div className="props-row">
+          <button
+            type="button"
+            className="btn btn--primary"
+            disabled={applyInProgress}
+            onClick={() => void submitAudioClipProps()}
+          >
+            Apply volume / audio fades
           </button>
         </div>
       )}

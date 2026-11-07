@@ -58,6 +58,10 @@ def get_public_settings(root: Path) -> dict[str, Any]:
     ui_public: dict[str, Any] = {}
     if isinstance(ui, dict):
         ui_public = ui
+    acr = raw.get("audio_cut_refine")
+    audio_cut_refine: dict[str, Any] = {}
+    if isinstance(acr, dict):
+        audio_cut_refine = acr
     return {
         "planner_api_key_configured": configured,
         "paths": {
@@ -72,6 +76,7 @@ def get_public_settings(root: Path) -> dict[str, Any]:
         "user_caption_styles": user_presets,
         "keybindings": keybindings,
         "ui": ui_public,
+        "audio_cut_refine": audio_cut_refine,
     }
 
 
@@ -123,6 +128,17 @@ def merge_settings(root: Path, body: dict[str, Any]) -> dict[str, Any]:
             prev = raw.get("ui") if isinstance(raw.get("ui"), dict) else {}
             merged = {**prev, **u}
             raw["ui"] = merged
+    if "audio_cut_refine" in body:
+        acr = body["audio_cut_refine"]
+        if acr is None:
+            raw.pop("audio_cut_refine", None)
+        elif isinstance(acr, dict):
+            prev = (
+                raw.get("audio_cut_refine")
+                if isinstance(raw.get("audio_cut_refine"), dict)
+                else {}
+            )
+            raw["audio_cut_refine"] = {**prev, **acr}
     save_raw(root, raw)
     return get_public_settings(root)
 

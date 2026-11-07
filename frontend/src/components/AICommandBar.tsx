@@ -290,16 +290,6 @@ export default function AICommandBar() {
             )}
           </div>
         )}
-        <p className="ai-command-bar__help">
-          Reference styles are saved under{" "}
-          <code className="ai-command-bar__code">plans/styles/</code> (upload analyzes
-          pacing, speech density, and frames — uses the planner API key).{" "}
-          Media bin: Shift+click to pick multiple clips for “Selected”. Undo the
-          result with{" "}
-          <kbd className="ai-command-bar__kbd">⌘Z</kbd> /{" "}
-          <kbd className="ai-command-bar__kbd">Ctrl+Z</kbd> when saving over the
-          active plan.
-        </p>
       </div>
     </section>
   );

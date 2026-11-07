@@ -28,6 +28,11 @@ ALLOWED_CLIP_PROPERTIES = frozenset(
         "created_by",
         "style_override",
         "audio_source",
+        "audio_fade_in",
+        "audio_fade_out",
+        "video_fade_in",
+        "video_fade_out",
+        "transition_out",
     }
 )
 
@@ -1107,9 +1112,11 @@ def set_track_property(
 ) -> TimelineOpResult:
     if not properties:
         raise ValueError("set_track_property: properties must be non-empty.")
-    if set(properties.keys()) - {"muted", "volume", "locked"}:
+    allowed = {"muted", "volume", "locked", "duck_under_track_id", "duck_gain"}
+    if set(properties.keys()) - allowed:
         raise ValueError(
-            "set_track_property: only 'muted', 'volume', and 'locked' are supported."
+            "set_track_property: only "
+            f"{sorted(allowed)!r} are supported."
         )
 
     tl = _clone(timeline)
@@ -1132,6 +1139,8 @@ def set_track_property(
             track[key] = float(value)
         elif key == "locked":
             track[key] = bool(value)
+        elif key == "duck_gain":
+            track[key] = float(value)
         else:
             track[key] = copy.deepcopy(value)
 
@@ -1314,10 +1323,91 @@ def replace_timeline(timeline: dict, *, timeline_data: dict) -> TimelineOpResult
     """Swap the entire v2 timeline (e.g. AI planner output); undo restores the previous tree."""
     old_snap = copy.deepcopy(timeline)
     new_tl = copy.deepcopy(timeline_data)
+    try:
+        from audio_cut_refine import load_settings, refine_timeline_audio_cuts
+
+        acfg = load_settings()
+        if acfg.get("enabled", True):
+            new_tl, report = refine_timeline_audio_cuts(new_tl, settings=acfg)
+            if report.moves:
+                return {
+                    "timeline": new_tl,
+                    "undo": {"op": "replace_timeline", "previous_timeline": old_snap},
+                    "refinement_report": {
+                        "moves": [m.as_dict() for m in report.moves],
+                        "summary": report.summary_line(),
+                    },
+                }
+    except Exception:
+        pass
     return {
         "timeline": new_tl,
         "undo": {"op": "replace_timeline", "previous_timeline": old_snap},
     }
+
+
+def refine_audio_cuts(
+    timeline: dict,
+    *,
+    clip_ids: list[str] | None = None,
+) -> TimelineOpResult:
+    """Manual 'Refine cuts' on selected narration clips (single undo step)."""
+    from audio_cut_refine import load_settings, refine_timeline_audio_cuts
+
+    want = {str(c) for c in (clip_ids or []) if c}
+    if not want:
+        raise ValueError("refine_audio_cuts: clip_ids required.")
+
+    before: list[dict[str, Any]] = []
+    for tr in timeline.get("tracks") or []:
+        if tr.get("type") != "audio":
+            continue
+        for clip in tr.get("clips") or []:
+            if str(clip.get("id")) in want:
+                before.append(
+                    {
+                        "clip_id": str(clip["id"]),
+                        "source_in": float(clip["source_in"]),
+                        "source_out": float(clip["source_out"]),
+                        "audio_fade_in": copy.deepcopy(clip.get("audio_fade_in")),
+                        "audio_fade_out": copy.deepcopy(clip.get("audio_fade_out")),
+                    }
+                )
+
+    acfg = load_settings()
+    new_tl, report = refine_timeline_audio_cuts(
+        timeline, settings=acfg, clip_ids=want
+    )
+    undo_steps = [
+        {
+            "op": "trim_clip",
+            "clip_id": row["clip_id"],
+            "source_in": row["source_in"],
+            "source_out": row["source_out"],
+        }
+        for row in before
+    ]
+    for row in before:
+        undo_steps.append(
+            {
+                "op": "set_clip_property",
+                "clip_id": row["clip_id"],
+                "properties": {
+                    "audio_fade_in": row["audio_fade_in"],
+                    "audio_fade_out": row["audio_fade_out"],
+                },
+            }
+        )
+    out: TimelineOpResult = {
+        "timeline": new_tl,
+        "undo": {"op": "sequence", "steps": undo_steps},
+    }
+    if report.moves:
+        out["refinement_report"] = {
+            "moves": [m.as_dict() for m in report.moves],
+            "summary": report.summary_line(),
+        }
+    return out
 
 
 def apply_undo(timeline: dict, undo: dict) -> TimelineOpResult:
@@ -1502,6 +1592,7 @@ OPERATIONS = {
     "separate_audio": separate_audio,
     "reattach_audio": reattach_audio,
     "unlink_clips": unlink_clips,
+    "refine_audio_cuts": refine_audio_cuts,
     "apply_undo": apply_undo_op,
 }
 

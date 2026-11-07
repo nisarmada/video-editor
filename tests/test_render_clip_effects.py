@@ -26,7 +26,6 @@ def _audio_rms_db(path: Path) -> float:
         "-",
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
-    # Parse stderr: mean_volume: -20.0 dB
     err = proc.stderr
     for line in err.splitlines():
         if "mean_volume:" in line:
@@ -35,11 +34,10 @@ def _audio_rms_db(path: Path) -> float:
     raise AssertionError("volumedetect did not report mean_volume")
 
 
-def test_render_volume_half_is_quieter_than_full(tmp_path: Path):
-    repo = Path(__file__).resolve().parents[1]
-    root = repo
-    src = root / "footage" / "test_a.mp4"
-    assert src.is_file()
+def test_render_volume_half_is_quieter_than_full(
+    tmp_path: Path, render_project_root: Path
+) -> None:
+    root = render_project_root
 
     def plan(volume: float) -> dict:
         return {
@@ -75,11 +73,10 @@ def test_render_volume_half_is_quieter_than_full(tmp_path: Path):
     assert db_half < db_full - 3.0
 
 
-def test_render_speed_doubles_shortens_output_duration(tmp_path: Path):
-    repo = Path(__file__).resolve().parents[1]
-    root = repo
-    src = root / "footage" / "test_a.mp4"
-    assert src.is_file()
+def test_render_speed_doubles_shortens_output_duration(
+    tmp_path: Path, render_project_root: Path
+) -> None:
+    root = render_project_root
 
     plan = {
         "schema_version": 2,

@@ -759,7 +759,9 @@ def save_timeline(
     if not is_v2(body.timeline):
         raise HTTPException(status_code=400, detail="timeline must be schema_version 2")
     with project_cwd(paths):
-        errors, warnings = validate_plan_data(body.timeline, None)
+        errors, warnings = validate_plan_data(
+            body.timeline, None, project_root=paths.root
+        )
     if errors:
         raise HTTPException(
             status_code=400,
@@ -768,7 +770,10 @@ def save_timeline(
     path = paths.plan_file(name)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(body.timeline, indent=2, ensure_ascii=False) + "\n")
-    return {"saved": path.name}
+    out: dict[str, Any] = {"saved": path.name}
+    if warnings:
+        out["warnings"] = warnings
+    return out
 
 
 @app.delete("/api/plans/{name}")
@@ -839,9 +844,13 @@ def duplicate_plan(
 
 
 @app.post("/api/timeline/apply-op")
-def apply_operation(body: ApplyOpRequest) -> dict[str, Any]:
+def apply_operation(
+    body: ApplyOpRequest,
+    paths: ProjectPaths = Depends(get_paths),
+) -> dict[str, Any]:
     try:
-        result = dispatch_operation(body.timeline, body.operation, body.arguments)
+        with project_cwd(paths):
+            result = dispatch_operation(body.timeline, body.operation, body.arguments)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return result
@@ -993,11 +1002,16 @@ def run_planner(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(plan_v2, indent=2, ensure_ascii=False) + "\n")
     log_event("info", f"Planner wrote {path.name}")
+    with project_cwd(paths):
+        from audio_cut_refine import check_word_clipped_at_cuts
+
+        cut_warnings = check_word_clipped_at_cuts(plan_v2, root=paths.root)
     return {
         "plan_name": path.name,
         "group_id": group_id,
         "usage": usage,
         "timeline": plan_v2,
+        "cut_quality_warnings": cut_warnings,
     }
 
 

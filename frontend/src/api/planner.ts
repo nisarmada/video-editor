@@ -28,6 +28,7 @@ export type RunPlannerResponse = {
   group_id: string;
   usage: Record<string, unknown>;
   timeline: TimelineV2;
+  cut_quality_warnings?: string[];
 };
 
 /**

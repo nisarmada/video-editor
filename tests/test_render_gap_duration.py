@@ -11,11 +11,10 @@ from render_core import render_plan_data
 from timeline_format import v2_timeline_duration
 
 
-def test_rendered_duration_matches_timeline_end_with_gap(tmp_path: Path):
-    repo = Path(__file__).resolve().parents[1]
-    root = repo
-    footage = root / "footage" / "test_a.mp4"
-    assert footage.is_file(), f"missing test fixture: {footage}"
+def test_rendered_duration_matches_timeline_end_with_gap(
+    tmp_path: Path, render_project_root: Path
+) -> None:
+    root = render_project_root
 
     plan = {
         "schema_version": 2,

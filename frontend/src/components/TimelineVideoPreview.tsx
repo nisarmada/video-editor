@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTimelineAudio } from "../audio/useTimelineAudio";
+import { useTimelinePlaybackClock } from "../hooks/useTimelinePlaybackClock";
+import { requestFootageAnalyze } from "../api/planner";
 import {
   activeVideoClipAt,
-  clipTimelineDuration,
   clipDisplayName,
   getSortedVideoClips,
   proxyUrlFromSource,
@@ -11,16 +12,24 @@ import {
 } from "../timeline/duration";
 import { useCaptionPreviewOverlay } from "../hooks/useCaptionPreviewOverlay";
 import { useTimelineStore } from "../store/timelineStore";
+import { previewPunchInScale } from "../timeline/exportZoomPreview";
+import { videoFadeOpacityAt } from "../timeline/previewFades";
 import { formatTimecode } from "../utils/timeFormat";
 import { useKeybindingsStore } from "../store/keybindingsStore";
 import { useEditorSettingsStore } from "../store/editorSettingsStore";
 import { getBindingLabel, getBindingTitle } from "../shortcuts/tooltip";
 
-const SOURCE_END_EPS = 0.05;
+function footageBasename(source: string | undefined): string {
+  if (!source) return "clip";
+  const parts = source.split("/");
+  return parts[parts.length - 1] ?? source;
+}
 
 export default function TimelineVideoPreview() {
   useEditorSettingsStore((s) => s.shortcutTargeting);
   useEditorSettingsStore((s) => s.perActionTargetMode);
+  useTimelinePlaybackClock();
+
   const timeline = useTimelineStore((s) => s.timeline);
   const playhead = useTimelineStore((s) => s.playheadSeconds);
   const playing = useTimelineStore((s) => s.timelinePlaying);
@@ -33,12 +42,17 @@ export default function TimelineVideoPreview() {
   const prevClipIdRef = useRef<string | null>(null);
   const [audioMasterVolume, setAudioMasterVolume] = useState(1);
   const [audioMasterMuted, setAudioMasterMuted] = useState(false);
+  const [proxyErrorSource, setProxyErrorSource] = useState<string | null>(
+    null,
+  );
+  const [proxyRegenBusy, setProxyRegenBusy] = useState(false);
 
   useTimelineAudio({
     videoRef,
     masterVolume: audioMasterVolume,
     masterMuted: audioMasterMuted,
   });
+
   const clipsRef = useRef(getSortedVideoClips(timeline));
   clipsRef.current = getSortedVideoClips(timeline);
 
@@ -72,7 +86,7 @@ export default function TimelineVideoPreview() {
     debounceMs: 280,
   });
 
-  // Load proxy / seek when clip or paused scrub position changes (not every tick while playing).
+  // Follow master playhead: load proxy, seek, play/pause (never advance playhead here).
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !timeline) return;
@@ -86,6 +100,10 @@ export default function TimelineVideoPreview() {
       return;
     }
 
+    if (proxyErrorSource && activeClip.source !== proxyErrorSource) {
+      setProxyErrorSource(null);
+    }
+
     const wantTime = timelineToSourceSeconds(activeClip, playhead);
     const srcIn = activeClip.source_in ?? 0;
     const srcOut = activeClip.source_out ?? srcIn;
@@ -93,6 +111,9 @@ export default function TimelineVideoPreview() {
       Math.max(wantTime, srcIn),
       Math.max(srcOut - 1e-3, srcIn),
     );
+
+    const speed = activeClip.speed && activeClip.speed > 0 ? activeClip.speed : 1;
+    video.playbackRate = speed;
 
     const absUrl = new URL(proxyUrl, window.location.origin).href;
     const needNewSrc = !video.src || video.src !== absUrl;
@@ -115,126 +136,74 @@ export default function TimelineVideoPreview() {
       const onReady = () => {
         video.removeEventListener("loadedmetadata", onReady);
         doSeek();
+        if (playing && !proxyErrorSource) {
+          void video.play().catch(() => {});
+        }
       };
       video.addEventListener("loadedmetadata", onReady);
     } else {
-      // Same proxy URL: still seek when scrubbing (paused) or when the active clip changed
-      // (e.g. two timeline clips from the same file). Avoid seeking every frame while playing
-      // and the clip is unchanged — timeupdate keeps the playhead in sync.
       if (!playing || clipChanged) {
         doSeek();
       }
-    }
-  }, [timeline, clipId, proxyUrl, playing, playhead, activeClip]);
-
-  /**
-   * Single transport: `timelinePlaying` drives <video> only (no play()/pause() from rAF or timeupdate).
-   * Seek effect loads src + currentTime; this effect starts/stops playback when the proxy is ready.
-   */
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-
-    const syncFromStore = () => {
-      const pl = useTimelineStore.getState().timelinePlaying;
-      const hasClip = !!activeClip && !!proxyUrl;
-      if (!pl || !hasClip) {
+      if (playing && !proxyErrorSource) {
+        void video.play().catch(() => {});
+      } else if (!playing) {
         video.pause();
-        return;
       }
-      const absWant = new URL(proxyUrl!, window.location.origin).href;
-      if (!video.src || video.src !== absWant) {
-        return;
-      }
-      void video.play().catch((err: unknown) => {
-        if (err instanceof Error && err.name === "AbortError") return;
-        useTimelineStore.getState().setTimelinePlaying(false);
-      });
-    };
+    }
+  }, [
+    timeline,
+    clipId,
+    proxyUrl,
+    playing,
+    playhead,
+    activeClip,
+    proxyErrorSource,
+  ]);
 
-    video.addEventListener("loadedmetadata", syncFromStore);
-    syncFromStore();
-
-    return () => {
-      video.removeEventListener("loadedmetadata", syncFromStore);
-    };
-  }, [playing, activeClip, proxyUrl, clipId]);
-
-  // While playing inside a clip, don't fight timeupdate with seeks.
+  // Soft drift resync when video is playing (clock remains master).
   useEffect(() => {
     const video = videoRef.current;
-    if (!video) return;
+    if (!video || !playing || !activeClip) return;
 
-    const onTimeUpdate = () => {
+    const iv = window.setInterval(() => {
       if (!useTimelineStore.getState().timelinePlaying) return;
-      const clips = clipsRef.current;
-      const p = useTimelineStore.getState().playheadSeconds;
-      const clip = activeVideoClipAt(clips, p);
-      if (!clip) return;
-
-      const speed = clip.speed && clip.speed > 0 ? clip.speed : 1;
-      const srcIn = clip.source_in ?? 0;
-      const srcOut = clip.source_out ?? srcIn;
-      const st = video.currentTime;
-
-      if (st >= srcOut - SOURCE_END_EPS) {
-        const atEnd =
-          clip.timeline_start + clipTimelineDuration(clip, "video");
-        const tl = useTimelineStore.getState().timeline;
-        const maxT = tl ? timelineEnd(tl) : atEnd;
-        useTimelineStore.getState().setPlayheadSeconds(Math.min(atEnd, maxT));
-        return;
+      const ph = useTimelineStore.getState().playheadSeconds;
+      const clip = activeVideoClipAt(clipsRef.current, ph);
+      if (!clip || clip.id !== activeClip.id) return;
+      const want = timelineToSourceSeconds(clip, ph);
+      if (Math.abs(video.currentTime - want) > 0.25) {
+        video.currentTime = want;
       }
+    }, 400);
+    return () => clearInterval(iv);
+  }, [playing, activeClip?.id]);
 
-      const ph = clip.timeline_start + (st - srcIn) / speed;
-      useTimelineStore.getState().setPlayheadSeconds(ph);
-    };
+  const onVideoError = useCallback(() => {
+    if (activeClip?.source) {
+      setProxyErrorSource(activeClip.source);
+    }
+  }, [activeClip?.source]);
 
-    video.addEventListener("timeupdate", onTimeUpdate);
-    return () => video.removeEventListener("timeupdate", onTimeUpdate);
-  }, [timeline]);
-
-  // Drive playhead in gaps + ensure video plays in clips.
-  useEffect(() => {
-    if (!playing || !timeline) return;
-
-    let raf = 0;
-    let last = performance.now();
-
-    const step = (now: number) => {
-      const dt = (now - last) / 1000;
-      last = now;
-
-      const p = useTimelineStore.getState().playheadSeconds;
-      const clip = activeVideoClipAt(clipsRef.current, p);
-      const video = videoRef.current;
-
-      if (clip) {
-        /* Video play/pause is owned by timelinePlaying sync effect — not here. */
-        raf = requestAnimationFrame(step);
-        return;
-      }
-
-      if (video) video.pause();
-
-      const maxT = timelineEnd(timeline);
-      const next = p + dt;
-      if (next >= maxT - 1e-6) {
-        useTimelineStore.getState().setPlayheadSeconds(maxT);
-        useTimelineStore.getState().setTimelinePlaying(false);
-        return;
-      }
-      useTimelineStore.getState().setPlayheadSeconds(next);
-      raf = requestAnimationFrame(step);
-    };
-
-    raf = requestAnimationFrame(step);
-    return () => cancelAnimationFrame(raf);
-  }, [playing, timeline]);
+  const regenerateProxy = useCallback(async () => {
+    const name = footageBasename(proxyErrorSource ?? activeClip?.source);
+    if (!name) return;
+    setProxyRegenBusy(true);
+    try {
+      await requestFootageAnalyze({ names: [name] });
+      setProxyErrorSource(null);
+      useTimelineStore.getState().setShortcutToast(`Queued proxy for ${name}`);
+    } catch (e) {
+      useTimelineStore.getState().setUiBannerError(
+        e instanceof Error ? e.message : "Could not queue proxy",
+      );
+    } finally {
+      setProxyRegenBusy(false);
+    }
+  }, [proxyErrorSource, activeClip?.source]);
 
   const kbOverrides = useKeybindingsStore((s) => s.overrides);
   const playPauseTitle = getBindingTitle("play_pause", kbOverrides);
-
   const onToggle = () => togglePlaying();
 
   if (!timeline) {
@@ -244,6 +213,15 @@ export default function TimelineVideoPreview() {
   }
 
   const inGap = !activeClip;
+  const punchScale = previewPunchInScale(activeClip?.zoom);
+  const videoOpacity =
+    activeClip && !inGap
+      ? videoFadeOpacityAt(activeClip, playhead)
+      : 1;
+
+  const showProxyError =
+    proxyErrorSource &&
+    activeClip?.source === proxyErrorSource;
 
   return (
     <div className="timeline-video-preview">
@@ -256,17 +234,44 @@ export default function TimelineVideoPreview() {
         </span>
       </div>
 
+      {showProxyError && (
+        <p className="panel-message panel-message--error" role="alert">
+          Proxy not available for {footageBasename(proxyErrorSource)}.{" "}
+          <button
+            type="button"
+            className="btn"
+            disabled={proxyRegenBusy}
+            onClick={() => void regenerateProxy()}
+          >
+            {proxyRegenBusy ? "Queueing…" : "Regenerate"}
+          </button>
+        </p>
+      )}
+
       <div className="preview-frame preview-frame--video preview-frame--timeline">
         <div
-          className={`preview-video-wrap${safeAreaGuide ? " preview-video-wrap--safe" : ""}`}
+          className={
+            `preview-video-wrap${safeAreaGuide ? " preview-video-wrap--safe" : ""}` +
+            (punchScale > 1 ? " preview-video-wrap--punch" : "")
+          }
         >
           <video
             ref={videoRef}
-            className={`preview-video${inGap ? " preview-video--hidden" : ""}`}
+            className={`preview-video${inGap || showProxyError ? " preview-video--hidden" : ""}`}
             playsInline
             preload="auto"
             muted
             onClick={onToggle}
+            onError={onVideoError}
+            style={{
+              ...(punchScale > 1
+                ? {
+                    transform: `scale(${punchScale})`,
+                    transformOrigin: "center center",
+                  }
+                : {}),
+              opacity: videoOpacity < 0.999 ? videoOpacity : undefined,
+            }}
           />
           {safeAreaGuide && <div className="preview-safe-area" aria-hidden />}
         </div>

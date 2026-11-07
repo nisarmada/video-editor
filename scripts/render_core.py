@@ -33,6 +33,20 @@ def resolve_source(raw: str, root: Path) -> Path:
     raise FileNotFoundError(f"Source not found: {raw}")
 
 
+def _optional_float(seg: dict, key: str) -> float | None:
+    if seg.get(key) is None:
+        return None
+    try:
+        return float(seg[key])
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_transition(seg: dict) -> dict | None:
+    tr = seg.get("transition_out")
+    return tr if isinstance(tr, dict) else None
+
+
 def _segment_transform(seg: dict) -> tuple[float, float, float | None]:
     speed = float(seg["speed"]) if seg.get("speed") is not None else 1.0
     volume = float(seg["volume"]) if seg.get("volume") is not None else 1.0
@@ -71,6 +85,11 @@ def parse_segments(segments_raw: list[dict], root: Path) -> list[TimelinePiece]:
                 speed=speed,
                 volume=volume,
                 zoom=zoom,
+                audio_fade_in=_optional_float(seg, "audio_fade_in"),
+                audio_fade_out=_optional_float(seg, "audio_fade_out"),
+                video_fade_in=_optional_float(seg, "video_fade_in"),
+                video_fade_out=_optional_float(seg, "video_fade_out"),
+                transition_out=_optional_transition(seg),
                 embed_audio_silent=embed_silent,
             )
         )
@@ -85,6 +104,15 @@ def collect_audio_branches(plan_data: dict, root: Path) -> list[AudioBranch]:
     for tr in get_tracks(plan_data, "audio"):
         if tr.get("muted"):
             continue
+        track_vol = (
+            float(tr["volume"])
+            if tr.get("volume") is not None
+            else 1.0
+        )
+        duck_under = tr.get("duck_under_track_id")
+        duck_gain = (
+            float(tr["duck_gain"]) if tr.get("duck_gain") is not None else None
+        )
         clips = sorted(
             tr.get("clips") or [],
             key=lambda c: float(c["timeline_start"]),
@@ -98,7 +126,8 @@ def collect_audio_branches(plan_data: dict, root: Path) -> list[AudioBranch]:
             except FileNotFoundError:
                 continue
             speed = float(c.get("speed") or 1.0) or 1.0
-            volume = float(c.get("volume")) if c.get("volume") is not None else 1.0
+            clip_vol = float(c.get("volume")) if c.get("volume") is not None else 1.0
+            volume = clip_vol * track_vol
             out.append(
                 AudioBranch(
                     path=path,
@@ -107,6 +136,13 @@ def collect_audio_branches(plan_data: dict, root: Path) -> list[AudioBranch]:
                     speed=speed,
                     volume=volume,
                     timeline_start=float(c["timeline_start"]),
+                    audio_fade_in=_optional_float(c, "audio_fade_in"),
+                    audio_fade_out=_optional_float(c, "audio_fade_out"),
+                    source_track_id=str(tr.get("id") or ""),
+                    duck_under_track_id=(
+                        str(duck_under) if isinstance(duck_under, str) and duck_under.strip() else None
+                    ),
+                    duck_gain=duck_gain,
                 )
             )
     return out

@@ -33,6 +33,11 @@ export default function SettingsPanel({
   const [maxLength, setMaxLength] = useState("");
   const [keyInput, setKeyInput] = useState("");
   const [testStatus, setTestStatus] = useState<string | null>(null);
+  const [cutRefineOn, setCutRefineOn] = useState(true);
+  const [preRollMs, setPreRollMs] = useState("120");
+  const [postRollMs, setPostRollMs] = useState("150");
+  const [snapWinMs, setSnapWinMs] = useState("80");
+  const [cutFadeMs, setCutFadeMs] = useState("20");
 
   useEffect(() => {
     if (!open) return;
@@ -52,6 +57,12 @@ export default function SettingsPanel({
             : "",
         );
         setTestStatus(null);
+        const acr = data.audio_cut_refine ?? {};
+        setCutRefineOn(acr.enabled !== false);
+        setPreRollMs(String(acr.pre_roll_ms ?? 120));
+        setPostRollMs(String(acr.post_roll_ms ?? 150));
+        setSnapWinMs(String(acr.snap_window_ms ?? 80));
+        setCutFadeMs(String(acr.fade_ms ?? 20));
       })
       .catch((e: unknown) => {
         setUiBannerError(
@@ -212,6 +223,84 @@ export default function SettingsPanel({
                 Output
                 <input value={output} onChange={(e) => setOutput(e.target.value)} />
               </label>
+            </section>
+
+            <section className="settings-block">
+              <h3>Narration cut refine</h3>
+              <p className="settings-hint">
+                Applied when the planner saves a plan and on Replace timeline / Refine
+                cuts. Turn off to keep planner trims verbatim.
+              </p>
+              <label className="settings-inline">
+                <input
+                  type="checkbox"
+                  checked={cutRefineOn}
+                  onChange={(e) => setCutRefineOn(e.target.checked)}
+                />
+                Enable automatic refine
+              </label>
+              <label className="settings-label">
+                Pre-roll (ms)
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  value={preRollMs}
+                  onChange={(e) => setPreRollMs(e.target.value)}
+                />
+              </label>
+              <label className="settings-label">
+                Post-roll (ms)
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  value={postRollMs}
+                  onChange={(e) => setPostRollMs(e.target.value)}
+                />
+              </label>
+              <label className="settings-label">
+                Snap window (ms)
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  value={snapWinMs}
+                  onChange={(e) => setSnapWinMs(e.target.value)}
+                />
+              </label>
+              <label className="settings-label">
+                Fade (ms)
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  value={cutFadeMs}
+                  onChange={(e) => setCutFadeMs(e.target.value)}
+                />
+              </label>
+              <button
+                type="button"
+                className="btn btn--primary"
+                disabled={loading}
+                onClick={() => {
+                  const num = (s: string, fb: number) => {
+                    const n = Number(s);
+                    return Number.isFinite(n) ? n : fb;
+                  };
+                  void putSettings({
+                    audio_cut_refine: {
+                      enabled: cutRefineOn,
+                      pre_roll_ms: num(preRollMs, 120),
+                      post_roll_ms: num(postRollMs, 150),
+                      snap_window_ms: num(snapWinMs, 80),
+                      fade_ms: num(cutFadeMs, 20),
+                    },
+                  })
+                    .then(setS)
+                    .catch((e: unknown) =>
+                      setUiBannerError(e instanceof Error ? e.message : "Save failed"),
+                    );
+                }}
+              >
+                Save cut refine settings
+              </button>
             </section>
 
             <section className="settings-block">

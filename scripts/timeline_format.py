@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from caption_style import validate_caption_style_dict, validate_style_override
+from edit_vocab import validate_fade_fields
 
 SCHEMA_V2 = 2
 MIN_CLIP_SECONDS = 0.3
@@ -87,6 +88,9 @@ def flatten_v2_to_v1_segments(data: dict) -> list[dict]:
         return []
     ttype = "video"
     track_muted = bool(video.get("muted"))
+    track_vol = (
+        float(video["volume"]) if video.get("volume") is not None else 1.0
+    )
     clips = sorted(video.get("clips") or [], key=lambda c: float(c["timeline_start"]))
     segments: list[dict] = []
     timeline_cursor = 0.0
@@ -120,8 +124,20 @@ def flatten_v2_to_v1_segments(data: dict) -> list[dict]:
             seg["zoom"] = c["zoom"]
         if c.get("speed") is not None:
             seg["speed"] = float(c["speed"])
-        if c.get("volume") is not None:
-            seg["volume"] = float(c["volume"])
+        clip_vol = float(c["volume"]) if c.get("volume") is not None else 1.0
+        eff_vol = clip_vol * track_vol
+        if eff_vol != 1.0:
+            seg["volume"] = eff_vol
+        for fk in (
+            "audio_fade_in",
+            "audio_fade_out",
+            "video_fade_in",
+            "video_fade_out",
+        ):
+            if c.get(fk) is not None:
+                seg[fk] = float(c[fk])
+        if isinstance(c.get("transition_out"), dict):
+            seg["transition_out"] = c["transition_out"]
         detached = c.get("audio_source") == "detached"
         if track_muted or detached:
             seg["embed_audio_silent"] = True
@@ -215,6 +231,11 @@ def validate_v2_clips_on_track(
                     errors.append(f"{label}: source not found: {clip['source']}")
                 except RuntimeError as e:
                     errors.append(f"{label}: {e}")
+                try:
+                    dur = clip_timeline_duration(clip, ttype or "video")
+                except (TypeError, ValueError):
+                    dur = 0.0
+                errors.extend(validate_fade_fields(clip, label, dur))
 
         elif ttype == "caption":
             if not clip.get("text"):
@@ -285,6 +306,15 @@ def validate_v2_data(
                 float(tv)
             except (TypeError, ValueError):
                 errors.append(f"Track {tid!r}: volume must be a number if set.")
+        if ttype == "audio":
+            dg = track.get("duck_gain")
+            if dg is not None:
+                try:
+                    g = float(dg)
+                    if g < 0 or g > 1:
+                        errors.append(f"Track {tid!r}: duck_gain must be between 0 and 1.")
+                except (TypeError, ValueError):
+                    errors.append(f"Track {tid!r}: duck_gain must be a number.")
         if mu is not None and ttype == "caption":
             errors.append(f"Track {tid!r}: caption track must not set muted.")
         if ttype == "video" and (track.get("clips") or []):

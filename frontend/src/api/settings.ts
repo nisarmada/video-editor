@@ -11,6 +11,16 @@ export type EditorUiSettingsPayload = {
   >;
 };
 
+export type AudioCutRefineSettings = {
+  enabled?: boolean;
+  pre_roll_ms?: number;
+  post_roll_ms?: number;
+  snap_window_ms?: number;
+  fade_ms?: number;
+  join_crossfade_ms?: number;
+  energy_disagree_ms?: number;
+};
+
 export type PublicSettings = {
   planner_api_key_configured: boolean;
   paths: { footage: string; plans: string; output: string };
@@ -18,6 +28,7 @@ export type PublicSettings = {
   /** User shortcut overrides; omitted or {} if unset */
   keybindings?: KeybindingOverridesMap;
   ui?: EditorUiSettingsPayload;
+  audio_cut_refine?: AudioCutRefineSettings;
 };
 
 export async function fetchSettings(): Promise<PublicSettings> {
@@ -32,6 +43,7 @@ export async function putSettings(body: {
   render_defaults?: { captions?: boolean; max_length?: number | null };
   keybindings?: KeybindingOverridesMap | null;
   ui?: EditorUiSettingsPayload | null;
+  audio_cut_refine?: AudioCutRefineSettings | null;
 }): Promise<PublicSettings> {
   const res = await apiRequest("/api/settings", {
     method: "PUT",

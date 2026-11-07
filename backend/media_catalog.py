@@ -165,11 +165,28 @@ def build_media_catalog(
             caps = load_json(captions_path(clip_path))
 
         transcript_segments: list[Any]
+        transcript_words: list[dict[str, Any]] = []
         if tr_status == COMPLETE:
             segs = tr_doc.get("segments") if isinstance(tr_doc, dict) else []
             transcript_segments = segs if isinstance(segs, list) else []
             if not transcript_segments:
                 transcript_segments = [{"note": "no speech detected"}]
+            for seg in transcript_segments:
+                if not isinstance(seg, dict):
+                    continue
+                for w in seg.get("words") or []:
+                    if not isinstance(w, dict):
+                        continue
+                    try:
+                        transcript_words.append(
+                            {
+                                "word": w.get("word"),
+                                "start": round(float(w["start"]), 4),
+                                "end": round(float(w["end"]), 4),
+                            }
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        continue
         else:
             transcript_segments = [{"note": NOT_ANALYZED}]
 
@@ -203,6 +220,7 @@ def build_media_catalog(
                 "waveform_peaks": _waveform_summary(clip_path),
             },
             "transcript_segments": transcript_segments,
+            "transcript_words": transcript_words,
             "silences": silences_list,
             "silence_ratio_estimate": sil_ratio,
             "shots": shots_raw if kind == "video" else [],

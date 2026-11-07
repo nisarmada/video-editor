@@ -20,6 +20,7 @@ import {
   timelineToSourceSeconds,
   proxyUrlFromSource,
 } from "../timeline/duration";
+import { audioFadeGainAt } from "../timeline/previewFades";
 import type { TimelineClip, TimelineV2 } from "../timeline/types";
 import { useTimelineStore } from "../store/timelineStore";
 import {
@@ -337,9 +338,10 @@ export function useTimelineAudio(opts: TimelineAudioOptions): void {
         const tv = voice.trackVolume;
 
         slot.audio.playbackRate = speed;
+        const fadeG = audioFadeGainAt(clip, voice.trackType, ph);
         slot.audio.volume = Math.max(
           0,
-          Math.min(1, cvol * tv),
+          Math.min(1, cvol * tv * fadeG),
         );
 
         const mt = mediaTimeForVoice(voice, ph, video);
@@ -363,7 +365,7 @@ export function useTimelineAudio(opts: TimelineAudioOptions): void {
         }
 
         void slot.audio.play().catch(() => {
-          useTimelineStore.getState().setTimelinePlaying(false);
+          /* Clock keeps running; missing proxy/decoding is surfaced on the video element. */
         });
       }
     };

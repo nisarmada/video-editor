@@ -40,10 +40,14 @@ import {
 import type { CaptionStyle, TimelineV2 } from "../timeline/types";
 import { findClipById, pruneClipIds } from "../timeline/selection";
 import { clipTimelineDuration } from "../timeline/duration";
+import { timelinePlaybackQualityWarning } from "../timeline/playbackClock";
 import type { GroupMovePlan } from "../timeline/groupMove";
 
 /** Human-readable line after planner succeeds (toast + optional inline). */
-function summarizePlannerTimeline(tl: TimelineV2): string {
+function summarizePlannerTimeline(
+  tl: TimelineV2,
+  cutWarnings?: string[],
+): string {
   let videoClips = 0;
   let audioTracksWithClips = 0;
   for (const tr of tl.tracks ?? []) {
@@ -52,7 +56,14 @@ function summarizePlannerTimeline(tl: TimelineV2): string {
     if (tr.type === "video") videoClips += n;
     if (tr.type === "audio") audioTracksWithClips += 1;
   }
-  return `Generated timeline with ${videoClips} video clip${videoClips === 1 ? "" : "s"} and ${audioTracksWithClips} audio track${audioTracksWithClips === 1 ? "" : "s"}.`;
+  const base = `Generated timeline with ${videoClips} video clip${videoClips === 1 ? "" : "s"} and ${audioTracksWithClips} audio track${audioTracksWithClips === 1 ? "" : "s"}.`;
+  const quality = timelinePlaybackQualityWarning(tl);
+  let out = quality ? `${base} ${quality}` : base;
+  if (cutWarnings?.length) {
+    out += ` Cut check: ${cutWarnings[0]}`;
+    if (cutWarnings.length > 1) out += ` (+${cutWarnings.length - 1} more)`;
+  }
+  return out;
 }
 
 export const DEFAULT_PLAN_NAME = "draft1_v2";
@@ -298,6 +309,8 @@ type TimelineViewState = {
 
   /** Delete all selected clips — one undo step. */
   deleteSelectedClip: () => Promise<TimelineInverseOp>;
+  /** Word-safe narration trim on selected audio clips (one undo). */
+  refineSelectedAudioCuts: () => Promise<TimelineInverseOp | void>;
   moveClipsToPlans: (plans: GroupMovePlan[]) => Promise<TimelineInverseOp>;
   setClipPropertyBatch: (
     clipIds: string[],
@@ -976,6 +989,10 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
     set({ applyOperationInProgress: true, opErrorMessage: null });
     try {
       const result = await fetchApplyOp(timeline, op.operation, op.arguments ?? {});
+      if (result.refinement_report?.summary) {
+        get().setShortcutToast(result.refinement_report.summary);
+        window.setTimeout(() => get().setShortcutToast(null), 8000);
+      }
       set((s) => {
         const pruned = pruneClipIds(result.timeline, s.selectedClipIds);
         const anchor =
@@ -1129,6 +1146,27 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
       throw new Error("No clip selected");
     }
     return get().deleteClipsByIds(ids);
+  },
+
+  refineSelectedAudioCuts: async () => {
+    const { timeline, selectedClipIds } = get();
+    if (!timeline || selectedClipIds.length === 0) {
+      throw new Error("Select narration (audio) clips first.");
+    }
+    const audioIds = new Set<string>();
+    for (const tr of timeline.tracks ?? []) {
+      if (tr.type !== "audio") continue;
+      for (const c of tr.clips ?? []) {
+        if (c.id && selectedClipIds.includes(c.id)) audioIds.add(c.id);
+      }
+    }
+    if (audioIds.size === 0) {
+      throw new Error("Refine cuts applies to audio-track clips only.");
+    }
+    return get().applyOperation({
+      operation: "refine_audio_cuts",
+      arguments: { clip_ids: [...audioIds] },
+    });
   },
 
   moveClipsToPlans: async (plans) => {
@@ -1505,11 +1543,15 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
           isDirty: false,
           saveStatus: "saved",
           saveError: null,
-          plannerSuccessSummary: summarizePlannerTimeline(doneTl),
+          plannerSuccessSummary: summarizePlannerTimeline(
+            doneTl,
+            result.cut_quality_warnings,
+          ),
           selectedClipId: null,
           selectedClipIds: [],
         });
-        get().setShortcutToast(summarizePlannerTimeline(doneTl));
+        const sum = summarizePlannerTimeline(doneTl, result.cut_quality_warnings);
+        get().setShortcutToast(sum);
         window.setTimeout(() => get().setShortcutToast(null), 6000);
         return;
       }
