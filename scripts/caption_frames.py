@@ -151,7 +151,17 @@ def main() -> None:
     keyframes = kf_doc["keyframes"]
     print(f"Found {len(keyframes)} keyframe(s) to caption.")
 
-    model = os.environ.get("ANTHROPIC_CAPTION_MODEL", DEFAULT_MODEL)
+    # Env wins. Otherwise the cheap triage model from Settings (same Haiku default).
+    env_model = os.environ.get("ANTHROPIC_CAPTION_MODEL", "").strip()
+    if env_model:
+        model = env_model
+    else:
+        try:
+            from planner_limits import load_planner_settings
+
+            model = str(load_planner_settings(Path.cwd()).get("triage_model") or DEFAULT_MODEL)
+        except Exception:
+            model = DEFAULT_MODEL
     try:
         frames = caption_keyframes(keyframes, model)
     except Exception as e:

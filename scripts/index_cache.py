@@ -39,8 +39,37 @@ def waveform_path(video: Path) -> Path:
     return index_dir() / f"{video.stem}_waveform.json"
 
 
+def embedding_path(video: Path) -> Path:
+    """Cached local text embedding for ranking a file against a brief."""
+    return index_dir() / f"{video.stem}_embed.json"
+
+
+def planner_usage_path() -> Path:
+    """Per-day planner token totals. Not a per-clip artifact."""
+    return index_dir() / "planner_usage.json"
+
+
 def keyframes_dir(video: Path) -> Path:
     return index_dir() / "keyframes" / video.stem
+
+
+def perception_path(video: Path) -> Path:
+    """Per-shot color, motion, shake, and downscaled vision JPEGs (no paid API)."""
+    return index_dir() / f"{video.stem}_perception.json"
+
+
+def audio_perception_path(video: Path) -> Path:
+    """LUFS, loudness range, 1s class windows, speech rate, fillers, pauses."""
+    return index_dir() / f"{video.stem}_audio_perception.json"
+
+
+def takes_path(video: Path) -> Path:
+    """Phrase-grouped speech takes with delivery measurements."""
+    return index_dir() / f"{video.stem}_takes.json"
+
+
+def perception_dir(video: Path) -> Path:
+    return index_dir() / "perception" / video.stem
 
 
 def load_json(path: Path) -> dict | list | None:

@@ -16,7 +16,6 @@ import {
   findClipById,
   allClipIds,
   orderedTracks,
-  readClipFromClipboard,
   readClipboardPayload,
 } from "../timeline/selection";
 import { timelineEnd, clipTimelineDuration } from "../timeline/duration";

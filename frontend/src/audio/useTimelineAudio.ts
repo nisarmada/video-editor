@@ -20,7 +20,9 @@ import {
   timelineToSourceSeconds,
   proxyUrlFromSource,
 } from "../timeline/duration";
+import { duckFactorForTrack } from "../timeline/duckEnvelope";
 import { audioFadeGainAt } from "../timeline/previewFades";
+import type { TimelineTrack } from "../timeline/types";
 import type { TimelineClip, TimelineV2 } from "../timeline/types";
 import { useTimelineStore } from "../store/timelineStore";
 import {
@@ -49,6 +51,7 @@ type ActiveVoice = {
   key: string;
   proxyUrl: string;
   clip: TimelineClip;
+  track: TimelineTrack;
   trackType: "video" | "audio";
   syncToVideo: boolean;
   trackVolume: number;
@@ -121,6 +124,7 @@ function activeAudioVoices(
           key: `v:${clip.id}`,
           proxyUrl: proxyUrlFromSource(clip.source),
           clip,
+          track: tr,
           trackType: "video",
           syncToVideo: activeVideo?.id === clip.id,
           trackVolume: trackVol,
@@ -130,6 +134,7 @@ function activeAudioVoices(
           key: `a:${clip.id}`,
           proxyUrl: proxyUrlFromSource(clip.source),
           clip,
+          track: tr,
           trackType: "audio",
           syncToVideo: false,
           trackVolume: trackVol,
@@ -339,9 +344,13 @@ export function useTimelineAudio(opts: TimelineAudioOptions): void {
 
         slot.audio.playbackRate = speed;
         const fadeG = audioFadeGainAt(clip, voice.trackType, ph);
+        const duck =
+          voice.trackType === "audio"
+            ? duckFactorForTrack(tl, voice.track, ph)
+            : 1;
         slot.audio.volume = Math.max(
           0,
-          Math.min(1, cvol * tv * fadeG),
+          Math.min(1, cvol * tv * fadeG * duck),
         );
 
         const mt = mediaTimeForVoice(voice, ph, video);

@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTimelineStore } from "../store/timelineStore";
+import { requestFootageRetranscribe } from "../api/footage";
+import SourceTakesPanel from "./SourceTakesPanel";
 import { formatDuration, formatTimecode } from "../utils/timeFormat";
 
 export default function SourcePreview() {
   const selectedName = useTimelineStore((s) => s.selectedFootageName);
   const clips = useTimelineStore((s) => s.footageClips);
+  const sourcePlaybackRequest = useTimelineStore((s) => s.sourcePlaybackRequest);
 
   const clip = useMemo(() => {
     if (!selectedName) return null;
@@ -15,6 +18,9 @@ export default function SourcePreview() {
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [mediaDuration, setMediaDuration] = useState<number | null>(null);
+  const [retranscribeBusy, setRetranscribeBusy] = useState(false);
+  const [retranscribeMsg, setRetranscribeMsg] = useState<string | null>(null);
+  const fetchFootage = useTimelineStore((s) => s.fetchFootage);
 
   const displayDuration = mediaDuration ?? clip?.duration_seconds ?? null;
 
@@ -37,6 +43,30 @@ export default function SourcePreview() {
     video.src = clip.proxy_url;
     video.load();
   }, [clip]);
+
+  useEffect(() => {
+    if (!sourcePlaybackRequest || !clip) return;
+    const video = videoRef.current;
+    if (!video) return;
+    const { start, end } = sourcePlaybackRequest;
+    const playRange = () => {
+      video.currentTime = Math.max(0, start);
+      void video.play();
+    };
+    if (video.readyState >= 1) {
+      playRange();
+    } else {
+      video.addEventListener("loadedmetadata", playRange, { once: true });
+    }
+    const onTime = () => {
+      if (video.currentTime >= end) {
+        video.pause();
+        video.currentTime = start;
+      }
+    };
+    video.addEventListener("timeupdate", onTime);
+    return () => video.removeEventListener("timeupdate", onTime);
+  }, [sourcePlaybackRequest, clip]);
 
   const togglePlay = useCallback(() => {
     const video = videoRef.current;
@@ -89,7 +119,44 @@ export default function SourcePreview() {
         <span className="source-preview__duration">
           {formatDuration(displayDuration)}
         </span>
+        {(clip.has_audio ?? true) && (
+          <button
+            type="button"
+            className="btn btn--ghost source-preview__retranscribe"
+            disabled={retranscribeBusy}
+            title="Re-run Whisper with current transcription settings (keeps word timestamps)"
+            onClick={() => {
+              if (
+                !window.confirm(
+                  `Re-transcribe "${clip.name}"? This rebuilds transcript, silences, audio metrics, takes, and embeddings.`,
+                )
+              ) {
+                return;
+              }
+              setRetranscribeBusy(true);
+              setRetranscribeMsg(null);
+              void requestFootageRetranscribe(clip.name)
+                .then(() => {
+                  setRetranscribeMsg("Queued re-transcription.");
+                  void fetchFootage({ silent: true });
+                })
+                .catch((e: unknown) => {
+                  setRetranscribeMsg(
+                    e instanceof Error ? e.message : "Re-transcribe failed",
+                  );
+                })
+                .finally(() => setRetranscribeBusy(false));
+            }}
+          >
+            {retranscribeBusy ? "Queuing…" : "Re-transcribe"}
+          </button>
+        )}
       </div>
+      {retranscribeMsg && (
+        <p className="panel-message" role="status">
+          {retranscribeMsg}
+        </p>
+      )}
 
       <div className="preview-frame preview-frame--video">
         <video
@@ -130,6 +197,7 @@ export default function SourcePreview() {
         onChange={(e) => onScrub(Number(e.target.value))}
         aria-label="Scrub source video"
       />
+      <SourceTakesPanel />
     </div>
   );
 }

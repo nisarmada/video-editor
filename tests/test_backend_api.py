@@ -191,9 +191,6 @@ def test_planner_run_mock(client: TestClient, monkeypatch):
     def fake_plan(brief: str, **kwargs):
         return tl, "group-1", {"input_tokens": 1, "output_tokens": 2}
 
-    monkeypatch.setattr(
-        "backend.main.list_unanalyzed_for_planning", lambda root, cf: []
-    )
     monkeypatch.setattr("backend.main.generate_plan", fake_plan)
     r = client.post(
         "/api/planner/run",
@@ -204,6 +201,84 @@ def test_planner_run_mock(client: TestClient, monkeypatch):
     assert r.json()["plan_name"] == "auto.json"
 
 
+def test_planner_full_mode_is_refused(client: TestClient, monkeypatch):
+    def boom(*args, **kwargs):
+        raise AssertionError("full mode must not call generate_plan")
+
+    monkeypatch.setattr("backend.main.generate_plan", boom)
+    r = client.post(
+        "/api/planner/run",
+        json={"brief": "10s test", "save_as": "auto", "mode": "full"},
+    )
+    assert r.status_code == 400
+    assert "Draft" in r.text
+
+
+def test_planner_estimate_does_not_call_the_model(client: TestClient, monkeypatch):
+    def boom(*args, **kwargs):
+        raise AssertionError("estimate must not call generate_plan")
+
+    monkeypatch.setattr("backend.main.generate_plan", boom)
+    monkeypatch.setattr(
+        "backend.main.prepare_planner_context",
+        lambda *args, **kwargs: {
+            "file_count": 6,
+            "omitted": 0,
+            "unanalyzed": ["raw.mov"],
+            "input_tokens": 9000,
+            "est_cost_usd": 0.04,
+            "confirm": False,
+            "model": "claude-sonnet-5-5",
+            "catalog_build_ms": 12,
+        },
+    )
+    r = client.post("/api/planner/estimate", json={"brief": "30s reel"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["file_count"] == 6
+    assert body["input_tokens"] == 9000
+    assert body["est_cost_usd"] == 0.04
+    assert body["unanalyzed"] == ["raw.mov"]
+
+
+def test_catalog_detail_slices_words(client: TestClient, monkeypatch):
+    monkeypatch.setattr(
+        "backend.main.build_media_catalog",
+        lambda *args, **kwargs: (
+            [
+                {
+                    "id": "clip.mp4",
+                    "transcript_words": [
+                        {"start": 0.0, "end": 0.4, "text": "hi"},
+                        {"start": 5.0, "end": 5.4, "text": "later"},
+                    ],
+                    "shots": [{"start": 0, "end": 1}],
+                    "keyframes": [],
+                    "ai_frame_captions": [],
+                }
+            ],
+            [],
+        ),
+    )
+    r = client.get(
+        "/api/media/catalog/detail",
+        params={"name": "clip.mp4", "start": 0, "end": 1},
+    )
+    assert r.status_code == 200
+    assert [word["text"] for word in r.json()["transcript_words"]] == ["hi"]
+
+
+def test_planner_settings_roundtrip(client: TestClient):
+    r = client.put(
+        "/api/settings",
+        json={"planner": {"catalog_token_budget": 4000, "confirm_above_usd": 0.2}},
+    )
+    assert r.status_code == 200
+    planner = r.json()["planner"]
+    assert planner["catalog_token_budget"] == 4000
+    assert planner["confirm_above_usd"] == 0.2
+
+
 def test_planner_run_passes_style_ids(client: TestClient, monkeypatch, tmp_path: Path):
     tl = _minimal_v2()
     captured: dict = {}
@@ -212,9 +287,6 @@ def test_planner_run_passes_style_ids(client: TestClient, monkeypatch, tmp_path:
         captured.update(kwargs)
         return tl, "g", {}
 
-    monkeypatch.setattr(
-        "backend.main.list_unanalyzed_for_planning", lambda root, cf: []
-    )
     monkeypatch.setattr("backend.main.generate_plan", fake_plan)
     r = client.post(
         "/api/planner/run",

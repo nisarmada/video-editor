@@ -20,8 +20,11 @@ from index_cache import (  # noqa: E402
     keyframes_path,
     load_json,
     merged_index_path,
+    audio_perception_path,
+    perception_path,
     silences_path,
     shots_path,
+    takes_path,
     transcript_path,
     waveform_path,
 )
@@ -45,6 +48,96 @@ def _file_kind(name: str) -> str:
 def _analysis_file_status(path: Path) -> str:
     """Whether a cached JSON artifact exists on disk."""
     return COMPLETE if path.is_file() else NOT_ANALYZED
+
+
+def _takes_summary(doc: dict | None) -> dict[str, Any]:
+    if not isinstance(doc, dict):
+        return {"status": NOT_ANALYZED}
+    if doc.get("has_audio") is False:
+        return {"status": COMPLETE, "has_audio": False, "take_count": 0}
+    if "has_speech" not in doc and doc.get("takes") is None:
+        return {"status": NOT_ANALYZED}
+    takes = doc.get("takes") if isinstance(doc.get("takes"), list) else []
+    groups = doc.get("phrase_groups") if isinstance(doc.get("phrase_groups"), list) else []
+    compact: list[dict[str, Any]] = []
+    for row in takes:
+        if not isinstance(row, dict):
+            continue
+        text = str(row.get("text") or "")
+        compact.append(
+            {
+                "take_index": row.get("take_index"),
+                "phrase_group": row.get("phrase_group"),
+                "start": row.get("start"),
+                "end": row.get("end"),
+                "speech_rate_wpm": row.get("speech_rate_wpm"),
+                "ends_complete_sentence": row.get("ends_complete_sentence"),
+                "is_restart": row.get("is_restart"),
+                "abandoned_sentence": row.get("abandoned_sentence"),
+                "text_preview": text[:72] + ("…" if len(text) > 72 else ""),
+            }
+        )
+    return {
+        "status": COMPLETE,
+        "has_speech": bool(doc.get("has_speech")),
+        "take_count": len(takes),
+        "phrase_group_count": len(groups),
+        "takes_compact": compact,
+    }
+
+
+def _audio_perception_summary(doc: dict | None) -> dict[str, Any]:
+    if not isinstance(doc, dict):
+        return {"status": NOT_ANALYZED}
+    if doc.get("has_audio") is False:
+        return {"status": COMPLETE, "has_audio": False}
+    if doc.get("has_audio") is not True and not doc.get("windows"):
+        return {"status": NOT_ANALYZED}
+    counts = doc.get("window_class_counts") if isinstance(doc.get("window_class_counts"), dict) else {}
+    return {
+        "status": COMPLETE,
+        "has_audio": True,
+        "loudness_lufs": doc.get("loudness_lufs"),
+        "loudness_range_lu": doc.get("loudness_range_lu"),
+        "dynamic_range_db": doc.get("dynamic_range_db"),
+        "speech_rate_wpm": doc.get("speech_rate_wpm"),
+        "filler_count": doc.get("filler_count"),
+        "pause_ratio": doc.get("pause_ratio"),
+        "longest_pause_s": doc.get("longest_pause_s"),
+        "window_class_counts": counts,
+    }
+
+
+def _perception_summary(doc: dict | None) -> dict[str, Any]:
+    """Roll shot-level numbers up for the catalog (no labels or verdicts)."""
+    if not isinstance(doc, dict):
+        return {"status": NOT_ANALYZED}
+    shots = doc.get("shots") or []
+    if not isinstance(shots, list) or not shots:
+        return {"status": NOT_ANALYZED, "shot_count": 0}
+    motion = [s.get("motion_level") for s in shots if isinstance(s, dict)]
+    shake = [s.get("shake_score") for s in shots if isinstance(s, dict)]
+    bright = [s.get("mean_brightness") for s in shots if isinstance(s, dict)]
+    contrast = [s.get("contrast") for s in shots if isinstance(s, dict)]
+    faces = [
+        int(s.get("face_sample_hits") or 0) > 0
+        for s in shots
+        if isinstance(s, dict) and int(s.get("face_samples") or 0) > 0
+    ]
+
+    def _mean(nums: list) -> float | None:
+        vals = [float(x) for x in nums if isinstance(x, (int, float))]
+        return round(float(sum(vals) / len(vals)), 4) if vals else None
+
+    return {
+        "status": COMPLETE,
+        "shot_count": len(shots),
+        "mean_motion_level": _mean(motion),
+        "mean_shake_score": _mean(shake),
+        "mean_brightness": _mean(bright),
+        "mean_contrast": _mean(contrast),
+        "shots_with_face_samples": sum(1 for hit in faces if hit),
+    }
 
 
 def _silence_ratio(duration: float, silences: list[dict] | None) -> float | None:
@@ -164,6 +257,25 @@ def build_media_catalog(
         if caps is None:
             caps = load_json(captions_path(clip_path))
 
+        perception_doc = merged_data.get("perception") if merged_data else None
+        if perception_doc is None:
+            perception_doc = load_json(perception_path(clip_path))
+        perception_summary = _perception_summary(
+            perception_doc if isinstance(perception_doc, dict) else None
+        )
+
+        audio_doc = merged_data.get("audio_perception") if merged_data else None
+        if audio_doc is None:
+            audio_doc = load_json(audio_perception_path(clip_path))
+        audio_summary = _audio_perception_summary(
+            audio_doc if isinstance(audio_doc, dict) else None
+        )
+
+        takes_doc = merged_data.get("takes") if merged_data else None
+        if takes_doc is None:
+            takes_doc = load_json(takes_path(clip_path))
+        takes_summary = _takes_summary(takes_doc if isinstance(takes_doc, dict) else None)
+
         transcript_segments: list[Any]
         transcript_words: list[dict[str, Any]] = []
         if tr_status == COMPLETE:
@@ -217,8 +329,25 @@ def build_media_catalog(
                 "ai_frame_captions": _analysis_file_status(captions_path(clip_path))
                 if kind == "video"
                 else "n/a (audio-only file)",
+                "video_perception": _analysis_file_status(perception_path(clip_path))
+                if kind == "video"
+                else "n/a (audio-only file)",
+                "audio_perception": _analysis_file_status(audio_perception_path(clip_path))
+                if has_audio
+                else "n/a (no audio)",
+                "takes": _analysis_file_status(takes_path(clip_path))
+                if has_audio
+                else "n/a (no audio)",
                 "waveform_peaks": _waveform_summary(clip_path),
             },
+            "perception_summary": perception_summary if kind == "video" else None,
+            "perception_shots": (
+                perception_doc.get("shots")
+                if isinstance(perception_doc, dict)
+                else []
+            )
+            if kind == "video"
+            else [],
             "transcript_segments": transcript_segments,
             "transcript_words": transcript_words,
             "silences": silences_list,
@@ -227,6 +356,23 @@ def build_media_catalog(
             "keyframes": kf_raw if kind == "video" else [],
             "ai_frame_captions": (caps.get("frames") if isinstance(caps, dict) else [])
             if kind == "video"
+            else [],
+            "audio_perception_summary": audio_summary if has_audio else None,
+            "audio_perception_windows": (
+                audio_doc.get("windows") if isinstance(audio_doc, dict) else []
+            )
+            if has_audio
+            else [],
+            "takes_summary": takes_summary if has_audio else None,
+            "takes": (
+                takes_doc.get("takes") if isinstance(takes_doc, dict) else []
+            )
+            if has_audio
+            else [],
+            "phrase_groups": (
+                takes_doc.get("phrase_groups") if isinstance(takes_doc, dict) else []
+            )
+            if has_audio
             else [],
         }
         entries.append(entry)

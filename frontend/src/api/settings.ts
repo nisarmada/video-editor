@@ -6,6 +6,8 @@ export type EditorUiSettingsPayload = {
   timelineSnapEnabled?: boolean;
   showCursorTimelineGuide?: boolean;
   cursorActionSelectsClip?: boolean;
+  marqueeOverlapMode?: "touch" | "inside";
+  selectLinkedClipsTogether?: boolean;
   perActionTargetMode?: Partial<
     Record<string, "cursor" | "playhead" | "selection" | "global">
   >;
@@ -21,6 +23,50 @@ export type AudioCutRefineSettings = {
   energy_disagree_ms?: number;
 };
 
+export type PlannerSettings = {
+  catalog_token_budget: number;
+  confirm_above_usd: number;
+  max_input_tokens: number;
+  max_cost_usd: number;
+  max_iterations: number;
+  max_images: number;
+  max_wall_time_s: number;
+  triage_model: string;
+  edit_model: string;
+};
+
+export const PLANNER_DEFAULTS: PlannerSettings = {
+  catalog_token_budget: 8000,
+  confirm_above_usd: 0.1,
+  max_input_tokens: 24000,
+  max_cost_usd: 1,
+  max_iterations: 3,
+  max_images: 0,
+  max_wall_time_s: 180,
+  triage_model: "claude-haiku-4-5-20251001",
+  edit_model: "claude-sonnet-5-5",
+};
+
+export type TranscriptionSettings = {
+  model_size: "small" | "medium";
+  keep_quiet_speech: boolean;
+};
+
+export const TRANSCRIPTION_DEFAULTS: TranscriptionSettings = {
+  model_size: "small",
+  keep_quiet_speech: false,
+};
+
+export type EmbeddingSettings = {
+  method: "hash" | "sentence_transformer";
+  model_name: string;
+};
+
+export const EMBEDDING_DEFAULTS: EmbeddingSettings = {
+  method: "hash",
+  model_name: "all-MiniLM-L6-v2",
+};
+
 export type PublicSettings = {
   planner_api_key_configured: boolean;
   paths: { footage: string; plans: string; output: string };
@@ -33,6 +79,9 @@ export type PublicSettings = {
   keybindings?: KeybindingOverridesMap;
   ui?: EditorUiSettingsPayload;
   audio_cut_refine?: AudioCutRefineSettings;
+  planner?: PlannerSettings;
+  transcription?: TranscriptionSettings;
+  embedding?: EmbeddingSettings;
 };
 
 export async function fetchSettings(): Promise<PublicSettings> {
@@ -52,6 +101,9 @@ export async function putSettings(body: {
   keybindings?: KeybindingOverridesMap | null;
   ui?: EditorUiSettingsPayload | null;
   audio_cut_refine?: AudioCutRefineSettings | null;
+  planner?: Partial<PlannerSettings> | null;
+  transcription?: Partial<TranscriptionSettings> | null;
+  embedding?: Partial<EmbeddingSettings> | null;
 }): Promise<PublicSettings> {
   const res = await apiRequest("/api/settings", {
     method: "PUT",

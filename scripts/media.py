@@ -18,10 +18,12 @@ from pathlib import Path
 
 from canvas_settings import CanvasSettings, piece_fit_settings, resolve_canvas  # noqa: E402
 from edit_vocab import (  # noqa: E402
-    AUDIO_FADE_SECONDS,
+    DUCK_GAIN_DEFAULT,
     append_audio_afade_filters,
     audio_fades_for_branch,
     audio_fades_for_segment,
+    ffmpeg_duck_volume_filter,
+    merge_time_windows,
     video_fade_chain,
 )
 
@@ -445,23 +447,82 @@ def _video_after_trim_chain(
     return rot + _fit_to_frame_filters(canvas, fit=fit, bar_fill=bar, pos_x=px, pos_y=py)
 
 
-def _timeline_overlap_br(a: AudioBranch, b: AudioBranch) -> bool:
-    a0, a1 = a.timeline_start, a.timeline_start + a.wall_duration()
-    b0, b1 = b.timeline_start, b.timeline_start + b.wall_duration()
-    return a0 < b1 - 1e-6 and b0 < a1 - 1e-6
+def _piece_transition_seconds(piece: TimelinePiece) -> float:
+    """Dissolve/crossfade length, or 0 when this piece does not overlap the next."""
+    tr = piece.transition_out
+    if not isinstance(tr, dict):
+        return 0.0
+    try:
+        duration = float(tr.get("duration", 0))
+    except (TypeError, ValueError):
+        return 0.0
+    return duration if duration > 1e-6 else 0.0
 
 
-def _branch_effective_volume(br: AudioBranch, branches: list[AudioBranch]) -> float:
-    vol = float(br.volume)
-    if not br.duck_under_track_id:
-        return vol
+def _export_shift_at(pieces: list[TimelinePiece], timeline_time: float) -> float:
+    """
+    Seconds to subtract from an editor time so it lines up with xfade output.
+    Each dissolve shortens the export by its duration after that junction.
+    """
+    cursor = 0.0
+    shift = 0.0
+    for index, piece in enumerate(pieces):
+        end = cursor + piece.output_duration()
+        has_next = index + 1 < len(pieces)
+        overlap = _piece_transition_seconds(piece) if has_next else 0.0
+        if overlap > 0 and timeline_time >= end - 1e-6:
+            shift += overlap
+        cursor = end
+    return shift
+
+
+def _editor_to_export_time(pieces: list[TimelinePiece], timeline_time: float) -> float:
+    return max(0.0, float(timeline_time) - _export_shift_at(pieces, float(timeline_time)))
+
+
+def _branch_export_span(
+    pieces: list[TimelinePiece],
+    branch: AudioBranch,
+) -> tuple[float, float]:
+    """Export-time [start, end) of a branch after dissolve shortening."""
+    start = _editor_to_export_time(pieces, branch.timeline_start)
+    return start, start + branch.wall_duration()
+
+
+def _duck_windows_local(
+    pieces: list[TimelinePiece],
+    branch: AudioBranch,
+    branches: list[AudioBranch],
+) -> list[tuple[float, float]]:
+    """Overlap with the duck-under track, in this branch's own audio time."""
+    if not branch.duck_under_track_id:
+        return []
+    start, end = _branch_export_span(pieces, branch)
+    windows: list[tuple[float, float]] = []
     for other in branches:
-        if other.source_track_id != br.duck_under_track_id:
+        if other is branch:
             continue
-        if _timeline_overlap_br(br, other):
-            gain = br.duck_gain if br.duck_gain is not None else 0.25
-            return vol * gain
-    return vol
+        if other.source_track_id != branch.duck_under_track_id:
+            continue
+        other_start, other_end = _branch_export_span(pieces, other)
+        overlap_start = max(start, other_start)
+        overlap_end = min(end, other_end)
+        if overlap_end - overlap_start > 1e-4:
+            windows.append((overlap_start - start, overlap_end - start))
+    return merge_time_windows(windows)
+
+
+def _branch_volume_filter(
+    pieces: list[TimelinePiece],
+    branch: AudioBranch,
+    branches: list[AudioBranch],
+) -> str:
+    """Flat volume, or a ramp that ducks only while the under-track overlaps."""
+    windows = _duck_windows_local(pieces, branch, branches)
+    if not branch.duck_under_track_id or not windows:
+        return _volume_filter_expr(branch.volume)
+    gain = branch.duck_gain if branch.duck_gain is not None else DUCK_GAIN_DEFAULT
+    return ffmpeg_duck_volume_filter(branch.volume, windows, gain)
 
 
 def _apply_video_transitions(
@@ -475,28 +536,58 @@ def _apply_video_transitions(
     i = 0
     xfi = 0
     while i < len(vlabels):
-        if (
-            i + 1 < len(vlabels)
-            and i < len(pieces)
-            and pieces[i].transition_out
-        ):
-            tr = pieces[i].transition_out or {}
-            try:
-                d = float(tr.get("duration", 0))
-            except (TypeError, ValueError):
-                d = 0.0
-            if d > 1e-6:
-                off = max(pieces[i].output_duration() - d, 0.0)
-                label = f"vxf{xfi}"
-                xfi += 1
-                parts.append(
-                    f"{vlabels[i]}{vlabels[i + 1]}xfade=transition=fade:"
-                    f"duration={d:.6f}:offset={off:.6f}[{label}]"
-                )
-                out.append(f"[{label}]")
-                i += 2
-                continue
+        overlap = (
+            _piece_transition_seconds(pieces[i])
+            if i + 1 < len(vlabels) and i < len(pieces)
+            else 0.0
+        )
+        if overlap > 0:
+            off = max(pieces[i].output_duration() - overlap, 0.0)
+            label = f"vxf{xfi}"
+            xfi += 1
+            parts.append(
+                f"{vlabels[i]}{vlabels[i + 1]}xfade=transition=fade:"
+                f"duration={overlap:.6f}:offset={off:.6f}[{label}]"
+            )
+            out.append(f"[{label}]")
+            i += 2
+            continue
         out.append(vlabels[i])
+        i += 1
+    return out
+
+
+def _apply_audio_transitions(
+    parts: list[str],
+    alabels: list[str],
+    pieces: list[TimelinePiece],
+) -> list[str]:
+    """
+    Crossfade embedded audio on the same pairs as video xfade.
+    acrossfade shortens the bus by the same overlap, so sound stays with the video.
+    """
+    if not alabels:
+        return alabels
+    out: list[str] = []
+    i = 0
+    xfi = 0
+    while i < len(alabels):
+        overlap = (
+            _piece_transition_seconds(pieces[i])
+            if i + 1 < len(alabels) and i < len(pieces)
+            else 0.0
+        )
+        if overlap > 0:
+            label = f"axf{xfi}"
+            xfi += 1
+            parts.append(
+                f"{alabels[i]}{alabels[i + 1]}acrossfade=d={overlap:.6f}:"
+                f"c1=tri:c2=tri[{label}]"
+            )
+            out.append(f"[{label}]")
+            i += 2
+            continue
+        out.append(alabels[i])
         i += 1
     return out
 
@@ -637,9 +728,9 @@ def _legacy_build_timeline_filter_graph(
         alabels.append(f"[a{i}]")
 
     vlabels = _apply_video_transitions(parts, vlabels, pieces)
-    vn = len(vlabels)
-    parts.append(f"{''.join(vlabels)}concat=n={vn}:v=1:a=0[vout]")
-    parts.append(f"{''.join(alabels)}concat=n={n}:v=0:a=1[aout]")
+    alabels = _apply_audio_transitions(parts, alabels, pieces)
+    parts.append(f"{''.join(vlabels)}concat=n={len(vlabels)}:v=1:a=0[vout]")
+    parts.append(f"{''.join(alabels)}concat=n={len(alabels)}:v=0:a=1[aout]")
     return ";".join(parts), ffmpeg_inputs
 
 
@@ -783,9 +874,10 @@ def _mixed_build_timeline_filter_graph(
         emb_labels.append(f"[emb{i}]")
 
     vlabels = _apply_video_transitions(parts, vlabels, pieces)
+    emb_labels = _apply_audio_transitions(parts, emb_labels, pieces)
     parts.append(f"{''.join(vlabels)}concat=n={len(vlabels)}:v=1:a=0[vout]")
     parts.append(
-        f"{''.join(emb_labels)}concat=n={n}:v=0:a=1[aembedded]"
+        f"{''.join(emb_labels)}concat=n={len(emb_labels)}:v=0:a=1[aembedded]"
     )
 
     mix_labels: list[str] = ["[aembedded]"]
@@ -807,13 +899,15 @@ def _mixed_build_timeline_filter_graph(
             continue
 
         t0 = float(br.timeline_start)
-        if t0 >= timeline_total - 1e-6:
+        export_t0 = _editor_to_export_time(pieces, t0)
+        export_end = _editor_to_export_time(pieces, float(timeline_total))
+        if export_t0 >= export_end - 1e-6:
             continue
 
         start = br.source_start
         end = br.source_end
         speed = br.effective_speed()
-        delay_ms = max(0, int(round(t0 * 1000)))
+        delay_ms = max(0, int(round(export_t0 * 1000)))
 
         tb: list[str] = [
             f"atrim=start={start:.6f}:end={end:.6f}",
@@ -821,8 +915,7 @@ def _mixed_build_timeline_filter_graph(
         ]
         for fac in _atempo_chain_factors(speed):
             tb.append(f"atempo={fac:.8f}".rstrip("0").rstrip("."))
-        eff_vol = _branch_effective_volume(br, audio_branches)
-        tb.append(_volume_filter_expr(eff_vol))
+        tb.append(_branch_volume_filter(pieces, br, audio_branches))
         fin, fout = audio_fades_for_branch(
             br.audio_fade_in, br.audio_fade_out, wall_duration=wall
         )
@@ -847,8 +940,11 @@ def _mixed_build_timeline_filter_graph(
     parts.append(
         f"{concat_s}amix=inputs={n_in}:normalize=0:duration=longest[amixed]"
     )
+    # Dissolve shortens the video. Trim the mix to that same export length
+    # (extra audio past the last video junction is shifted, not left late).
+    mix_end = _editor_to_export_time(pieces, float(timeline_total))
     parts.append(
-        f"[amixed]atrim=duration={timeline_total:.6f},"
+        f"[amixed]atrim=duration={mix_end:.6f},"
         f"alimiter=limit=0.95,aformat=sample_rates={sr}:channel_layouts=stereo[aout]"
     )
 

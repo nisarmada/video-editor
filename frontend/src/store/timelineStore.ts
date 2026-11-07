@@ -3,17 +3,18 @@ import {
   fetchFootageList,
   rescanFootageFolder,
   type FootageClip,
-  type FootageKind,
 } from "../api/footage";
 import {
   fetchPlan,
   fetchPlanList,
   savePlan as savePlanToServer,
 } from "../api/plans";
-import { fetchMediaCatalog } from "../api/catalog";
 import {
   PlannerAnalysisRequiredError,
-  requestFootageAnalyze,
+  estimatePlanner,
+  formatPlannerEstimate,
+  formatPlannerUsage,
+  readStringList,
   runPlanner as callPlanner,
 } from "../api/planner";
 import { listStyles, type StyleListItem } from "../api/styles";
@@ -31,7 +32,12 @@ import {
   renamePlan as renamePlanApi,
 } from "../api/planManagement";
 import { applyTimelineOperation } from "../api/timelineOps";
-import { LAST_OPENED_PLAN_KEY, normalizePlanStem, validatePlanStem } from "../utils/planStem";
+import {
+  LAST_OPENED_PLAN_KEY,
+  nextAutoPlanStem,
+  normalizePlanStem,
+  validatePlanStem,
+} from "../utils/planStem";
 import {
   canMutateTimeline,
   parseApplyOpErrorMessage,
@@ -208,6 +214,9 @@ type TimelineViewState = {
 
   /** Which preview is shown — only one player mounts at a time. */
   previewPanelMode: PreviewPanelMode;
+  /** Bumped when UI requests source preview of a time range (e.g. speech take). */
+  sourcePlaybackRequest: { id: number; start: number; end: number } | null;
+  requestSourcePlayback: (start: number, end: number) => void;
 
   /** Timeline caption overlay: limit ASS to selected clip (preview only). */
   captionPreviewClipOnly: boolean;
@@ -238,6 +247,8 @@ type TimelineViewState = {
   plannerProgressMessage: string | null;
   /** Shown briefly after success (and in toast). */
   plannerSuccessSummary: string | null;
+  /** Files left out of the last estimate or run because analysis is missing. */
+  plannerUnanalyzed: string[];
 
   /** Saved style profiles (plans/styles/*.json) for AI planner imitate. */
   styleProfiles: StyleListItem[];
@@ -274,6 +285,7 @@ type TimelineViewState = {
       footageScope?: "all" | "selected";
       clipNames?: string[];
       imitateStyleId?: string | null;
+      mode?: "draft" | "full";
     },
   ) => Promise<void>;
   /** Save if dirty, then POST /api/render using plan file on disk. */
@@ -413,6 +425,17 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
   mediaBinCategory: "all",
   setMediaBinCategory: (c: MediaBinCategory) => set({ mediaBinCategory: c }),
   previewPanelMode: "timeline",
+  sourcePlaybackRequest: null,
+  requestSourcePlayback: (start, end) =>
+    set((s) => ({
+      sourcePlaybackRequest: {
+        id: (s.sourcePlaybackRequest?.id ?? 0) + 1,
+        start,
+        end,
+      },
+      previewPanelMode: "source",
+      timelinePlaying: false,
+    })),
   captionPreviewClipOnly: false,
   setCaptionPreviewClipOnly: (v) => set({ captionPreviewClipOnly: v }),
   captionSafeAreaGuide: false,
@@ -428,6 +451,7 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
   plannerPhase: "idle",
   plannerProgressMessage: null,
   plannerSuccessSummary: null,
+  plannerUnanalyzed: [],
   styleProfiles: [],
   styleProfilesLoading: false,
   styleProfilesError: null,
@@ -731,7 +755,7 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
         settings = await fetchSettings();
       } catch {
         settings = {
-          render_defaults: { captions: false, max_length: null },
+          render_defaults: { captions: false, max_length: null, video_crf: 23 },
         };
       }
       const rd = settings.render_defaults;
@@ -1419,23 +1443,13 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
       plannerSuccessSummary: null,
       uiBannerError: null,
     });
-    if (typeof window !== "undefined") {
-      if (get().isDirty) {
-        if (
-          !window.confirm(
-            "You have unsaved edits. The planner overwrites the plan file on disk; unsaved work will be lost. Continue?",
-          )
-        ) {
-          return;
-        }
-      }
-    }
     const trimmed = brief.trim();
     if (!trimmed) {
       set({ plannerError: "Describe the edit you want (brief is required)." });
       return;
     }
-    const stem = normalizePlanStem(saveAsStem);
+    const requested = normalizePlanStem(saveAsStem);
+    const stem = requested || nextAutoPlanStem(get().availablePlans);
     if (!stem) {
       set({ plannerError: "Save-as name is required." });
       return;
@@ -1463,83 +1477,114 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
       typeof window !== "undefined" &&
       get().availablePlans.includes(stem)
     ) {
+      const replacingOpenPlan =
+        get().isDirty && normalizePlanStem(get().currentPlanName) === stem;
+      const extra = replacingOpenPlan
+        ? " Unsaved edits in the editor will be replaced."
+        : "";
       if (
         !window.confirm(
-          `This will overwrite plans/${stem}.json on disk. Continue?`,
+          `This will overwrite plans/${stem}.json on disk.${extra} Continue?`,
         )
       ) {
         return;
       }
+    } else if (get().isDirty) {
+      const active = normalizePlanStem(get().currentPlanName);
+      if (active && active !== stem) {
+        await get().savePlan();
+        if (get().saveStatus === "error") {
+          set({
+            plannerError:
+              get().saveError ||
+              "Could not save the current plan before generating a new one.",
+          });
+          return;
+        }
+      }
+    }
+    const mode = opts?.mode ?? "draft";
+    if (mode !== "draft") {
+      set({
+        plannerError:
+          "Full mode is not available yet. Use Draft. The agent loop is a later step.",
+        plannerUnanalyzed: [],
+      });
+      return;
     }
     set({
       plannerRunning: true,
       plannerError: null,
       plannerPhase: "context",
-      plannerProgressMessage: "Gathering media index context…",
+      plannerProgressMessage: "Estimating tokens…",
+      plannerUnanalyzed: [],
     });
-    const sleep = (ms: number) =>
-      new Promise<void>((resolve) => {
-        window.setTimeout(resolve, ms);
-      });
-
-    /** Poll until every catalog entry in scope has merged_index "complete". */
-    async function waitForMergedIndex(scopeNames: string[] | null): Promise<void> {
-      const deadline = Date.now() + 90 * 60 * 1000;
-      while (Date.now() < deadline) {
-        const { entries } = await fetchMediaCatalog(
-          scopeNames?.length
-            ? { names: scopeNames }
-            : undefined,
-        );
-        const pending = entries.filter(
-          (e) => (e.analysis?.merged_index ?? "") !== "complete",
-        );
-        if (pending.length === 0) {
-          return;
-        }
-        await sleep(2500);
-      }
-      throw new Error("Analysis timed out — check logs and try again.");
-    }
 
     try {
-      set({ plannerPhase: "planning", plannerProgressMessage: "Sending to planner (Claude)…" });
+      const estimate = await estimatePlanner({
+        brief: trimmed,
+        ...(clipFilter ? { clip_filenames: clipFilter } : {}),
+        ...(imitateId ? { imitate_style_id: imitateId } : {}),
+      });
+      const line = formatPlannerEstimate(estimate);
+      const skipped = estimate.unanalyzed ?? [];
+      const skipNote = skipped.length
+        ? ` Skipping ${skipped.length} unanalyzed file(s).`
+        : "";
+      set({
+        plannerUnanalyzed: skipped,
+        plannerProgressMessage: `${line}.${skipNote}`.trim(),
+      });
+      if (estimate.file_count <= 0) {
+        const names = skipped.length ? skipped.join(", ") : "none listed";
+        set({
+          plannerRunning: false,
+          plannerPhase: "idle",
+          plannerProgressMessage: null,
+          plannerError: `No analyzed files to plan with. Analyze now: ${names}`,
+        });
+        return;
+      }
+      if (
+        estimate.confirm &&
+        typeof window !== "undefined" &&
+        !window.confirm(`${line}.${skipNote} Continue?`)
+      ) {
+        set({
+          plannerRunning: false,
+          plannerPhase: "idle",
+          plannerProgressMessage: null,
+        });
+        return;
+      }
+      set({
+        plannerPhase: "planning",
+        plannerProgressMessage: `${line}. Sending to planner…`,
+      });
       let result: Awaited<ReturnType<typeof callPlanner>>;
       try {
         result = await callPlanner({
           brief: trimmed,
           save_as: stem,
+          mode: "draft",
           ...(clipFilter ? { clip_filenames: clipFilter } : {}),
           ...(imitateId ? { imitate_style_id: imitateId } : {}),
         });
       } catch (firstErr) {
         if (firstErr instanceof PlannerAnalysisRequiredError) {
           const need = firstErr.unanalyzed;
-          if (!need.length) {
-            throw new Error(
-              "Planner needs analyzed media but did not list missing files.",
-            );
-          }
           set({
-            plannerPhase: "context",
-            plannerProgressMessage: `Analyzing media (${need.length} file(s))…`,
+            plannerUnanalyzed: need,
+            plannerRunning: false,
+            plannerPhase: "idle",
+            plannerProgressMessage: null,
+            plannerError: need.length
+              ? `No analyzed files to plan with. Analyze now: ${need.join(", ")}`
+              : "No analyzed files to plan with.",
           });
-          await requestFootageAnalyze({ names: need });
-          const scopeWait = clipFilter?.length ? clipFilter : null;
-          await waitForMergedIndex(scopeWait);
-          set({
-            plannerPhase: "planning",
-            plannerProgressMessage: "Sending to planner (Claude)…",
-          });
-          result = await callPlanner({
-            brief: trimmed,
-            save_as: stem,
-            ...(clipFilter ? { clip_filenames: clipFilter } : {}),
-            ...(imitateId ? { imitate_style_id: imitateId } : {}),
-          });
-        } else {
-          throw firstErr;
+          return;
         }
+        throw firstErr;
       }
       await get().refreshAvailablePlans();
       const stemFromFile = normalizePlanStem(result.plan_name);
@@ -1555,6 +1600,9 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
         set({ plannerPhase: "saving", plannerProgressMessage: "Saving plan file…" });
         await savePlanToServer(stemFromFile, get().timeline!);
         const doneTl = get().timeline!;
+        const sum = summarizePlannerTimeline(doneTl, result.cut_quality_warnings);
+        const usageLine = formatPlannerUsage(result.usage);
+        const fromRun = readStringList(result.usage?.unanalyzed);
         set({
           plannerRunning: false,
           plannerError: null,
@@ -1563,14 +1611,11 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
           isDirty: false,
           saveStatus: "saved",
           saveError: null,
-          plannerSuccessSummary: summarizePlannerTimeline(
-            doneTl,
-            result.cut_quality_warnings,
-          ),
+          plannerSuccessSummary: usageLine ? `${sum} ${usageLine}` : sum,
+          plannerUnanalyzed: fromRun ?? get().plannerUnanalyzed,
           selectedClipId: null,
           selectedClipIds: [],
         });
-        const sum = summarizePlannerTimeline(doneTl, result.cut_quality_warnings);
         get().setShortcutToast(sum);
         window.setTimeout(() => get().setShortcutToast(null), 6000);
         return;
@@ -1578,13 +1623,19 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
 
       await get().loadPlan(stemFromFile, { skipDirtyConfirm: true });
       const tl2 = get().timeline;
+      const sum2 = tl2 ? summarizePlannerTimeline(tl2) : "";
+      const usageLine2 = formatPlannerUsage(result.usage);
+      const fromRun2 = readStringList(result.usage?.unanalyzed);
       set({
         plannerRunning: false,
         plannerError: null,
         plannerPhase: "idle",
         plannerProgressMessage: null,
-        ...(tl2
-          ? { plannerSuccessSummary: summarizePlannerTimeline(tl2) }
+        plannerUnanalyzed: fromRun2 ?? get().plannerUnanalyzed,
+        ...(sum2
+          ? {
+              plannerSuccessSummary: usageLine2 ? `${sum2} ${usageLine2}` : sum2,
+            }
           : {}),
       });
       if (tl2) {

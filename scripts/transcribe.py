@@ -16,6 +16,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 from index_cache import cache_hit, save_json, transcript_path  # noqa: E402
 from probe import get_video_info  # noqa: E402
+from transcription_settings import load_transcription_settings  # noqa: E402
 
 
 def has_audio_track(path: Path) -> bool:
@@ -55,18 +56,32 @@ def extract_audio_wav(video_path: Path, wav_path: Path) -> None:
         raise RuntimeError(result.stderr.strip() or "ffmpeg audio extract failed")
 
 
-def transcribe_wav(wav_path: Path) -> tuple[list[dict], str, float]:
+def transcribe_wav(
+    wav_path: Path,
+    *,
+    model_size: str = "small",
+    keep_quiet_speech: bool = False,
+) -> tuple[list[dict], str, float]:
     """
-    Run faster-whisper (small model, CPU, int8) with word timestamps and VAD.
+    Run faster-whisper with word timestamps and VAD.
     Returns (segments, language, duration from model).
     """
     from faster_whisper import WhisperModel
 
-    model = WhisperModel("small", device="cpu", compute_type="int8")
+    size = model_size if model_size in ("small", "medium") else "small"
+    model = WhisperModel(size, device="cpu", compute_type="int8")
+    vad_parameters: dict | None = None
+    if keep_quiet_speech:
+        # Looser VAD keeps low-volume speech that default filtering might drop.
+        vad_parameters = {
+            "min_silence_duration_ms": 80,
+            "speech_pad_ms": 320,
+        }
     segments_iter, info = model.transcribe(
         str(wav_path),
         word_timestamps=True,
         vad_filter=True,
+        vad_parameters=vad_parameters,
     )
 
     segments: list[dict] = []
@@ -143,8 +158,18 @@ def main() -> None:
 
     try:
         extract_audio_wav(video_path, wav_path)
-        print("Transcribing (first run downloads the small model; may take a while)...")
-        segments, language, model_duration = transcribe_wav(wav_path)
+        tcfg = load_transcription_settings()
+        size = str(tcfg.get("model_size") or "small")
+        quiet = bool(tcfg.get("keep_quiet_speech"))
+        print(
+            f"Transcribing with whisper {size} "
+            f"(keep_quiet_speech={quiet}; first run may download the model)..."
+        )
+        segments, language, model_duration = transcribe_wav(
+            wav_path,
+            model_size=size,
+            keep_quiet_speech=quiet,
+        )
     except RuntimeError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
@@ -168,6 +193,8 @@ def main() -> None:
         "clip": video_path.name,
         "language": language,
         "duration_seconds": round(total_duration, 3),
+        "model_size": size,
+        "keep_quiet_speech": quiet,
         "segments": segments,
     }
     save_json(out_path, payload)

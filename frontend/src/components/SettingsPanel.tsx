@@ -1,11 +1,24 @@
 import { useEffect, useState } from "react";
 import {
   fetchSettings,
+  PLANNER_DEFAULTS,
   putPlannerApiKey,
   putSettings,
   testPlannerConnection,
+  TRANSCRIPTION_DEFAULTS,
+  EMBEDDING_DEFAULTS,
+  type EmbeddingSettings,
+  type PlannerSettings,
   type PublicSettings,
+  type TranscriptionSettings,
 } from "../api/settings";
+import {
+  clearPaidCaptionCaches,
+  clearRegenerableCaches,
+  fetchStorageStats,
+  formatBytes,
+  type StorageStats,
+} from "../api/storage";
 import { useTimelineStore } from "../store/timelineStore";
 
 type Props = {
@@ -38,6 +51,13 @@ export default function SettingsPanel({
   const [postRollMs, setPostRollMs] = useState("150");
   const [snapWinMs, setSnapWinMs] = useState("80");
   const [cutFadeMs, setCutFadeMs] = useState("20");
+  const [planner, setPlanner] = useState<PlannerSettings>(PLANNER_DEFAULTS);
+  const [transcription, setTranscription] = useState<TranscriptionSettings>(
+    TRANSCRIPTION_DEFAULTS,
+  );
+  const [embedding, setEmbedding] = useState<EmbeddingSettings>(EMBEDDING_DEFAULTS);
+  const [storageStats, setStorageStats] = useState<StorageStats | null>(null);
+  const [storageMsg, setStorageMsg] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -63,6 +83,22 @@ export default function SettingsPanel({
         setPostRollMs(String(acr.post_roll_ms ?? 150));
         setSnapWinMs(String(acr.snap_window_ms ?? 80));
         setCutFadeMs(String(acr.fade_ms ?? 20));
+        setPlanner({ ...PLANNER_DEFAULTS, ...(data.planner ?? {}) });
+        setTranscription({
+          ...TRANSCRIPTION_DEFAULTS,
+          ...(data.transcription ?? {}),
+        });
+        setEmbedding({
+          ...EMBEDDING_DEFAULTS,
+          ...(data.embedding ?? {}),
+        });
+        void fetchStorageStats()
+          .then((st) => {
+            if (!cancelled) setStorageStats(st);
+          })
+          .catch(() => {
+            if (!cancelled) setStorageStats(null);
+          });
       })
       .catch((e: unknown) => {
         setUiBannerError(
@@ -301,6 +337,362 @@ export default function SettingsPanel({
               >
                 Save cut refine settings
               </button>
+            </section>
+
+            <section className="settings-block">
+              <h3>Planner limits</h3>
+              <p className="settings-hint">
+                Draft mode stays inside these limits. A run asks before it goes
+                over the confirm amount. The cheap model is for captions. The
+                edit model writes the timeline.
+              </p>
+              <label className="settings-label">
+                Catalog token budget
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  value={String(planner.catalog_token_budget)}
+                  onChange={(e) =>
+                    setPlanner({
+                      ...planner,
+                      catalog_token_budget: Number(e.target.value),
+                    })
+                  }
+                />
+              </label>
+              <label className="settings-label">
+                Confirm above ($)
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  value={String(planner.confirm_above_usd)}
+                  onChange={(e) =>
+                    setPlanner({
+                      ...planner,
+                      confirm_above_usd: Number(e.target.value),
+                    })
+                  }
+                />
+              </label>
+              <label className="settings-label">
+                Max input tokens
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  value={String(planner.max_input_tokens)}
+                  onChange={(e) =>
+                    setPlanner({
+                      ...planner,
+                      max_input_tokens: Number(e.target.value),
+                    })
+                  }
+                />
+              </label>
+              <label className="settings-label">
+                Max cost ($)
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  value={String(planner.max_cost_usd)}
+                  onChange={(e) =>
+                    setPlanner({ ...planner, max_cost_usd: Number(e.target.value) })
+                  }
+                />
+              </label>
+              <label className="settings-label">
+                Max model calls
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  value={String(planner.max_iterations)}
+                  onChange={(e) =>
+                    setPlanner({
+                      ...planner,
+                      max_iterations: Number(e.target.value),
+                    })
+                  }
+                />
+              </label>
+              <label className="settings-label">
+                Max images
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  value={String(planner.max_images)}
+                  onChange={(e) =>
+                    setPlanner({ ...planner, max_images: Number(e.target.value) })
+                  }
+                />
+              </label>
+              <label className="settings-label">
+                Max time (seconds)
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  value={String(planner.max_wall_time_s)}
+                  onChange={(e) =>
+                    setPlanner({
+                      ...planner,
+                      max_wall_time_s: Number(e.target.value),
+                    })
+                  }
+                />
+              </label>
+              <label className="settings-label">
+                Cheap model (captions)
+                <input
+                  type="text"
+                  value={planner.triage_model}
+                  onChange={(e) =>
+                    setPlanner({ ...planner, triage_model: e.target.value })
+                  }
+                />
+              </label>
+              <label className="settings-label">
+                Edit model
+                <input
+                  type="text"
+                  value={planner.edit_model}
+                  onChange={(e) =>
+                    setPlanner({ ...planner, edit_model: e.target.value })
+                  }
+                />
+              </label>
+              <button
+                type="button"
+                className="btn btn--primary"
+                disabled={loading}
+                onClick={() => {
+                  void putSettings({ planner })
+                    .then((data) => {
+                      setS(data);
+                      setPlanner({ ...PLANNER_DEFAULTS, ...(data.planner ?? {}) });
+                    })
+                    .catch((e: unknown) =>
+                      setUiBannerError(
+                        e instanceof Error ? e.message : "Save failed",
+                      ),
+                    );
+                }}
+              >
+                Save planner limits
+              </button>
+            </section>
+
+            <section className="settings-block">
+              <h3>Transcription</h3>
+              <p className="settings-hint">
+                faster-whisper runs locally. Word timestamps are always saved.
+                Re-transcribe a file from Source preview after changing these.
+              </p>
+              <label className="settings-label">
+                Model size
+                <select
+                  value={transcription.model_size}
+                  onChange={(e) =>
+                    setTranscription({
+                      ...transcription,
+                      model_size: e.target.value as "small" | "medium",
+                    })
+                  }
+                >
+                  <option value="small">small (faster)</option>
+                  <option value="medium">medium (more accurate)</option>
+                </select>
+              </label>
+              <label className="settings-inline">
+                <input
+                  type="checkbox"
+                  checked={transcription.keep_quiet_speech}
+                  onChange={(e) =>
+                    setTranscription({
+                      ...transcription,
+                      keep_quiet_speech: e.target.checked,
+                    })
+                  }
+                />
+                Keep quiet speech (looser VAD)
+              </label>
+              <button
+                type="button"
+                className="btn btn--primary"
+                disabled={loading}
+                onClick={() => {
+                  void putSettings({ transcription })
+                    .then((data) => {
+                      setS(data);
+                      setTranscription({
+                        ...TRANSCRIPTION_DEFAULTS,
+                        ...(data.transcription ?? {}),
+                      });
+                    })
+                    .catch((e: unknown) =>
+                      setUiBannerError(
+                        e instanceof Error ? e.message : "Save failed",
+                      ),
+                    );
+                }}
+              >
+                Save transcription settings
+              </button>
+            </section>
+
+            <section className="settings-block">
+              <h3>Catalog embedding</h3>
+              <p className="settings-hint">
+                Used to rank files when the planner catalog is over token budget.
+                Hashed bag-of-words is fast but literal. Sentence-transformer
+                downloads a small local model (all-MiniLM-L6-v2) and falls back
+                to hash if it fails.
+              </p>
+              <label className="settings-label">
+                Method
+                <select
+                  value={embedding.method}
+                  onChange={(e) =>
+                    setEmbedding({
+                      ...embedding,
+                      method: e.target.value as EmbeddingSettings["method"],
+                    })
+                  }
+                >
+                  <option value="hash">Hashed bag-of-words (default)</option>
+                  <option value="sentence_transformer">
+                    Sentence-transformer (local)
+                  </option>
+                </select>
+              </label>
+              <label className="settings-label">
+                Model name
+                <input
+                  value={embedding.model_name}
+                  disabled={embedding.method === "hash"}
+                  onChange={(e) =>
+                    setEmbedding({ ...embedding, model_name: e.target.value })
+                  }
+                />
+              </label>
+              <button
+                type="button"
+                className="btn btn--primary"
+                disabled={loading}
+                onClick={() => {
+                  void putSettings({ embedding })
+                    .then((data) => {
+                      setS(data);
+                      setEmbedding({
+                        ...EMBEDDING_DEFAULTS,
+                        ...(data.embedding ?? {}),
+                      });
+                    })
+                    .catch((e: unknown) =>
+                      setUiBannerError(
+                        e instanceof Error ? e.message : "Save failed",
+                      ),
+                    );
+                }}
+              >
+                Save embedding settings
+              </button>
+            </section>
+
+            <section className="settings-block">
+              <h3>Storage</h3>
+              <p className="settings-hint">
+                Regenerable caches: perception JPEGs, keyframe images, and
+                embedding JSON. AI frame captions are separate (paid API).
+              </p>
+              {storageStats ? (
+                <ul className="settings-kv">
+                  <li>
+                    Perception images:{" "}
+                    {formatBytes(storageStats.perception_images_bytes)}
+                  </li>
+                  <li>
+                    Keyframe images:{" "}
+                    {formatBytes(storageStats.keyframes_images_bytes)}
+                  </li>
+                  <li>
+                    Embedding JSON:{" "}
+                    {formatBytes(storageStats.embedding_json_bytes)}
+                  </li>
+                  <li>
+                    Paid AI captions:{" "}
+                    {formatBytes(storageStats.paid_caption_json_bytes ?? 0)}
+                  </li>
+                  <li>
+                    <strong>
+                      Total regenerable:{" "}
+                      {formatBytes(storageStats.total_regenerable_bytes)}
+                    </strong>
+                  </li>
+                </ul>
+              ) : (
+                <p className="modal-sheet__muted">Storage stats unavailable.</p>
+              )}
+              {storageMsg && <p className="settings-ok">{storageMsg}</p>}
+              <div className="settings-actions">
+                <button
+                  type="button"
+                  className="btn btn--ghost"
+                  disabled={loading}
+                  onClick={() => {
+                    if (
+                      !window.confirm(
+                        "Clear regenerable caches? Analysis will rebuild on next run.",
+                      )
+                    ) {
+                      return;
+                    }
+                    setLoading(true);
+                    void clearRegenerableCaches()
+                      .then((res) => {
+                        setStorageStats(res.stats);
+                        setStorageMsg(
+                          `Freed ${formatBytes(res.freed_bytes)} (${res.removed_files} files).`,
+                        );
+                      })
+                      .catch((e: unknown) =>
+                        setUiBannerError(
+                          e instanceof Error ? e.message : "Clear failed",
+                        ),
+                      )
+                      .finally(() => setLoading(false));
+                  }}
+                >
+                  Clear regenerable caches
+                </button>
+                <button
+                  type="button"
+                  className="btn btn--ghost"
+                  disabled={loading}
+                  onClick={() => {
+                    if (
+                      !window.confirm(
+                        "Clear paid AI frame captions? Rebuilding them will call the paid caption API for each video.",
+                      )
+                    ) {
+                      return;
+                    }
+                    setLoading(true);
+                    void clearPaidCaptionCaches()
+                      .then((res) => {
+                        setStorageStats(res.stats);
+                        setStorageMsg(
+                          `Cleared paid captions: ${formatBytes(res.freed_bytes)} (${res.removed_files} files).`,
+                        );
+                      })
+                      .catch((e: unknown) =>
+                        setUiBannerError(
+                          e instanceof Error ? e.message : "Clear failed",
+                        ),
+                      )
+                      .finally(() => setLoading(false));
+                  }}
+                >
+                  Clear paid AI descriptions…
+                </button>
+              </div>
             </section>
 
             <section className="settings-block">

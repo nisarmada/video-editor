@@ -39,6 +39,22 @@ export async function fetchFootageList(): Promise<FootageClip[]> {
   return data.clips ?? [];
 }
 
+export async function requestFootageRetranscribe(
+  name: string,
+): Promise<{ queued: string; removed_index_files: string[] }> {
+  const res = await fetch(
+    `/api/footage/${encodeURIComponent(name)}/retranscribe`,
+    { method: "POST" },
+  );
+  const t = await res.text();
+  if (!res.ok) {
+    throw new Error(
+      parseFastApiErrorBody(t) || `Re-transcribe failed (${res.status})`,
+    );
+  }
+  return JSON.parse(t) as { queued: string; removed_index_files: string[] };
+}
+
 export async function rescanFootageFolder(): Promise<{ queued: string[] }> {
   const res = await fetch("/api/footage/rescan", { method: "POST" });
   if (!res.ok) {

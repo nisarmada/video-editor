@@ -1,4 +1,4 @@
-"""Background full index pipeline: transcript → silences → shots → keyframes → captions → merged index."""
+"""Background index: transcript → silences → shots → video_perception → keyframes → captions → merge."""
 
 from __future__ import annotations
 
@@ -92,6 +92,14 @@ def schedule_index_pipeline(root: Path, clip_path: Path) -> None:
             # Order matches PROJECT.md pipeline (caption_frames needs keyframes)
             run_script("transcribe.py", [], "transcribe")
             run_script("silences.py", [], "silences")
+            try:
+                run_script("audio_perception.py", [], "audio_perception")
+            except RuntimeError:
+                mark_step(name, "audio_perception skipped")
+            try:
+                run_script("takes.py", [], "takes")
+            except RuntimeError:
+                mark_step(name, "takes skipped")
             ext = src.suffix.lower()
             from footage_exts import AUDIO_EXTS, VIDEO_EXTS  # noqa: PLC0415
 
@@ -99,6 +107,10 @@ def schedule_index_pipeline(root: Path, clip_path: Path) -> None:
                 pass
             elif ext in VIDEO_EXTS:
                 run_script("shots.py", [], "shots")
+                try:
+                    run_script("video_perception.py", [], "video_perception")
+                except RuntimeError:
+                    mark_step(name, "video_perception skipped")
                 run_script("keyframes.py", [], "keyframes")
                 try:
                     run_script("caption_frames.py", [], "caption_frames")
@@ -108,6 +120,11 @@ def schedule_index_pipeline(root: Path, clip_path: Path) -> None:
                 raise RuntimeError(f"Unsupported footage extension: {ext}")
 
             build_merged_index(src, force=True)
+
+            try:
+                run_script("text_embeddings.py", [], "text_embeddings")
+            except RuntimeError:
+                mark_step(name, "text_embeddings skipped")
 
             if schedule_waveform_work is not None:
                 try:

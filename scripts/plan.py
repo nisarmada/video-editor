@@ -11,7 +11,9 @@ import json
 import os
 import re
 import sys
+import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -30,6 +32,22 @@ from audio_cut_refine import load_settings, refine_timeline_audio_cuts  # noqa: 
 from validate_plan import validate_plan_data, validate_segments  # noqa: E402
 
 from backend.media_catalog import build_media_catalog  # noqa: E402
+from index_cache import load_json, planner_usage_path, save_json_atomic  # noqa: E402
+from planner_catalog import (  # noqa: E402
+    build_repair_prompt,
+    cached_system_blocks,
+    catalog_block,
+    content_as_text,
+    select_compact,
+    user_content_blocks,
+)
+from planner_limits import (  # noqa: E402
+    OUTPUT_TOKEN_GUESS,
+    RunBudget,
+    estimate_cost_usd,
+    estimate_tokens,
+    load_planner_settings,
+)
 
 DEFAULT_MODEL = "claude-sonnet-4-5-20250514"
 # User-facing default name; override with ANTHROPIC_PLAN_MODEL (e.g. claude-sonnet-5-5)
@@ -38,10 +56,11 @@ DEFAULT_MODEL_ENV = "claude-sonnet-5-5"
 # Rough Sonnet-class $/token for console estimate (update if pricing changes)
 INPUT_USD_PER_TOKEN = 3.0 / 1_000_000
 OUTPUT_USD_PER_TOKEN = 15.0 / 1_000_000
+PLANNER_MAX_TOKENS = 8192
 
 BASE_SYSTEM_PROMPT = """You help build a timeline for a local video editor. Output area is typically 1080x1920 at 30 fps unless settings say otherwise.
 
-You receive a JSON **media catalog**: one object per file in footage/. Each entry includes kind (video or audio), duration, stream flags, analysis status, transcript segments (or a note), **transcript_words** (flat word start/end times — use these for narration trims), silences, and for video files shots / keyframes / optional AI frame captions. Entries marked "not analyzed" for some fields mean that data was not produced yet — still use what is available.
+You receive a **compact media catalog**: one small object per analyzed file (id, kind, duration, a one-line summary, a few measurements, analysis status, and a short transcript_digest). Files that are not analyzed are listed by name only and must not be used. Full word lists, shots, and frames are not in this request.
 
 You cannot see pixels or waveforms directly; rely on the catalog text and numbers.
 
@@ -60,8 +79,8 @@ The project uses **multi-track** timelines:
   - Optional: `speed`, `volume`, `zoom` (video)
   - Optional audio fades (seconds): `audio_fade_in`, `audio_fade_out` on video and audio clips
   - Optional video fades (seconds): `video_fade_in`, `video_fade_out` on video clips only
-  - Optional cut to next shot: `transition_out`: `{ "type": "dissolve" | "crossfade", "duration": <seconds> }` on a video clip (dissolve/crossfade use the same export)
-  - Optional on **audio tracks** (not clips): `duck_under_track_id` (another audio track id), `duck_gain` (0–1, default 0.25 when ducking applies) — lowers this track's clips when they overlap clips on the duck-under track
+  - Optional cut to the next video clip: `transition_out`: `{ "type": "dissolve" | "crossfade", "duration": <seconds> }` on a video clip. Export overlaps those two clips by that duration (the joined picture is shorter by that amount) and overlaps their audio by the same amount so sound stays in sync. Preview plays a hard cut; the overlap is export only.
+  - Optional on **audio tracks** (not clips): `duck_under_track_id` (another audio track id), `duck_gain` (0–1, default 0.25). While this track overlaps clips on that track, its level eases down to duck_gain and back (short attack and release). Outside the overlap the level stays unchanged.
   - Do **not** use fade, transition, or ducking fields you were not told are supported; omit when unsure
   - Optional on **video** clips: `audio_source` — `"embedded"` (default) or `"detached"`:
     - `embedded`: mix the clip's own audio in the usual way.
@@ -154,12 +173,65 @@ def build_user_prompt(
     )
 
 
+def response_text_and_stop(response: object) -> tuple[str, str | None]:
+    """Join every text block. Thinking blocks are not timeline JSON."""
+    parts: list[str] = []
+    for block in getattr(response, "content", None) or []:
+        if getattr(block, "type", None) != "text":
+            continue
+        chunk = getattr(block, "text", "") or ""
+        if chunk:
+            parts.append(chunk)
+    stop = getattr(response, "stop_reason", None)
+    return "\n".join(parts), (str(stop) if stop else None)
+
+
+def _first_balanced_json_object(text: str, start: int) -> str:
+    """Slice the object that begins at start, respecting strings and escapes."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    raise ValueError(
+        "JSON object was cut off before it closed "
+        "(the reply may have hit the token limit)"
+    )
+
+
 def parse_plan_json(text: str) -> dict:
-    text = text.strip()
-    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-    if fence:
-        text = fence.group(1).strip()
-    data = json.loads(text)
+    """
+    Pull the first JSON object out of a model reply.
+    Drops markdown fences and any prose before or after the object.
+    """
+    if not text or not str(text).strip():
+        raise ValueError("model returned no JSON text")
+    cleaned = re.sub(r"```(?:json)?", "", text, flags=re.IGNORECASE)
+    cleaned = cleaned.replace("```", "")
+    start = cleaned.find("{")
+    if start < 0:
+        raise ValueError("No JSON object in model response")
+    blob = _first_balanced_json_object(cleaned, start)
+    try:
+        data = json.loads(blob)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Plan JSON could not be parsed: {exc}") from exc
     if not isinstance(data, dict):
         raise ValueError("Plan must be a JSON object")
     if isinstance(data.get("tracks"), list) and data.get("schema_version") != 2:
@@ -170,6 +242,66 @@ def parse_plan_json(text: str) -> dict:
     if "segments" in data:
         return data
     raise ValueError("Plan must have schema_version 2 or a legacy 'segments' array")
+
+
+def save_raw_planner_response(
+    text: str,
+    *,
+    stop_reason: str | None,
+    attempt: str,
+) -> Path:
+    """Atomic text dump so a bad reply can be inspected without another API call."""
+    debug_dir = Path.cwd() / "plans" / "_planner_debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%f")
+    path = debug_dir / f"{stamp}_{attempt}.txt"
+    body = f"stop_reason: {stop_reason}\n\n{text}"
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(body, encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
+def stop_reason_note(stop_reason: str | None) -> str:
+    if stop_reason == "max_tokens":
+        return (
+            f"Planner hit max_tokens ({PLANNER_MAX_TOKENS}) and the reply was cut off "
+            "(stop_reason=max_tokens)."
+        )
+    if stop_reason:
+        return f"stop_reason={stop_reason}."
+    return "stop_reason was not reported."
+
+
+def invalid_plan_message(
+    exc: BaseException,
+    stop_reason: str | None,
+    raw_path: Path,
+    *,
+    attempt: str,
+) -> str:
+    return (
+        f"Invalid plan JSON ({attempt}): {exc}. {stop_reason_note(stop_reason)} "
+        f"Raw response saved to {raw_path}."
+    )
+
+
+def build_json_retry_user_prompt(previous_text: str, stop_reason: str | None) -> str:
+    """
+    One short follow-up. Does not include the media catalog.
+    The previous reply is clipped so this call stays cheap.
+    """
+    clipped = previous_text or ""
+    if len(clipped) > 8000:
+        clipped = clipped[:4000] + "\n...\n" + clipped[-4000:]
+    return (
+        "The previous reply was not a usable timeline JSON object. "
+        f"{stop_reason_note(stop_reason)} "
+        "Reply with one JSON object only. No markdown fences and no explanation. "
+        "If the reply was cut off, return a shorter valid schema_version 2 timeline.\n\n"
+        "Previous reply:\n"
+        f"{clipped}"
+    )
 
 
 def ensure_ai_v2_plan(plan: dict, brief: str, run_group_id: str) -> dict:
@@ -250,11 +382,11 @@ def validate_plan_parsed(plan: dict, brief: str, target: float | None) -> list[s
 
 def call_claude(
     model: str,
-    system: str,
-    user: str,
+    system: str | list,
+    user: str | list,
     *,
     api_key: str | None = None,
-) -> tuple[str, object]:
+) -> tuple[str, object, str | None]:
     import anthropic
 
     key = (api_key or "").strip() or os.environ.get("ANTHROPIC_API_KEY", "").strip()
@@ -264,12 +396,49 @@ def call_claude(
     client = anthropic.Anthropic(api_key=key)
     response = client.messages.create(
         model=model,
-        max_tokens=8192,
+        max_tokens=PLANNER_MAX_TOKENS,
         system=system,
         messages=[{"role": "user", "content": user}],
     )
-    parts = [b.text for b in response.content if b.type == "text"]
-    return "\n".join(parts), response.usage
+    text, stop_reason = response_text_and_stop(response)
+    return text, response.usage, stop_reason
+
+
+def _usage_tokens(usage: object) -> tuple[int, int]:
+    if usage is None:
+        return 0, 0
+    return (
+        int(getattr(usage, "input_tokens", 0) or 0),
+        int(getattr(usage, "output_tokens", 0) or 0),
+    )
+
+
+def record_planner_usage(
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    cost_usd: float,
+) -> dict:
+    """Add this run to today's total in index/planner_usage.json (atomic write)."""
+    path = planner_usage_path()
+    data = load_json(path)
+    if not isinstance(data, dict):
+        data = {}
+    days = data.get("days")
+    if not isinstance(days, dict):
+        days = {}
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    bucket = days.get(day)
+    if not isinstance(bucket, dict):
+        bucket = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "runs": 0}
+    bucket["input_tokens"] = int(bucket.get("input_tokens") or 0) + int(input_tokens)
+    bucket["output_tokens"] = int(bucket.get("output_tokens") or 0) + int(output_tokens)
+    bucket["cost_usd"] = round(float(bucket.get("cost_usd") or 0) + float(cost_usd), 6)
+    bucket["runs"] = int(bucket.get("runs") or 0) + 1
+    days[day] = bucket
+    data["days"] = days
+    save_json_atomic(path, data)
+    return bucket
 
 
 def print_usage(usage: object, model: str) -> None:
@@ -281,31 +450,87 @@ def print_usage(usage: object, model: str) -> None:
     print(f"Tokens ({model}): input={inp} output={out}  (~${est:.4f} estimated)")
 
 
-def generate_plan(
+def _parse_or_retry_plan(
+    text: str,
+    stop_reason: str | None,
+    *,
+    model_used: str,
+    system_prompt: str | list,
+    api_key: str | None,
+    total_usage: dict,
+    budget: RunBudget | None = None,
+) -> dict:
+    """Parse the reply. On failure, one cheap retry that does not resend the catalog."""
+    try:
+        return parse_plan_json(text)
+    except (json.JSONDecodeError, ValueError) as first_error:
+        raw_path = save_raw_planner_response(
+            text, stop_reason=stop_reason, attempt="first"
+        )
+        retry_user = build_json_retry_user_prompt(text, stop_reason)
+        est_in = estimate_tokens(retry_user) + estimate_tokens(
+            content_as_text(system_prompt)
+        )
+        if budget is not None and not budget.allow(
+            est_input=est_in, est_output=OUTPUT_TOKEN_GUESS
+        ):
+            raise ValueError(
+                invalid_plan_message(
+                    first_error, stop_reason, raw_path, attempt="first reply"
+                )
+                + f" Stopped before a retry ({budget.stop_reason})."
+            )
+        try:
+            retry_text, usage2, stop2 = call_claude(
+                model_used, system_prompt, retry_user, api_key=api_key
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Planner API error on JSON retry: "
+                f"{exc}. {invalid_plan_message(first_error, stop_reason, raw_path, attempt='first reply')}"
+            ) from exc
+        in2, out2 = _usage_tokens(usage2)
+        total_usage["input_tokens"] += in2
+        total_usage["output_tokens"] += out2
+        if budget is not None:
+            budget.note_call(in2, out2)
+        try:
+            return parse_plan_json(retry_text)
+        except (json.JSONDecodeError, ValueError) as retry_error:
+            raw2 = save_raw_planner_response(
+                retry_text, stop_reason=stop2, attempt="retry"
+            )
+            raise ValueError(
+                invalid_plan_message(
+                    first_error, stop_reason, raw_path, attempt="first reply"
+                )
+                + " "
+                + invalid_plan_message(
+                    retry_error, stop2, raw2, attempt="retry"
+                )
+            ) from retry_error
+
+
+def prepare_planner_context(
     brief: str,
     *,
-    api_key: str | None = None,
     clip_filenames: list[str] | None = None,
     imitate_style_id: str | None = None,
-    require_merged_index: bool = True,
-) -> tuple[dict, str, dict]:
+    root: Path | None = None,
+) -> dict:
     """
-    Call Claude, validate, return v2 plan, group_id, and token usage tallies.
-    Requires cwd = project root (footage/, index/).
-    If clip_filenames is set, only those footage basenames are in the catalog.
+    Build the compact catalog and a cost estimate. Does not call the model.
     """
-    load_dotenv()
-
-    root = Path.cwd()
-    imitate_profile: dict | None = None
+    t0 = time.perf_counter()
+    project = root or Path.cwd()
+    limits = load_planner_settings(project)
+    imitate_profile = None
     if imitate_style_id:
-        imitate_profile = load_style_profile(root, imitate_style_id)
-
+        imitate_profile = load_style_profile(project, imitate_style_id)
     system_prompt = build_system_prompt(imitate_profile=imitate_profile)
-
     scope = "selected" if clip_filenames else "all"
     catalog, cat_warnings = build_media_catalog(
-        root,
+        project,
         scope=scope,
         only_basenames=clip_filenames,
     )
@@ -313,36 +538,143 @@ def generate_plan(
         raise RuntimeError(
             "No media files in footage/. Add clips (video and/or audio), then run analysis."
         )
+    rows, omitted, unanalyzed = select_compact(
+        catalog,
+        brief,
+        int(limits["catalog_token_budget"]),
+    )
+    catalog_ms = int((time.perf_counter() - t0) * 1000)
+    if not rows:
+        # Estimate can report this. generate_plan turns it into an error.
+        return {
+            "limits": limits,
+            "system": [],
+            "user": [],
+            "rows": [],
+            "omitted": omitted,
+            "unanalyzed": unanalyzed,
+            "catalog_build_ms": catalog_ms,
+            "input_tokens": 0,
+            "output_tokens_guess": 0,
+            "est_cost_usd": 0.0,
+            "confirm": False,
+            "model": limits["edit_model"],
+            "file_count": 0,
+            "mode": "draft",
+        }
+    cat_text = catalog_block(rows, omitted=omitted, unanalyzed=unanalyzed)
+    if cat_warnings:
+        cat_text += "\nCatalog warnings:\n" + "\n".join(f"- {w}" for w in cat_warnings)
+    target = parse_target_seconds(brief)
+    target_line = (
+        f"Target length: about {target} seconds total (timeline end)."
+        if target
+        else "Infer a sensible target_length_seconds from the brief."
+    )
+    brief_text = (
+        f"User brief:\n{brief}\n\n{target_line}\n\n"
+        "Return the timeline JSON object only (schema_version 2, see system instructions)."
+    )
+    system = cached_system_blocks(system_prompt)
+    user = user_content_blocks(cat_text, brief_text)
+    input_tokens = estimate_tokens(content_as_text(system) + content_as_text(user))
+    cost = estimate_cost_usd(input_tokens, OUTPUT_TOKEN_GUESS, tier="edit")
+    return {
+        "limits": limits,
+        "system": system,
+        "user": user,
+        "rows": rows,
+        "omitted": omitted,
+        "unanalyzed": unanalyzed,
+        "catalog_build_ms": catalog_ms,
+        "input_tokens": input_tokens,
+        "output_tokens_guess": OUTPUT_TOKEN_GUESS,
+        "est_cost_usd": round(cost, 4),
+        "confirm": cost >= float(limits["confirm_above_usd"]),
+        "model": limits["edit_model"],
+        "file_count": len(rows),
+        "mode": "draft",
+    }
 
-    if require_merged_index:
-        missing_merged = [
-            e["id"]
-            for e in catalog
-            if (e.get("analysis") or {}).get("merged_index") != "complete"
-        ]
-        if missing_merged:
-            joined = ", ".join(missing_merged)
-            raise RuntimeError(
-                "Merged index missing for: "
-                f"{joined}. Run POST /api/footage/analyze with these names, "
-                "or wait for analysis to finish."
-            )
 
-    user_prompt = build_user_prompt(brief, catalog, cat_warnings)
+def _attach_run_meta(plan: dict, meta: dict) -> dict:
+    out = dict(plan)
+    out["planner_run"] = meta
+    return out
 
-    requested = os.environ.get("ANTHROPIC_PLAN_MODEL", DEFAULT_MODEL_ENV)
-    model_candidates = [requested]
-    if requested == DEFAULT_MODEL_ENV and DEFAULT_MODEL not in model_candidates:
-        model_candidates.append(DEFAULT_MODEL)
 
-    total_usage: dict = {"input_tokens": 0, "output_tokens": 0}
+def generate_plan(
+    brief: str,
+    *,
+    api_key: str | None = None,
+    clip_filenames: list[str] | None = None,
+    imitate_style_id: str | None = None,
+    require_merged_index: bool = True,
+    mode: str = "draft",
+) -> tuple[dict, str, dict]:
+    """
+    Draft mode: one edit-model call on the compact catalog, plus at most
+    a cheap JSON retry and one repair that does not resend unrelated files.
+    Full mode is not built yet.
+    require_merged_index is kept so older callers still import; unanalyzed
+    files are never sent either way.
+    """
+    del require_merged_index  # behavior is always "do not send unanalyzed files"
+    load_dotenv()
+    if (mode or "draft").lower() != "draft":
+        raise RuntimeError(
+            "Full mode is not available yet. Use Draft. The agent loop is a later step."
+        )
+
+    ctx = prepare_planner_context(
+        brief,
+        clip_filenames=clip_filenames,
+        imitate_style_id=imitate_style_id,
+    )
+    if not ctx["rows"]:
+        joined = ", ".join(ctx["unanalyzed"]) if ctx["unanalyzed"] else "(none)"
+        raise RuntimeError(
+            "No analyzed media to plan with. Analyze now: " + joined
+        )
+    limits = ctx["limits"]
+    budget = RunBudget(limits)
+    model_used = str(limits["edit_model"])
+    fallback = DEFAULT_MODEL if model_used == DEFAULT_MODEL_ENV else None
+    model_candidates = [model_used]
+    if fallback and fallback not in model_candidates:
+        model_candidates.append(fallback)
+
+    total_usage: dict = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "catalog_build_ms": ctx["catalog_build_ms"],
+        "model_call_ms": 0,
+        "validation_ms": 0,
+        "file_count": ctx["file_count"],
+        "omitted_count": ctx["omitted"],
+        "unanalyzed": ctx["unanalyzed"],
+        "mode": "draft",
+        "tier": "edit",
+    }
+
+    if not budget.allow(
+        est_input=int(ctx["input_tokens"]),
+        est_output=OUTPUT_TOKEN_GUESS,
+        images=0,
+    ):
+        raise RuntimeError(
+            "Planner stopped before the model call "
+            f"({budget.stop_reason}). Raise the limit in Settings or shorten the brief."
+        )
+
     text: str | None = None
-    model_used = requested
-
+    usage = None
+    stop_reason: str | None = None
+    model_t0 = time.perf_counter()
     for i, current_model in enumerate(model_candidates):
         try:
-            text, usage = call_claude(
-                current_model, system_prompt, user_prompt, api_key=api_key
+            text, usage, stop_reason = call_claude(
+                current_model, ctx["system"], ctx["user"], api_key=api_key
             )
             model_used = current_model
             break
@@ -350,52 +682,104 @@ def generate_plan(
             if i < len(model_candidates) - 1:
                 continue
             raise RuntimeError(f"Planner API error: {e}") from e
+    total_usage["model_call_ms"] += int((time.perf_counter() - model_t0) * 1000)
 
     assert text is not None
-    if usage:
-        total_usage["input_tokens"] += getattr(usage, "input_tokens", 0) or 0
-        total_usage["output_tokens"] += getattr(usage, "output_tokens", 0) or 0
+    in1, out1 = _usage_tokens(usage)
+    total_usage["input_tokens"] += in1
+    total_usage["output_tokens"] += out1
+    budget.note_call(in1, out1)
 
-    try:
-        plan = parse_plan_json(text)
-    except (json.JSONDecodeError, ValueError) as e:
-        raise ValueError(f"Invalid plan JSON from model: {e}") from e
+    plan = _parse_or_retry_plan(
+        text,
+        stop_reason,
+        model_used=model_used,
+        system_prompt=ctx["system"],
+        api_key=api_key,
+        total_usage=total_usage,
+        budget=budget,
+    )
+    # Retry tokens were added inside _parse_or_retry_plan; keep the budget in sync
+    # when the retry did not run (note_call already counted the first response only).
+    budget.input_tokens = int(total_usage["input_tokens"])
+    budget.output_tokens = int(total_usage["output_tokens"])
 
     run_group_id = str(uuid.uuid4())
     target = parse_target_seconds(brief) or plan.get("target_length_seconds")
     target = float(target) if isinstance(target, (int, float)) else None
 
+    val_t0 = time.perf_counter()
     errors = validate_plan_parsed(plan, brief, target)
+    total_usage["validation_ms"] += int((time.perf_counter() - val_t0) * 1000)
+    budget_stop = None
     if errors:
-        fix_prompt = (
-            user_prompt
-            + "\n\nYour previous JSON failed validation:\n"
-            + "\n".join(f"- {e}" for e in errors)
-            + "\n\nReturn a corrected JSON object only."
-        )
-        try:
-            text, usage2 = call_claude(
-                model_used, system_prompt, fix_prompt, api_key=api_key
-            )
-        except Exception as e:
-            raise RuntimeError(f"Planner API error on fix pass: {e}") from e
-        if usage2:
-            total_usage["input_tokens"] += getattr(usage2, "input_tokens", 0) or 0
-            total_usage["output_tokens"] += getattr(usage2, "output_tokens", 0) or 0
-        try:
-            plan = parse_plan_json(text)
-        except (json.JSONDecodeError, ValueError) as e:
-            raise ValueError(f"Invalid fixed plan JSON: {e}") from e
-        errors = validate_plan_parsed(plan, brief, target)
-        if errors:
-            raise ValueError(errors)
+        repair = build_repair_prompt(plan, errors, ctx["rows"])
+        est_in = estimate_tokens(repair) + estimate_tokens(content_as_text(ctx["system"]))
+        if not budget.allow(est_input=est_in, est_output=OUTPUT_TOKEN_GUESS):
+            budget_stop = budget.stop_reason
+        else:
+            model_t0 = time.perf_counter()
+            try:
+                text, usage2, _fix_stop = call_claude(
+                    model_used, ctx["system"], repair, api_key=api_key
+                )
+            except Exception as e:
+                raise RuntimeError(f"Planner API error on fix pass: {e}") from e
+            total_usage["model_call_ms"] += int((time.perf_counter() - model_t0) * 1000)
+            in2, out2 = _usage_tokens(usage2)
+            total_usage["input_tokens"] += in2
+            total_usage["output_tokens"] += out2
+            budget.note_call(in2, out2)
+            try:
+                plan = parse_plan_json(text)
+            except (json.JSONDecodeError, ValueError) as e:
+                raise ValueError(f"Invalid fixed plan JSON: {e}") from e
+            val_t0 = time.perf_counter()
+            errors = validate_plan_parsed(plan, brief, target)
+            total_usage["validation_ms"] += int((time.perf_counter() - val_t0) * 1000)
+            if errors:
+                raise ValueError(errors)
 
-    if is_v2(plan):
+    if budget_stop:
+        plan_v2 = plan
+    elif is_v2(plan):
         plan_v2 = finalize_v2_direct(plan, brief, run_group_id)
     else:
         plan_v2 = finalize_v2_from_segments(plan, brief, run_group_id)
 
+    cost = round(estimate_cost_usd(
+        int(total_usage["input_tokens"]),
+        int(total_usage["output_tokens"]),
+        tier="edit",
+    ), 4)
+    day = record_planner_usage(
+        input_tokens=int(total_usage["input_tokens"]),
+        output_tokens=int(total_usage["output_tokens"]),
+        cost_usd=cost,
+    )
+    meta = {
+        "mode": "draft",
+        "model": model_used,
+        "input_tokens": total_usage["input_tokens"],
+        "output_tokens": total_usage["output_tokens"],
+        "cost_usd": cost,
+        "timings_ms": {
+            "catalog_build": total_usage["catalog_build_ms"],
+            "model_call": total_usage["model_call_ms"],
+            "validation": total_usage["validation_ms"],
+        },
+        "budget_stop": budget_stop,
+        "omitted_files": ctx["omitted"],
+        "unanalyzed": ctx["unanalyzed"],
+        "validation_errors": errors if budget_stop else [],
+        "day_total": day,
+    }
+    plan_v2 = _attach_run_meta(plan_v2, meta)
     total_usage["model"] = model_used
+    total_usage["cost_usd"] = cost
+    total_usage["budget_stop"] = budget_stop
+    total_usage["day_total"] = day
+    total_usage["timings_ms"] = meta["timings_ms"]
     return plan_v2, run_group_id, total_usage
 
 

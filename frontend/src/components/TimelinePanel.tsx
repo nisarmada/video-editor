@@ -14,10 +14,7 @@ import {
   trackClipClass,
 } from "../timeline/duration";
 import {
-  clipLinkingEnabled,
-  copyClipPayload,
   copyClipsPayload,
-  expandSelectionWithAvLinks,
   findClipById,
   linkedPartnerId,
   selectionIdsForClick,
@@ -150,14 +147,10 @@ export default function TimelinePanel() {
   const splitAtPlayhead = useTimelineStore((s) => s.splitAtPlayhead);
   const refineSelectedAudioCuts = useTimelineStore((s) => s.refineSelectedAudioCuts);
   const deleteSelectedClip = useTimelineStore((s) => s.deleteSelectedClip);
-  const separateAudio = useTimelineStore((s) => s.separateAudio);
-  const reattachAudio = useTimelineStore((s) => s.reattachAudio);
-  const unlinkClipsAction = useTimelineStore((s) => s.unlinkClipsAction);
   const toggleClipLinking = useTimelineStore((s) => s.toggleClipLinking);
   const applyOperation = useTimelineStore((s) => s.applyOperation);
   const moveClipsToPlans = useTimelineStore((s) => s.moveClipsToPlans);
   const runBatchOperationSteps = useTimelineStore((s) => s.runBatchOperationSteps);
-  const setClipPropertyBatch = useTimelineStore((s) => s.setClipPropertyBatch);
   const shortcutToast = useTimelineStore((s) => s.shortcutToast);
   const setShortcutToast = useTimelineStore((s) => s.setShortcutToast);
 

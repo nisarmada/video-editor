@@ -24,6 +24,9 @@ from index_cache import (  # noqa: E402
     keyframes_path,
     load_json,
     merged_index_path,
+    audio_perception_path,
+    takes_path,
+    perception_path,
     save_json,
     silences_path,
     shots_path,
@@ -67,6 +70,9 @@ def build_merged_index(clip_path: Path, *, force: bool = False) -> dict:
         keyframes = keyframes_doc.get("keyframes") or []
 
     captions = load_json(captions_path(clip_path))
+    perception = load_json(perception_path(clip_path))
+    audio_perception = load_json(audio_perception_path(clip_path))
+    takes_doc = load_json(takes_path(clip_path))
 
     duration, has_audio, rotation = clip_metadata(clip_path)
 
@@ -104,6 +110,12 @@ def build_merged_index(clip_path: Path, *, force: bool = False) -> dict:
         payload["keyframes"] = keyframes
     if is_video and captions is not None:
         payload["captions"] = captions
+    if is_video and perception is not None:
+        payload["perception"] = perception
+    if audio_perception is not None:
+        payload["audio_perception"] = audio_perception
+    if takes_doc is not None:
+        payload["takes"] = takes_doc
 
     save_json(out_path, payload)
     return payload

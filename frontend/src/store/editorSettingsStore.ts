@@ -99,7 +99,7 @@ function writeLocal(s: State): void {
   }
 }
 
-let persistTimer: ReturnType<typeof setTimeout> | null = null;
+let persistTimer: number | null = null;
 function schedulePersist(s: State): void {
   writeLocal(s);
   if (persistTimer) clearTimeout(persistTimer);

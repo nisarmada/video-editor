@@ -86,7 +86,7 @@ export type TimelineClip = {
   /** Seconds; export default when omitted uses legacy 20ms boundary fades (embedded) or 20ms per clip (audio track). */
   audio_fade_in?: number;
   audio_fade_out?: number;
-  /** Seconds; video opacity fade (export only when set). */
+  /** Seconds; video opacity fade in preview and export when set. */
   video_fade_in?: number;
   video_fade_out?: number;
   transition_out?: { type: "dissolve" | "crossfade"; duration: number };
@@ -110,7 +110,7 @@ export type TimelineTrack = {
   muted?: boolean;
   /** Linear gain for preview/export mixing (default 1). */
   volume?: number;
-  /** When set on an audio track, multiply clip gain when overlapping clips on this track id. */
+  /** While clips overlap this track id, ease gain down to duck_gain and back. */
   duck_under_track_id?: string;
   duck_gain?: number;
   clips: TimelineClip[];

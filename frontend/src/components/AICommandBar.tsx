@@ -1,13 +1,15 @@
 import { useEffect, useRef, useState } from "react";
+import { requestFootageAnalyze } from "../api/planner";
 import { analyzeStyle } from "../api/styles";
 import { useTimelineStore } from "../store/timelineStore";
+import { nextAutoPlanStem } from "../utils/planStem";
 
 type FootageScope = "all" | "selected";
+type PlannerMode = "draft" | "full";
 
 const PLANNER_BAR_COLLAPSED_KEY = "video-editor:plannerBarCollapsed";
 
 export default function AICommandBar() {
-  const currentPlanName = useTimelineStore((s) => s.currentPlanName);
   const timelineLoading = useTimelineStore((s) => s.timelineLoading);
   const saving = useTimelineStore((s) => s.saveStatus === "saving");
   const rendering = useTimelineStore((s) => s.renderStatus === "rendering");
@@ -24,15 +26,20 @@ export default function AICommandBar() {
   const plannerSuccessSummary = useTimelineStore(
     (s) => s.plannerSuccessSummary,
   );
+  const plannerUnanalyzed = useTimelineStore((s) => s.plannerUnanalyzed);
 
   const selectedFootageNames = useTimelineStore((s) => s.selectedFootageNames);
+  const availablePlans = useTimelineStore((s) => s.availablePlans);
   const runPlannerJob = useTimelineStore((s) => s.runPlannerJob);
   const styleProfiles = useTimelineStore((s) => s.styleProfiles);
   const refreshStyleProfiles = useTimelineStore((s) => s.refreshStyleProfiles);
 
   const [brief, setBrief] = useState("");
-  const [saveAs, setSaveAs] = useState("");
+  const [saveAsTouched, setSaveAsTouched] = useState(false);
+  const [saveAs, setSaveAs] = useState(() => nextAutoPlanStem([]));
   const [footageScope, setFootageScope] = useState<FootageScope>("all");
+  const [plannerMode, setPlannerMode] = useState<PlannerMode>("draft");
+  const [analyzeNote, setAnalyzeNote] = useState<string | null>(null);
   const [barCollapsed, setBarCollapsed] = useState(() => {
     if (typeof window === "undefined") return false;
     return window.localStorage.getItem(PLANNER_BAR_COLLAPSED_KEY) === "1";
@@ -43,10 +50,9 @@ export default function AICommandBar() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    if (currentPlanName) {
-      setSaveAs((prev) => prev || currentPlanName);
-    }
-  }, [currentPlanName]);
+    if (saveAsTouched) return;
+    setSaveAs(nextAutoPlanStem(availablePlans));
+  }, [availablePlans, saveAsTouched]);
 
   const blocked =
     timelineLoading ||
@@ -145,11 +151,14 @@ export default function AICommandBar() {
               <input
                 type="text"
                 className="ai-command-bar__input ai-command-bar__input--stem"
-                placeholder="plan name (no .json)"
+                placeholder="new plan name"
                 value={saveAs}
-                onChange={(e) => setSaveAs(e.target.value)}
+                onChange={(e) => {
+                  setSaveAsTouched(true);
+                  setSaveAs(e.target.value);
+                }}
                 disabled={plannerRunning}
-                title="Plan file stem; overwrites if it already exists"
+                title="New plan file unless this name already exists"
               />
             </label>
             <div
@@ -177,6 +186,30 @@ export default function AICommandBar() {
                   title="Shift+click clips in the media bin to add to selection"
                 >
                   Selected ({selectedFootageNames.length})
+                </button>
+              </div>
+            </div>
+            <div className="ai-command-bar__scope" role="group" aria-label="Planner mode">
+              <span className="ai-command-bar__label">Mode</span>
+              <div className="ai-command-bar__segment">
+                <button
+                  type="button"
+                  className={`btn btn--segment${plannerMode === "draft" ? " btn--segment-active" : ""}`}
+                  aria-pressed={plannerMode === "draft"}
+                  disabled={plannerRunning}
+                  onClick={() => setPlannerMode("draft")}
+                >
+                  Draft
+                </button>
+                <button
+                  type="button"
+                  className={`btn btn--segment${plannerMode === "full" ? " btn--segment-active" : ""}`}
+                  aria-pressed={plannerMode === "full"}
+                  disabled={plannerRunning}
+                  title="Not available yet. Draft is one compact call."
+                  onClick={() => setPlannerMode("full")}
+                >
+                  Full
                 </button>
               </div>
             </div>
@@ -243,13 +276,14 @@ export default function AICommandBar() {
                   : undefined
               }
               onClick={() =>
-                void runPlannerJob(brief, saveAs || currentPlanName, {
+                void runPlannerJob(brief, saveAs, {
                   footageScope,
                   clipNames:
                     footageScope === "selected"
                       ? selectedFootageNames
                       : undefined,
                   imitateStyleId: imitateStyleId || null,
+                  mode: plannerMode,
                 })
               }
             >
@@ -267,7 +301,9 @@ export default function AICommandBar() {
         {(plannerRunning ||
           plannerError ||
           plannerSuccessSummary ||
-          styleUploadError) && (
+          styleUploadError ||
+          analyzeNote ||
+          plannerUnanalyzed.length > 0) && (
           <div className="ai-command-bar__status">
             {plannerRunning && plannerProgressMessage && (
               <span className="ai-command-bar__progress">
@@ -276,9 +312,42 @@ export default function AICommandBar() {
             )}
             {plannerRunning && plannerPhase === "planning" && (
               <span className="ai-command-bar__hint">
-                This may take a minute while the model reads your transcripts and
-                indexes.
+                Draft mode sends a short catalog and makes one model call.
               </span>
+            )}
+            {plannerUnanalyzed.length > 0 && !plannerRunning && (
+              <button
+                type="button"
+                className="btn btn--ghost"
+                onClick={() => {
+                  const names = plannerUnanalyzed;
+                  if (
+                    typeof window !== "undefined" &&
+                    !window.confirm(
+                      `Analyze ${names.length} file(s) now? Video that still needs frame captions can call the paid caption API.`,
+                    )
+                  ) {
+                    return;
+                  }
+                  setAnalyzeNote(null);
+                  void requestFootageAnalyze({ names })
+                    .then((res) => {
+                      setAnalyzeNote(
+                        `Queued analysis for ${res.queued.length} file(s). Generate again when it finishes.`,
+                      );
+                    })
+                    .catch((e: unknown) => {
+                      setAnalyzeNote(
+                        e instanceof Error ? e.message : "Could not queue analysis.",
+                      );
+                    });
+                }}
+              >
+                Analyze now ({plannerUnanalyzed.length})
+              </button>
+            )}
+            {analyzeNote && (
+              <span className="ai-command-bar__hint">{analyzeNote}</span>
             )}
             {(plannerError || styleUploadError) && (
               <span className="ai-command-bar__error" role="alert">

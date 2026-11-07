@@ -62,6 +62,27 @@ def get_public_settings(root: Path) -> dict[str, Any]:
     audio_cut_refine: dict[str, Any] = {}
     if isinstance(acr, dict):
         audio_cut_refine = acr
+    transcription = raw.get("transcription")
+    transcription_public = {
+        "model_size": "small",
+        "keep_quiet_speech": False,
+    }
+    if isinstance(transcription, dict):
+        size = str(transcription.get("model_size") or "small").lower()
+        if size in ("small", "medium"):
+            transcription_public["model_size"] = size
+        transcription_public["keep_quiet_speech"] = bool(
+            transcription.get("keep_quiet_speech")
+        )
+    embedding = raw.get("embedding")
+    embedding_public = {"method": "hash", "model_name": "all-MiniLM-L6-v2"}
+    if isinstance(embedding, dict):
+        method = str(embedding.get("method") or "hash").lower()
+        if method in ("hash", "sentence_transformer"):
+            embedding_public["method"] = method
+        name = str(embedding.get("model_name") or "all-MiniLM-L6-v2").strip()
+        if name:
+            embedding_public["model_name"] = name
     return {
         "planner_api_key_configured": configured,
         "paths": {
@@ -80,7 +101,17 @@ def get_public_settings(root: Path) -> dict[str, Any]:
         "keybindings": keybindings,
         "ui": ui_public,
         "audio_cut_refine": audio_cut_refine,
+        "planner": _public_planner(root),
+        "transcription": transcription_public,
+        "embedding": embedding_public,
     }
+
+
+def _public_planner(root: Path) -> dict[str, Any]:
+    """Budgets and model names. No secrets."""
+    from planner_limits import public_planner_settings
+
+    return public_planner_settings(root)
 
 
 def set_planner_api_key(root: Path, api_key: str | None) -> None:
@@ -149,6 +180,40 @@ def merge_settings(root: Path, body: dict[str, Any]) -> dict[str, Any]:
                 else {}
             )
             raw["audio_cut_refine"] = {**prev, **acr}
+    if "planner" in body and isinstance(body["planner"], dict):
+        from planner_limits import DEFAULTS
+
+        prev = raw.get("planner") if isinstance(raw.get("planner"), dict) else {}
+        incoming = {k: body["planner"][k] for k in DEFAULTS if k in body["planner"]}
+        raw["planner"] = {**prev, **incoming}
+    if "transcription" in body and isinstance(body["transcription"], dict):
+        prev = (
+            raw.get("transcription")
+            if isinstance(raw.get("transcription"), dict)
+            else {}
+        )
+        inc = body["transcription"]
+        merged_tx = {**prev}
+        if "model_size" in inc:
+            size = str(inc["model_size"] or "small").lower()
+            if size in ("small", "medium"):
+                merged_tx["model_size"] = size
+        if "keep_quiet_speech" in inc:
+            merged_tx["keep_quiet_speech"] = bool(inc["keep_quiet_speech"])
+        raw["transcription"] = merged_tx
+    if "embedding" in body and isinstance(body["embedding"], dict):
+        prev = raw.get("embedding") if isinstance(raw.get("embedding"), dict) else {}
+        inc = body["embedding"]
+        merged_emb = {**prev}
+        if "method" in inc:
+            method = str(inc["method"] or "hash").lower()
+            if method in ("hash", "sentence_transformer"):
+                merged_emb["method"] = method
+        if "model_name" in inc:
+            name = str(inc["model_name"] or "").strip()
+            if name:
+                merged_emb["model_name"] = name
+        raw["embedding"] = merged_emb
     save_raw(root, raw)
     return get_public_settings(root)
 

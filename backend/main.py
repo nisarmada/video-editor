@@ -31,7 +31,7 @@ from backend.app_logging import get_logs, last_index, log_event  # noqa: E402
 from backend.footage_jobs import get_job, schedule_proxy_work  # noqa: E402
 from backend.index_jobs import get_job as get_index_job  # noqa: E402
 from backend.index_jobs import schedule_index_pipeline  # noqa: E402
-from backend.media_catalog import build_media_catalog, list_unanalyzed_for_planning  # noqa: E402
+from backend.media_catalog import build_media_catalog  # noqa: E402
 from backend.waveform_jobs import (  # noqa: E402
     get_job as get_waveform_job,
     schedule_waveform_work,
@@ -56,6 +56,7 @@ from backend.render_jobs import (  # noqa: E402
     update_job,
 )
 from backend.caption_style_store import fonts_bundle_dir  # noqa: E402
+from backend.retranscribe import clear_transcript_dependent_index  # noqa: E402
 from backend.settings_store import (  # noqa: E402
     effective_planner_api_key,
     effective_render_defaults,
@@ -65,8 +66,13 @@ from backend.settings_store import (  # noqa: E402
     save_raw,
     set_planner_api_key,
 )
+from backend.storage_cache import (  # noqa: E402
+    clear_paid_caption_caches,
+    clear_regenerable_caches,
+    storage_stats,
+)
 from analyze_style import analyze_reference_video  # noqa: E402
-from plan import generate_plan  # noqa: E402
+from plan import generate_plan, prepare_planner_context  # noqa: E402
 from proxy_media import (  # noqa: E402
     ensure_proxy,
     ensure_thumbnail,
@@ -127,16 +133,26 @@ class SaveTimelineRequest(BaseModel):
 class PlannerRequest(BaseModel):
     brief: str
     save_as: str = Field(description="Plan filename without path, e.g. draft1")
-    # If set, only these footage basenames are sent to the model (merged indexes must exist).
+    # If set, only these footage basenames are considered. Unanalyzed files are still omitted.
     clip_filenames: list[str] | None = None
     allow_without_merged_index: bool = Field(
         default=False,
-        description="If true, run planner even when merged index is missing (not recommended).",
+        description="Kept for older clients. Unanalyzed files are never sent.",
     )
     imitate_style_id: str | None = Field(
         default=None,
         description="plans/styles/<id>.json profile to mirror in the system prompt",
     )
+    mode: str = Field(
+        default="draft",
+        description="draft = one compact call. full is not available yet.",
+    )
+
+
+class PlannerEstimateRequest(BaseModel):
+    brief: str
+    clip_filenames: list[str] | None = None
+    imitate_style_id: str | None = None
 
 
 class RenderRequest(BaseModel):
@@ -158,6 +174,10 @@ class SettingsUpdate(BaseModel):
     user_caption_styles: list[dict[str, Any]] | None = None
     keybindings: dict[str, Any] | None = None
     ui: dict[str, Any] | None = None
+    audio_cut_refine: dict[str, Any] | None = None
+    planner: dict[str, Any] | None = None
+    transcription: dict[str, Any] | None = None
+    embedding: dict[str, Any] | None = None
 
 
 class CaptionsAssBody(BaseModel):
@@ -411,6 +431,14 @@ def put_settings(body: SettingsUpdate, paths: ProjectPaths = Depends(get_paths))
         payload["keybindings"] = body.keybindings
     if body.ui is not None:
         payload["ui"] = body.ui
+    if body.planner is not None:
+        payload["planner"] = body.planner
+    if body.audio_cut_refine is not None:
+        payload["audio_cut_refine"] = body.audio_cut_refine
+    if body.transcription is not None:
+        payload["transcription"] = body.transcription
+    if body.embedding is not None:
+        payload["embedding"] = body.embedding
     log_event("info", "Settings updated (non-secret keys only)")
     merge_settings(paths.root, payload)
     paths2 = refresh_paths_from_settings()
@@ -565,6 +593,41 @@ def analyze_footage(
     return {"queued": [p.name for p in targets]}
 
 
+@app.post("/api/footage/{name}/retranscribe")
+def retranscribe_footage(name: str, paths: ProjectPaths = Depends(get_paths)) -> dict[str, Any]:
+    """Re-run transcription with current settings; rebuilds dependent index JSON."""
+    base = Path(name).name
+    if not base or base != name:
+        raise HTTPException(status_code=400, detail="Invalid name")
+    clip_path = paths.footage / base
+    if not clip_path.is_file():
+        raise HTTPException(status_code=404, detail=f"Not in footage/: {base}")
+    removed = clear_transcript_dependent_index(paths.root, clip_path)
+    schedule_index_pipeline(paths.root, clip_path)
+    return {"queued": base, "removed_index_files": removed}
+
+
+@app.get("/api/storage/stats")
+def get_storage_stats(paths: ProjectPaths = Depends(get_paths)) -> dict[str, Any]:
+    return storage_stats(paths.root)
+
+
+@app.post("/api/storage/clear-regenerable")
+def post_clear_regenerable_caches(
+    paths: ProjectPaths = Depends(get_paths),
+) -> dict[str, Any]:
+    """Delete perception JPEGs, keyframe images, and local recomputable JSON (not AI captions)."""
+    return clear_regenerable_caches(paths.root)
+
+
+@app.post("/api/storage/clear-paid-captions")
+def post_clear_paid_caption_caches(
+    paths: ProjectPaths = Depends(get_paths),
+) -> dict[str, Any]:
+    """Delete *_captions.json only; regenerating calls the paid caption API."""
+    return clear_paid_caption_caches(paths.root)
+
+
 @app.get("/api/media/catalog")
 def get_media_catalog(
     paths: ProjectPaths = Depends(get_paths),
@@ -584,6 +647,71 @@ def get_media_catalog(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"entries": entries, "warnings": warnings}
+
+
+@app.get("/api/media/catalog/detail")
+def get_media_catalog_detail(
+    name: str,
+    start: float | None = None,
+    end: float | None = None,
+    paths: ProjectPaths = Depends(get_paths),
+) -> dict[str, Any]:
+    """Words, shots, and frames for one file. Draft mode does not call this."""
+    base = Path(name).name
+    if not base or base != name:
+        raise HTTPException(status_code=400, detail="Invalid name")
+    try:
+        entries, _warnings = build_media_catalog(
+            paths.root,
+            scope="selected",
+            only_basenames=[base],
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if not entries:
+        raise HTTPException(status_code=404, detail=f"No catalog entry for {base}")
+    from planner_catalog import detail_slice
+
+    return detail_slice(entries[0], start=start, end=end)
+
+
+def _unanalyzed_names_from_message(msg: str) -> list[str]:
+    if "Analyze now:" not in msg:
+        return []
+    tail = msg.split("Analyze now:", 1)[1]
+    return [
+        part.strip()
+        for part in tail.split(",")
+        if part.strip() and part.strip() != "(none)"
+    ]
+
+
+@app.post("/api/planner/estimate")
+def estimate_planner(
+    body: PlannerEstimateRequest,
+    paths: ProjectPaths = Depends(get_paths),
+) -> dict[str, Any]:
+    """Token and cost estimate. Does not call the model."""
+    with project_cwd(paths):
+        try:
+            ctx = prepare_planner_context(
+                body.brief,
+                clip_filenames=body.clip_filenames,
+                imitate_style_id=body.imitate_style_id,
+            )
+        except RuntimeError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+    return {
+        "file_count": ctx["file_count"],
+        "omitted_count": ctx["omitted"],
+        "unanalyzed": ctx["unanalyzed"],
+        "input_tokens": ctx["input_tokens"],
+        "est_cost_usd": ctx["est_cost_usd"],
+        "confirm": ctx["confirm"],
+        "model": ctx["model"],
+        "catalog_build_ms": ctx["catalog_build_ms"],
+        "mode": "draft",
+    }
 
 
 @app.get("/api/footage/{name}/index-job")
@@ -964,17 +1092,16 @@ def run_planner(
     body: PlannerRequest,
     paths: ProjectPaths = Depends(get_paths),
 ) -> dict[str, Any]:
-    api_key = effective_planner_api_key(paths.root)
-    unanalyzed = list_unanalyzed_for_planning(paths.root, body.clip_filenames)
-    if unanalyzed and not body.allow_without_merged_index:
+    mode = (body.mode or "draft").strip().lower()
+    if mode != "draft":
         raise HTTPException(
-            status_code=409,
-            detail={
-                "message": "Analysis required: merged index missing for some files.",
-                "unanalyzed": unanalyzed,
-                "hint": "POST /api/footage/analyze with { names: [...] } or { all: true }",
-            },
+            status_code=400,
+            detail=(
+                "Full mode is not available yet. Use Draft. "
+                "The agent loop is a later step."
+            ),
         )
+    api_key = effective_planner_api_key(paths.root)
     with project_cwd(paths):
         try:
             plan_v2, group_id, usage = generate_plan(
@@ -982,22 +1109,25 @@ def run_planner(
                 api_key=api_key,
                 clip_filenames=body.clip_filenames,
                 imitate_style_id=body.imitate_style_id,
-                require_merged_index=not body.allow_without_merged_index,
+                require_merged_index=False,
+                mode=mode,
             )
         except FileNotFoundError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
         except RuntimeError as e:
             msg = str(e)
-            if "Merged index missing" in msg:
+            if "Analyze now" in msg or "No analyzed media" in msg:
                 raise HTTPException(
                     status_code=409,
                     detail={
                         "message": msg,
-                        "unanalyzed": unanalyzed,
-                        "hint": "POST /api/footage/analyze with { names: [...] } or { all: true }",
+                        "unanalyzed": _unanalyzed_names_from_message(msg),
+                        "hint": "POST /api/footage/analyze with { names: [...] }",
                     },
                 ) from e
-            raise HTTPException(status_code=503, detail=msg)
+            if msg.startswith("Planner stopped") or msg.startswith("Full mode"):
+                raise HTTPException(status_code=400, detail=msg) from e
+            raise HTTPException(status_code=503, detail=msg) from e
         except ValueError as e:
             detail = e.args[0] if e.args and isinstance(e.args[0], list) else str(e)
             raise HTTPException(status_code=400, detail=detail)

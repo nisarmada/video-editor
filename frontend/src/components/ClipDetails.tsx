@@ -549,7 +549,10 @@ export default function ClipDetails() {
             />
           </div>
           <div className="props-row">
-            <label>transition_out (s)</label>
+            <label>
+              transition_out (s){" "}
+              <span className="props-export-only">export only</span>
+            </label>
             <input
               type="text"
               inputMode="decimal"
@@ -570,7 +573,7 @@ export default function ClipDetails() {
               value={duckUnderIn}
               onChange={(e) => setDuckUnderIn(e.target.value)}
               disabled={applyInProgress}
-              placeholder="voice track id"
+              placeholder="audio track id"
             />
           </div>
           <div className="props-row">

@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { fetchMediaCatalog } from "../api/catalog";
 import {
   deleteFootageFile,
   FootageInUseError,
   uploadFootageFile,
 } from "../api/footage";
+import { requestFootageAnalyze } from "../api/planner";
+import { filesMissingAnalysis } from "../media/missingAnalysis";
 import {
   FOOTAGE_DRAG_MIME,
   FOOTAGE_DRAG_TEXT_TYPE,
@@ -48,6 +51,9 @@ export default function MediaBin() {
   const selectFootage = useTimelineStore((s) => s.selectFootage);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [analyzeBusy, setAnalyzeBusy] = useState(false);
+  const [analyzeMessage, setAnalyzeMessage] = useState<string | null>(null);
+  const [analyzeIsError, setAnalyzeIsError] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [uploads, setUploads] = useState<UploadRow[]>([]);
   const [deleteBusy, setDeleteBusy] = useState<string | null>(null);
@@ -106,6 +112,47 @@ export default function MediaBin() {
 
   function onImportClick() {
     fileInputRef.current?.click();
+  }
+
+  async function onAnalyzeMissing() {
+    setAnalyzeBusy(true);
+    setAnalyzeMessage(null);
+    setAnalyzeIsError(false);
+    try {
+      const { entries } = await fetchMediaCatalog();
+      const missing = filesMissingAnalysis(entries);
+      if (missing.length === 0) {
+        setAnalyzeMessage("Every file in the library already has its analysis files.");
+        return;
+      }
+      const needsCaptions = missing.filter((row) =>
+        row.missing.includes("ai_frame_captions"),
+      );
+      if (needsCaptions.length > 0) {
+        const ok = window.confirm(
+          `${needsCaptions.length} video file(s) are missing frame captions. ` +
+            "Queuing them can call the paid caption API when those captions are not cached. Continue?",
+        );
+        if (!ok) {
+          setAnalyzeMessage("Analyze all missing was cancelled.");
+          return;
+        }
+      }
+      const queued = await requestFootageAnalyze({
+        names: missing.map((row) => row.id),
+      });
+      setAnalyzeMessage(
+        `Queued analysis for ${queued.queued.length} file(s).`,
+      );
+      await fetchFootage({ silent: true });
+    } catch (e) {
+      setAnalyzeIsError(true);
+      setAnalyzeMessage(
+        e instanceof Error ? e.message : "Could not queue analysis.",
+      );
+    } finally {
+      setAnalyzeBusy(false);
+    }
   }
 
   async function onDelete(name: string) {
@@ -179,7 +226,28 @@ export default function MediaBin() {
         >
           Rescan folder
         </button>
+        <button
+          type="button"
+          className="btn btn--ghost"
+          disabled={analyzeBusy || clips.length === 0}
+          title="Queue analysis for files that are missing a transcript, silences, shots, keyframes, captions, or a merged index"
+          onClick={() => void onAnalyzeMissing()}
+        >
+          {analyzeBusy ? "Queuing…" : "Analyze all missing"}
+        </button>
       </div>
+      {analyzeMessage && (
+        <p
+          className={
+            analyzeIsError
+              ? "panel-message panel-message--error"
+              : "panel-message"
+          }
+          role={analyzeIsError ? "alert" : "status"}
+        >
+          {analyzeMessage}
+        </p>
+      )}
       <div className="panel__body panel__body--media">
         {loading && <p className="panel-message">Loading footage…</p>}
         {error && (

@@ -2,7 +2,16 @@ import { parseFastApiErrorBody } from "./httpError";
 
 export type MediaCatalogEntry = {
   id: string;
-  analysis?: { merged_index?: string };
+  kind?: string;
+  analysis?: {
+    merged_index?: string;
+    transcript?: string;
+    silences?: string;
+    shots?: string;
+    keyframes?: string;
+    ai_frame_captions?: string;
+    waveform_peaks?: { status?: string };
+  };
   [key: string]: unknown;
 };
 

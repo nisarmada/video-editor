@@ -12,7 +12,6 @@ import {
 import { timelineViewportElRef } from "../store/editorSettingsStore";
 import { snapShortcutTime } from "./snapTime";
 import {
-  clipLinkingEnabled,
   expandSelectionWithAvLinks,
   findClipById,
 } from "../timeline/selection";
