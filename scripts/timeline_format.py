@@ -47,11 +47,32 @@ def clip_timeline_duration(clip: dict, track_type: str) -> float:
     speed = float(clip.get("speed") or 1.0)
     if speed <= 0:
         speed = 1.0
+    if track_type == "caption":
+        t0 = float(clip.get("timeline_start") or 0.0)
+        if clip.get("timeline_end") is not None:
+            try:
+                tend = float(clip["timeline_end"])
+                if tend > t0 + 1e-9:
+                    return tend - t0
+            except (TypeError, ValueError):
+                pass
+        if "source_in" in clip and "source_out" in clip:
+            try:
+                base = float(clip["source_out"]) - float(clip["source_in"])
+            except (TypeError, ValueError):
+                base = 0.0
+        else:
+            base = 0.0
+        if base <= 1e-9:
+            text = clip.get("text")
+            if isinstance(text, str) and text.strip():
+                est = max(0.5, min(24.0, len(text.strip()) * 0.045))
+                return est
+            return 0.25
+        return max(base, 0.25)
     src_in = float(clip["source_in"])
     src_out = float(clip["source_out"])
     base = src_out - src_in
-    if track_type == "caption":
-        return base
     return base / speed
 
 

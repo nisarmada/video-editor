@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   deleteFootageFile,
   FootageInUseError,
@@ -19,8 +19,26 @@ type UploadRow = {
   error: string | null;
 };
 
+function clipFootageKind(clip: { kind?: string; name: string }): "video" | "audio" {
+  if (clip.kind === "audio" || clip.kind === "video") return clip.kind;
+  const ext = clip.name.includes(".")
+    ? clip.name.slice(clip.name.lastIndexOf(".")).toLowerCase()
+    : "";
+  const audioExts = new Set([
+    ".mp3",
+    ".wav",
+    ".aac",
+    ".m4a",
+    ".flac",
+    ".ogg",
+    ".opus",
+  ]);
+  return audioExts.has(ext) ? "audio" : "video";
+}
+
 export default function MediaBin() {
   const clips = useTimelineStore((s) => s.footageClips);
+  const mediaBinCategory = useTimelineStore((s) => s.mediaBinCategory);
   const loading = useTimelineStore((s) => s.footageLoading);
   const error = useTimelineStore((s) => s.footageError);
   const selectedName = useTimelineStore((s) => s.selectedFootageName);
@@ -37,6 +55,11 @@ export default function MediaBin() {
   useEffect(() => {
     void fetchFootage();
   }, [fetchFootage]);
+
+  const visibleClips = useMemo(() => {
+    if (mediaBinCategory === "all") return clips;
+    return clips.filter((c) => clipFootageKind(c) === mediaBinCategory);
+  }, [clips, mediaBinCategory]);
 
   const needsPoll = clips.some((c) => {
     const st = c.process_status ?? "ready";
@@ -137,7 +160,7 @@ export default function MediaBin() {
           ref={fileInputRef}
           type="file"
           className="media-bin-toolbar__file-input"
-          accept="video/mp4,video/quicktime,video/x-m4v,video/x-matroska,video/webm,.mp4,.mov,.m4v,.mkv,.webm"
+          accept="video/*,audio/*,.mp4,.mov,.m4v,.mkv,.webm,.mp3,.wav,.aac,.m4a,.flac,.ogg,.opus"
           multiple
           onChange={(e) => {
             const f = e.target.files;
@@ -191,20 +214,40 @@ export default function MediaBin() {
             ))}
           </ul>
         )}
-        {!loading && !error && clips.length === 0 && uploads.length === 0 && (
+        {!loading &&
+          !error &&
+          clips.length === 0 &&
+          uploads.length === 0 && (
           <p className="panel-message">
-            No clips yet — Import or drop video files here (saved under{" "}
+            No clips yet — Import or drop video or audio files here (saved under{" "}
             <code className="media-bin-code">footage/</code>).
           </p>
         )}
+        {!loading &&
+          !error &&
+          clips.length > 0 &&
+          visibleClips.length === 0 &&
+          uploads.length === 0 && (
+            <p className="panel-message">
+              No{" "}
+              {mediaBinCategory === "video"
+                ? "video"
+                : mediaBinCategory === "audio"
+                  ? "audio"
+                  : ""}{" "}
+              files in <code className="media-bin-code">footage/</code> yet — switch tab or
+              import {mediaBinCategory === "audio" ? "an .mp3 / .wav" : "media"}.
+            </p>
+          )}
         <ul className="media-list">
-          {clips.map((clip) => {
+          {visibleClips.map((clip) => {
             const isSelected =
               clip.name === selectedName || selectedNames.includes(clip.name);
             const pStatus = clip.process_status ?? "ready";
             const processing =
               pStatus === "processing" || pStatus === "pending";
             const failed = pStatus === "failed";
+            const kind = clipFootageKind(clip);
             return (
               <li key={clip.name} className="media-list__row">
                 <button
@@ -252,6 +295,11 @@ export default function MediaBin() {
                   </div>
                   <div className="media-list__meta">
                     <span className="media-list__name" title={clip.name}>
+                      {kind === "audio" && (
+                        <span className="media-list__kind" title="Audio file">
+                          ♪{" "}
+                        </span>
+                      )}
                       {clip.name}
                     </span>
                     <span className="media-list__duration">

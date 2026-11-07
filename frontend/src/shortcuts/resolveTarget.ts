@@ -13,9 +13,10 @@ import { timelineViewportElRef } from "../store/editorSettingsStore";
 import { snapShortcutTime } from "./snapTime";
 import {
   clipLinkingEnabled,
-  expandLinkedSelection,
+  expandSelectionWithAvLinks,
   findClipById,
 } from "../timeline/selection";
+import { useEditorSettingsStore } from "../store/editorSettingsStore";
 import { clipTimelineDuration } from "../timeline/duration";
 
 export type ResolvedShortcutTarget = {
@@ -27,7 +28,7 @@ export type ResolvedShortcutTarget = {
   primaryClipId: string | null;
   /** Multi-select clip ids when selection path applies */
   clipIds: string[];
-  /** From expandLinkedSelection when linking on */
+  /** After expandSelectionWithAvLinks when Sel link is on */
   expandedClipIds: string[];
   fallbackNoClip: boolean;
   message: string | null;
@@ -220,9 +221,11 @@ export function resolveTarget(
     baseIds = [clipId];
   }
 
+  const selectLinked =
+    useEditorSettingsStore.getState().selectLinkedClipsTogether;
   let clipIds =
-    clipLinkingEnabled(tl!) && baseIds.length > 0
-      ? expandLinkedSelection(tl!, baseIds)
+    baseIds.length > 0
+      ? expandSelectionWithAvLinks(tl!, baseIds, selectLinked)
       : baseIds;
 
   clipIds = clipIds.filter((id) => clipContainsTime(id, raw));

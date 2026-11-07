@@ -16,9 +16,11 @@ import {
 import {
   clipLinkingEnabled,
   copyClipPayload,
-  expandLinkedSelection,
+  copyClipsPayload,
+  expandSelectionWithAvLinks,
   findClipById,
   linkedPartnerId,
+  selectionIdsForClick,
   orderedTracks,
   playheadInsideClip,
   readClipFromClipboard,
@@ -62,6 +64,8 @@ import {
   setCursorHoverClip,
 } from "../store/cursorContextStore";
 import { timelineViewportElRef, useEditorSettingsStore } from "../store/editorSettingsStore";
+import { useTimelineMarquee } from "../hooks/useTimelineMarquee";
+import { validateGroupMove } from "../timeline/groupMove";
 
 const LABEL_WIDTH = TIMELINE_LABEL_WIDTH;
 const RULER_HEIGHT = TIMELINE_RULER_HEIGHT;
@@ -104,13 +108,18 @@ function isFootageBinDrag(e: React.DragEvent): boolean {
   return isFootageFromBinDragging();
 }
 
-type PointerDragState = {
+type PointerDragMember = {
   clipId: string;
   originTrackId: string;
   originTrackType: TrackType;
+  originTimelineStart: number;
+};
+
+type PointerDragState = {
+  primary: PointerDragMember;
   pointerId: number;
   startClientX: number;
-  originTimelineStart: number;
+  group: PointerDragMember[];
 };
 
 export default function TimelinePanel() {
@@ -145,6 +154,9 @@ export default function TimelinePanel() {
   const unlinkClipsAction = useTimelineStore((s) => s.unlinkClipsAction);
   const toggleClipLinking = useTimelineStore((s) => s.toggleClipLinking);
   const applyOperation = useTimelineStore((s) => s.applyOperation);
+  const moveClipsToPlans = useTimelineStore((s) => s.moveClipsToPlans);
+  const runBatchOperationSteps = useTimelineStore((s) => s.runBatchOperationSteps);
+  const setClipPropertyBatch = useTimelineStore((s) => s.setClipPropertyBatch);
   const shortcutToast = useTimelineStore((s) => s.shortcutToast);
   const setShortcutToast = useTimelineStore((s) => s.setShortcutToast);
 
@@ -161,7 +173,6 @@ export default function TimelinePanel() {
   const [dropIndicatorSec, setDropIndicatorSec] = useState<number | null>(null);
   const [pointerDrag, setPointerDrag] = useState<PointerDragState | null>(null);
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
-  const [hoverClipId, setHoverClipId] = useState<string | null>(null);
   /** Clip that would receive cursor-based shortcuts (keyboard), for outline */
   const [cursorTargetClipId, setCursorTargetClipId] = useState<string | null>(null);
 
@@ -184,7 +195,109 @@ export default function TimelinePanel() {
     }
   }, []);
 
+  const runBatchSeparate = useCallback(
+    async (ids: string[]) => {
+      if (!timeline) return;
+      const steps: { operation: string; arguments: Record<string, unknown> }[] = [];
+      let skip = 0;
+      for (const id of ids) {
+        const h = findClipById(timeline, id);
+        if (h?.trackType === "video" && h.clip.audio_source !== "detached") {
+          steps.push({ operation: "separate_audio", arguments: { clip_id: id } });
+        } else skip += 1;
+      }
+      if (steps.length === 0) {
+        setOpError("No selected clips with embedded audio.");
+        return;
+      }
+      await runBatchOperationSteps(steps);
+      if (skip > 0) {
+        setShortcutToast(`Separated ${steps.length} of ${ids.length}; ${skip} skipped.`);
+      }
+    },
+    [timeline, runBatchOperationSteps, setOpError, setShortcutToast],
+  );
+
+  const runBatchReattach = useCallback(
+    async (ids: string[]) => {
+      if (!timeline) return;
+      const steps: { operation: string; arguments: Record<string, unknown> }[] = [];
+      let skip = 0;
+      for (const id of ids) {
+        const h = findClipById(timeline, id);
+        const ok =
+          h?.trackType === "video"
+            ? h.clip.audio_source === "detached"
+            : h?.trackType === "audio" && !!h.clip.group_id;
+        if (ok) steps.push({ operation: "reattach_audio", arguments: { clip_id: id } });
+        else skip += 1;
+      }
+      if (steps.length === 0) {
+        setOpError("No selected clips that can reattach audio.");
+        return;
+      }
+      await runBatchOperationSteps(steps);
+      if (skip > 0) {
+        setShortcutToast(`Reattached ${steps.length} of ${ids.length}; ${skip} skipped.`);
+      }
+    },
+    [timeline, runBatchOperationSteps, setOpError, setShortcutToast],
+  );
+
+  const runBatchUnlink = useCallback(
+    async (ids: string[]) => {
+      if (!timeline) return;
+      const steps: { operation: string; arguments: Record<string, unknown> }[] = [];
+      let skip = 0;
+      for (const id of ids) {
+        const h = findClipById(timeline, id);
+        if (h?.clip.group_id) {
+          steps.push({ operation: "unlink_clips", arguments: { clip_id: id } });
+        } else skip += 1;
+      }
+      if (steps.length === 0) {
+        setOpError("No linked clips in selection.");
+        return;
+      }
+      await runBatchOperationSteps(steps);
+      if (skip > 0) {
+        setShortcutToast(`Unlinked ${steps.length} of ${ids.length}; ${skip} skipped.`);
+      }
+    },
+    [timeline, runBatchOperationSteps, setOpError, setShortcutToast],
+  );
+
+  const copySelectedClips = useCallback(() => {
+    if (!timeline) return;
+    const tracks = orderedTracks(timeline);
+    const items = selectedClipIds
+      .map((id) => {
+        const hit = findClipById(timeline, id);
+        if (!hit) return null;
+        const trackIndex = tracks.findIndex((t) => t.id === hit.trackId);
+        return {
+          clip: hit.clip,
+          sourceTrackId: hit.trackId,
+          sourceTrackType: hit.trackType,
+          timelineStart: hit.clip.timeline_start,
+          trackIndex: trackIndex >= 0 ? trackIndex : 0,
+        };
+      })
+      .filter((x): x is NonNullable<typeof x> => x != null);
+    copyClipsPayload(items);
+  }, [timeline, selectedClipIds]);
+
   const linkingEnabled = timeline?.settings?.clip_linking_enabled !== false;
+  const selectLinkedTogether = useEditorSettingsStore(
+    (s) => s.selectLinkedClipsTogether,
+  );
+  const setSelectLinkedTogether = useEditorSettingsStore((s) => s.setUi);
+  const { marquee, onLanePointerDown } = useTimelineMarquee(
+    viewportRef,
+    timeline,
+    pxPerSecond,
+  );
+  const selectionCount = selectedClipIds.length;
 
   const kbOverrides = useKeybindingsStore((s) => s.overrides);
   useEditorSettingsStore((s) => s.shortcutTargeting);
@@ -409,49 +522,29 @@ export default function TimelinePanel() {
     (e: React.MouseEvent, clipId: string) => {
       e.stopPropagation();
       if (!timeline) return;
-      if (e.shiftKey) {
+      const ignoreLinks = e.altKey;
+      const linkSelect = !ignoreLinks && selectLinkedTogether;
+      const additive = e.shiftKey || e.metaKey || e.ctrlKey;
+      if (additive) {
         const cur = new Set(selectedClipIds);
-        if (cur.has(clipId)) cur.delete(clipId);
-        else cur.add(clipId);
-        let next = [...cur];
-        if (clipLinkingEnabled(timeline)) {
-          next = expandLinkedSelection(timeline, next);
+        const toToggle = selectionIdsForClick(timeline, clipId, linkSelect);
+        const removing = toToggle.every((id) => cur.has(id));
+        for (const id of toToggle) {
+          if (removing) cur.delete(id);
+          else cur.add(id);
         }
-        setSelectedClipIds(next);
+        setSelectedClipIds([...cur], { anchorId: clipId });
       } else {
-        if (clipLinkingEnabled(timeline)) {
-          const expanded = expandLinkedSelection(timeline, [clipId]);
-          setSelectedClipIds(expanded);
-        } else {
-          setSelectedClipId(clipId);
-        }
+        const expanded = selectionIdsForClick(timeline, clipId, linkSelect);
+        setSelectedClipIds(expanded, { anchorId: clipId });
       }
     },
     [
       timeline,
       selectedClipIds,
-      setSelectedClipId,
+      selectLinkedTogether,
       setSelectedClipIds,
     ],
-  );
-
-  const applyMoveClip = useCallback(
-    async (
-      clipId: string,
-      nextStart: number,
-      destTrackId: string,
-      originTrackId: string,
-    ) => {
-      const args: Record<string, unknown> = {
-        clip_id: clipId,
-        timeline_start: nextStart,
-      };
-      if (destTrackId !== originTrackId) {
-        args.track_id = destTrackId;
-      }
-      await applyOperation({ operation: "move_clip", arguments: args });
-    },
-    [applyOperation],
   );
 
   /** In-timeline clip move — document capture so listeners run during pointer capture */
@@ -463,45 +556,39 @@ export default function TimelinePanel() {
       if (e.pointerId !== pd.pointerId) return;
       const vp = viewportRef.current;
       if (!vp) return;
-      const hit = findTrackUnderPoint(vp, e.clientY);
-      if (!hit || hit.trackType !== pd.originTrackType) {
-        setDropIndicatorSec(null);
-        return;
-      }
       const dxSec = (e.clientX - pd.startClientX) / pxPerSecond;
-      const nextStart = Math.max(0, snapTimelineSec(pd.originTimelineStart + dxSec));
+      const nextStart = Math.max(
+        0,
+        snapTimelineSec(pd.primary.originTimelineStart + dxSec),
+      );
       setDropIndicatorSec(nextStart);
     };
 
     const finish = async (e: PointerEvent) => {
       if (e.pointerId !== pd.pointerId) return;
       const vp = viewportRef.current;
+      const tl = useTimelineStore.getState().timeline;
       setPointerDrag(null);
       setIgnoreCursorMovesUntil(0);
       setDropIndicatorSec(null);
       setDragInProgress(false);
 
-      if (!vp) return;
+      if (!vp || !tl) return;
       if (useTimelineStore.getState().applyOperationInProgress) return;
 
-      const hit = findTrackUnderPoint(vp, e.clientY);
-      if (!hit || hit.trackType !== pd.originTrackType) {
-        setOpError(
-          "Move cancelled: drop on a compatible track only (same type as the clip).",
-        );
+      const dxSec = (e.clientX - pd.startClientX) / pxPerSecond;
+      const delta = snapTimelineSec(pd.primary.originTimelineStart + dxSec) - pd.primary.originTimelineStart;
+      if (Math.abs(delta) < 1e-6) return;
+
+      const movingIds = pd.group.map((g) => g.clipId);
+      const validation = validateGroupMove(tl, movingIds, delta);
+      if (!validation.ok) {
+        setOpError(validation.message);
         return;
       }
 
-      const dxSec = (e.clientX - pd.startClientX) / pxPerSecond;
-      const nextStart = Math.max(0, snapTimelineSec(pd.originTimelineStart + dxSec));
-
-      const unchanged =
-        hit.trackId === pd.originTrackId &&
-        Math.abs(nextStart - pd.originTimelineStart) < 1e-6;
-      if (unchanged) return;
-
       try {
-        await applyMoveClip(pd.clipId, nextStart, hit.trackId, pd.originTrackId);
+        await moveClipsToPlans(validation.moves);
       } catch {
         /* store sets opErrorMessage */
       }
@@ -515,7 +602,7 @@ export default function TimelinePanel() {
       document.removeEventListener("pointerup", finish, { capture: true });
       document.removeEventListener("pointercancel", finish, { capture: true });
     };
-  }, [pointerDrag, pxPerSecond, applyMoveClip, setDragInProgress, setOpError]);
+  }, [pointerDrag, pxPerSecond, moveClipsToPlans, setDragInProgress, setOpError]);
 
   const onClipPointerDown = useCallback(
     (
@@ -533,26 +620,54 @@ export default function TimelinePanel() {
       e.stopPropagation();
       setDragInProgress(true);
       setIgnoreCursorMovesUntil(performance.now() + 60_000);
+      const st = useTimelineStore.getState();
+      const sel = st.selectedClipIds;
+      const inSel = sel.includes(opts.clipId);
+      let group: PointerDragMember[] = [];
+      if (inSel && sel.length > 1 && timeline) {
+        for (const id of sel) {
+          const hit = findClipById(timeline, id);
+          if (!hit) continue;
+          group.push({
+            clipId: id,
+            originTrackId: hit.trackId,
+            originTrackType: hit.trackType as TrackType,
+            originTimelineStart: hit.clip.timeline_start,
+          });
+        }
+      }
+      if (group.length === 0) {
+        group = [
+          {
+            clipId: opts.clipId,
+            originTrackId: opts.trackId,
+            originTrackType: opts.trackType,
+            originTimelineStart: opts.timelineStart,
+          },
+        ];
+      }
+      const primary = group.find((g) => g.clipId === opts.clipId) ?? group[0]!;
       setPointerDrag({
-        clipId: opts.clipId,
-        originTrackId: opts.trackId,
-        originTrackType: opts.trackType,
+        primary,
+        group,
         pointerId: e.pointerId,
         startClientX: e.clientX,
-        originTimelineStart: opts.timelineStart,
       });
-      setDropIndicatorSec(opts.timelineStart);
-      const tl = useTimelineStore.getState().timeline;
-      if (tl && clipLinkingEnabled(tl)) {
-        setSelectedClipIds(expandLinkedSelection(tl, [opts.clipId]));
-      } else {
-        setSelectedClipId(opts.clipId);
+      setDropIndicatorSec(primary.originTimelineStart);
+      const tl = st.timeline;
+      if (!inSel && tl) {
+        setSelectedClipIds(
+          selectionIdsForClick(tl, opts.clipId, selectLinkedTogether),
+          { anchorId: opts.clipId },
+        );
       }
       setTimelinePlaying(false);
     },
     [
       busy,
       applyInProgress,
+      timeline,
+      selectLinkedTogether,
       setDragInProgress,
       setSelectedClipId,
       setSelectedClipIds,
@@ -833,10 +948,15 @@ export default function TimelinePanel() {
             Redo
           </button>
           <div className="timeline-toolbar__sep" aria-hidden />
+          {selectionCount > 0 ? (
+            <span className="timeline-toolbar__selection-badge" title="Selected clips">
+              {selectionCount} selected
+            </span>
+          ) : null}
           <button
             type="button"
             className="timeline-toolbar__tool timeline-toolbar__tool--text"
-            disabled={busy || !selectedClipId}
+            disabled={busy || selectionCount === 0}
             onClick={() => void splitAtPlayhead().catch(() => {})}
             title={bindingTitle("split", "Split")}
           >
@@ -845,7 +965,7 @@ export default function TimelinePanel() {
           <button
             type="button"
             className="timeline-toolbar__tool timeline-toolbar__tool--text"
-            disabled={busy || !selectedClipId}
+            disabled={busy || selectionCount === 0}
             onClick={() => void deleteSelectedClip().catch(() => {})}
             title={bindingTitle("delete", "Delete")}
           >
@@ -867,6 +987,22 @@ export default function TimelinePanel() {
             onClick={() => void runOp(() => toggleClipLinking())}
           >
             Link {linkingEnabled ? "on" : "off"}
+          </button>
+          <button
+            type="button"
+            className={
+              "timeline-toolbar__tool timeline-toolbar__tool--text" +
+              (selectLinkedTogether ? " timeline-toolbar__link-on" : "")
+            }
+            disabled={busy}
+            title="Select separated audio+video together when clicking (Alt+click = one clip)"
+            onClick={() =>
+              setSelectLinkedTogether({
+                selectLinkedClipsTogether: !selectLinkedTogether,
+              })
+            }
+          >
+            Select linked {selectLinkedTogether ? "on" : "off"}
           </button>
           <div className="timeline-toolbar__zoom">
             <span className="timeline-toolbar__zoom-label">Zoom</span>
@@ -935,9 +1071,6 @@ export default function TimelinePanel() {
           <div
             ref={viewportRef}
             className="timeline-viewport"
-            onClick={() => {
-              setSelectedClipIds([]);
-            }}
             role="presentation"
           >
             <div
@@ -979,6 +1112,18 @@ export default function TimelinePanel() {
                   }}
                 />
               )}
+              {marquee.active && marquee.rect ? (
+                <div
+                  className="timeline-marquee-rect"
+                  aria-hidden
+                  style={{
+                    left: marquee.rect.left,
+                    top: marquee.rect.top,
+                    width: marquee.rect.right - marquee.rect.left,
+                    height: marquee.rect.bottom - marquee.rect.top,
+                  }}
+                />
+              ) : null}
 
               <div className="timeline-ruler-row">
                 <div
@@ -1027,6 +1172,14 @@ export default function TimelinePanel() {
                       <span className="track-label__title">
                         {track.label ?? track.type}
                       </span>
+                      {track.type === "caption" &&
+                      (track.clips?.length ?? 0) === 0 ? (
+                        <p className="track-label__caption-hint">
+                          Speech captions are generated from the transcript on export
+                          (Captions tab). Editable caption clips appear here when the
+                          plan includes a caption track.
+                        </p>
+                      ) : null}
                       {showTrackControls ? (
                         <div className="track-label__row">
                           <button
@@ -1092,6 +1245,7 @@ export default function TimelinePanel() {
                       }
                       onDragLeave={onLaneDragLeave}
                       onDrop={(e) => void onLaneDrop(e, track.id, track.type)}
+                      onPointerDown={onLanePointerDown}
                     >
                       {(track.clips ?? []).map((clip) => {
                         const start = clip.timeline_start;
@@ -1103,14 +1257,8 @@ export default function TimelinePanel() {
                           clip.id === selectedClipId;
                         const cursorTarget = clip.id === cursorTargetClipId;
                         const partner =
-                          timeline && (track.type === "video" || track.type === "audio")
-                            ? linkedPartnerId(timeline, clip.id)
-                            : null;
-                        const linked = !!(clip.group_id && partner);
-                        const linkedHover =
-                          linked &&
-                          hoverClipId !== null &&
-                          (clip.id === hoverClipId || partner === hoverClipId);
+                          timeline ? linkedPartnerId(timeline, clip.id) : null;
+                        const linked = !!partner;
                         const src = clip.source;
                         const si = clip.source_in ?? 0;
                         const so = clip.source_out ?? si;
@@ -1129,17 +1277,25 @@ export default function TimelinePanel() {
                             className={
                               trackClipClass(track.type) +
                               (selected ? " tl-clip--selected" : "") +
-                              (cursorTarget ? " tl-clip--cursor-target" : "") +
-                              (linkedHover ? " tl-clip--linked-peer-hover" : "")
+                              (cursorTarget ? " tl-clip--cursor-target" : "")
                             }
                             style={{ left, width, touchAction: "none" }}
                             title={clipDisplayName(clip, track.type)}
                             onClick={(e) => onClipClick(e, clip.id)}
-                            onMouseEnter={() => setHoverClipId(clip.id)}
-                            onMouseLeave={() => setHoverClipId(null)}
                             onContextMenu={(e) => {
                               e.preventDefault();
                               e.stopPropagation();
+                              const sel = useTimelineStore.getState().selectedClipIds;
+                              if (!sel.includes(clip.id)) {
+                                setSelectedClipIds(
+                                  selectionIdsForClick(
+                                    timeline,
+                                    clip.id,
+                                    selectLinkedTogether,
+                                  ),
+                                  { anchorId: clip.id },
+                                );
+                              }
                               setContextMenu({
                                 x: e.clientX,
                                 y: e.clientY,
@@ -1242,99 +1398,64 @@ export default function TimelinePanel() {
                 const canUnlink = !!c.group_id;
                 const vol = c.volume !== undefined ? c.volume : 1;
                 const canPaste = !!readClipFromClipboard();
+                const nSel = selectedClipIds.length;
+                const suffix = nSel > 1 ? ` (${nSel})` : "";
                 return [
                   {
-                    label: "Separate audio",
+                    label: `Separate audio${suffix}`,
                     shortcut: bindingKeysOnly("separate_audio"),
                     disabled: !canSeparate || busy,
-                    onSelect: () =>
-                      void runOp(async () => {
-                        useTimelineStore.setState({
-                          selectedClipId: c.id,
-                          selectedClipIds: [c.id],
-                        });
-                        await separateAudio();
-                      }),
+                    onSelect: () => void runOp(() => runBatchSeparate(selectedClipIds)),
                   },
                   {
-                    label: "Reattach audio",
+                    label: `Reattach audio${suffix}`,
                     shortcut: bindingKeysOnly("reattach_audio"),
                     disabled: !canReattach || busy,
-                    onSelect: () =>
-                      void runOp(async () => {
-                        useTimelineStore.setState({
-                          selectedClipId: c.id,
-                          selectedClipIds: [c.id],
-                        });
-                        await reattachAudio();
-                      }),
+                    onSelect: () => void runOp(() => runBatchReattach(selectedClipIds)),
                   },
                   {
-                    label: "Unlink",
+                    label: `Unlink${suffix}`,
                     shortcut: bindingKeysOnly("unlink_clips"),
-                    disabled: !canUnlink || busy,
-                    onSelect: () =>
-                      void runOp(async () => {
-                        useTimelineStore.setState({
-                          selectedClipId: c.id,
-                          selectedClipIds: [c.id],
-                        });
-                        await unlinkClipsAction();
-                      }),
+                    disabled: busy || (nSel <= 1 && !canUnlink),
+                    onSelect: () => void runOp(() => runBatchUnlink(selectedClipIds)),
                   },
                   {
-                    label: "Split at playhead",
+                    label: `Split at playhead${suffix}`,
                     shortcut: bindingKeysOnly("split"),
-                    disabled:
-                      busy ||
-                      !playheadInsideClip(c, trackType, playhead),
-                    onSelect: () =>
-                      void runOp(async () => {
-                        useTimelineStore.setState({
-                          selectedClipId: c.id,
-                          selectedClipIds: [c.id],
-                        });
-                        await splitAtPlayhead();
-                      }),
+                    disabled: busy || (nSel <= 1 && !playheadInsideClip(c, trackType, playhead)),
+                    onSelect: () => void runOp(() => splitAtPlayhead()),
                   },
                   {
-                    label: "Delete",
+                    label: `Delete${suffix}`,
                     shortcut: bindingKeysOnly("delete"),
-                    disabled: busy,
+                    disabled: busy || nSel === 0,
+                    onSelect: () => void runOp(() => deleteSelectedClip()),
+                  },
+                  {
+                    label: (vol <= 0 ? "Unmute clip" : "Mute clip") + suffix,
+                    shortcut: bindingKeysOnly("mute_clip"),
+                    disabled: busy || nSel === 0,
                     onSelect: () =>
                       void runOp(async () => {
-                        useTimelineStore.setState({
-                          selectedClipId: c.id,
-                          selectedClipIds: [c.id],
+                        const steps = selectedClipIds.map((id) => {
+                          const h = findClipById(timeline!, id);
+                          const v = h?.clip.volume !== undefined ? h.clip.volume : 1;
+                          return {
+                            operation: "set_clip_property",
+                            arguments: {
+                              clip_id: id,
+                              properties: { volume: v <= 0 ? 1 : 0 },
+                            },
+                          };
                         });
-                        await deleteSelectedClip();
+                        await runBatchOperationSteps(steps);
                       }),
                   },
                   {
-                    label: vol <= 0 ? "Unmute clip" : "Mute clip",
-                    shortcut: bindingKeysOnly("mute_clip"),
-                    disabled: busy,
-                    onSelect: () =>
-                      void runOp(() =>
-                        applyOperation({
-                          operation: "set_clip_property",
-                          arguments: {
-                            clip_id: c.id,
-                            properties: { volume: vol <= 0 ? 1 : 0 },
-                          },
-                        }),
-                      ),
-                  },
-                  {
-                    label: "Copy",
+                    label: `Copy${suffix}`,
                     shortcut: bindingKeysOnly("copy_clip"),
-                    disabled: busy,
-                    onSelect: () =>
-                      copyClipPayload({
-                        clip: c,
-                        sourceTrackId: contextMenu.trackId,
-                        sourceTrackType: contextMenu.trackType,
-                      }),
+                    disabled: busy || nSel === 0,
+                    onSelect: () => copySelectedClips(),
                   },
                   {
                     label: "Paste at playhead",

@@ -11,12 +11,14 @@ from timeline_ops import (
     apply_undo,
     batch_operations,
     delete_clip,
+    delete_clips,
     dispatch_operation,
     merge_clips,
     move_clip,
     remove_track,
     set_clip_property,
     split_clip,
+    split_clips_at_time,
     trim_clip,
     trim_timeline_edge,
 )
@@ -303,6 +305,177 @@ def test_trim_timeline_edge_start_and_undo():
     c2 = video_clips(back["timeline"])[0]
     assert c2["timeline_start"] == pytest.approx(0.0)
     assert c2["source_in"] == pytest.approx(0.0)
+
+
+def linked_video_audio_timeline() -> dict:
+    return {
+        "schema_version": 2,
+        "tracks": [
+            {
+                "id": "track-video-main",
+                "type": "video",
+                "clips": [
+                    {
+                        "id": "vid-1",
+                        "source": "footage/a.mp4",
+                        "source_in": 0.0,
+                        "source_out": 6.0,
+                        "timeline_start": 0.0,
+                        "created_by": "user",
+                        "group_id": "grp-1",
+                        "audio_source": "detached",
+                    },
+                ],
+            },
+            {
+                "id": "track-audio-main",
+                "type": "audio",
+                "clips": [
+                    {
+                        "id": "aud-1",
+                        "source": "footage/a.mp4",
+                        "source_in": 0.0,
+                        "source_out": 6.0,
+                        "timeline_start": 0.0,
+                        "created_by": "user",
+                        "group_id": "grp-1",
+                    },
+                ],
+            },
+        ],
+        "settings": {"clip_linking_enabled": True},
+    }
+
+
+def test_delete_clips_linked_pair_in_selection_one_undo():
+    tl = linked_video_audio_timeline()
+    out = delete_clips(tl, clip_ids=["vid-1", "aud-1"])
+    assert not any(
+        c.get("id") in ("vid-1", "aud-1")
+        for tr in out["timeline"]["tracks"]
+        for c in tr.get("clips") or []
+    )
+    back = apply_undo(out["timeline"], out["undo"])
+    ids = {
+        c.get("id")
+        for tr in back["timeline"]["tracks"]
+        for c in tr.get("clips") or []
+    }
+    assert ids == {"vid-1", "aud-1"}
+
+
+def test_delete_clips_batch_no_duplicate_partner_error():
+    tl = linked_video_audio_timeline()
+    with pytest.raises(ValueError, match="not found|Clip not found"):
+        batch_operations(
+            tl,
+            steps=[
+                {"operation": "delete_clip", "arguments": {"clip_id": "vid-1"}},
+                {"operation": "delete_clip", "arguments": {"clip_id": "aud-1"}},
+            ],
+        )
+    tl2 = linked_video_audio_timeline()
+    ok = delete_clips(tl2, clip_ids=["vid-1", "aud-1"])
+    assert ok["timeline"]["tracks"][0]["clips"] == []
+
+
+def test_delete_clips_ignores_stale_id():
+    tl = sample_timeline()
+    out = delete_clips(tl, clip_ids=["clip-1", "missing-id", "clip-2"])
+    vids = {c["id"] for c in video_clips(out["timeline"])}
+    assert vids == set()
+    back = apply_undo(out["timeline"], out["undo"])
+    assert len(video_clips(back["timeline"])) == 2
+
+
+def test_delete_clips_via_dispatch():
+    tl = linked_video_audio_timeline()
+    out = dispatch_operation(
+        tl, "delete_clips", {"clip_ids": ["vid-1", "aud-1", "vid-1"]}
+    )
+    assert out["undo"]["op"] == "sequence"
+    back = apply_undo(out["timeline"], out["undo"])
+    assert {c["id"] for tr in back["timeline"]["tracks"] for c in tr.get("clips") or []} == {
+        "vid-1",
+        "aud-1",
+    }
+
+
+def test_delete_clips_caption_track():
+    tl = {
+        "schema_version": 2,
+        "tracks": [
+            {"id": "v", "type": "video", "clips": []},
+            {
+                "id": "c",
+                "type": "caption",
+                "clips": [
+                    {
+                        "id": "cap-a",
+                        "text": "One",
+                        "timeline_start": 0.0,
+                        "source_in": 0.0,
+                        "source_out": 2.0,
+                        "created_by": "user",
+                    },
+                    {
+                        "id": "cap-b",
+                        "text": "Two",
+                        "timeline_start": 3.0,
+                        "source_in": 0.0,
+                        "source_out": 2.0,
+                        "created_by": "user",
+                    },
+                ],
+            },
+        ],
+    }
+    out = delete_clips(tl, clip_ids=["cap-a", "cap-b"])
+    assert out["timeline"]["tracks"][1]["clips"] == []
+    back = apply_undo(out["timeline"], out["undo"])
+    assert len(back["timeline"]["tracks"][1]["clips"]) == 2
+
+
+def test_split_caption_clip_text_only_timeline():
+    tl = {
+        "schema_version": 2,
+        "tracks": [
+            {
+                "id": "c",
+                "type": "caption",
+                "clips": [
+                    {
+                        "id": "cap1",
+                        "text": "Hello world",
+                        "timeline_start": 0.0,
+                        "timeline_end": 4.0,
+                        "created_by": "user",
+                    },
+                ],
+            },
+        ],
+    }
+    out = split_clip(tl, clip_id="cap1", at_timeline_time=2.0)
+    clips = out["timeline"]["tracks"][0]["clips"]
+    assert len(clips) == 2
+    back = apply_undo(out["timeline"], out["undo"])
+    assert len(back["timeline"]["tracks"][0]["clips"]) == 1
+
+
+def test_split_clips_at_time_linked_pair():
+    tl = linked_video_audio_timeline()
+    out = split_clips_at_time(tl, clip_ids=["vid-1", "aud-1"], at_timeline_time=3.0)
+    vids = [
+        c
+        for tr in out["timeline"]["tracks"]
+        if tr["type"] == "video"
+        for c in tr.get("clips") or []
+    ]
+    assert len(vids) == 2
+    back = apply_undo(out["timeline"], out["undo"])
+    assert len(
+        [c for tr in back["timeline"]["tracks"] if tr["type"] == "video" for c in tr.get("clips") or []]
+    ) == 1
 
 
 def test_batch_operations_two_splits_one_undo():

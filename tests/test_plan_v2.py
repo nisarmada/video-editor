@@ -33,7 +33,10 @@ def test_convert_applies_planner_created_by_and_group():
     for track in v2["tracks"]:
         for clip in track.get("clips") or []:
             assert clip["created_by"] == "ai"
-            assert clip["group_id"] == "run-group-abc"
+            if track.get("type") == "caption":
+                assert "group_id" not in clip
+            else:
+                assert clip["group_id"] == "run-group-abc"
 
 
 def test_finalize_v2_plan(monkeypatch):
@@ -61,4 +64,4 @@ def test_finalize_v2_plan(monkeypatch):
     assert video["clips"][0]["created_by"] == "ai"
     assert video["clips"][0]["group_id"] == "group-xyz"
     cap = get_track(v2, "caption")
-    assert cap["clips"][0]["group_id"] == "group-xyz"
+    assert "group_id" not in cap["clips"][0]

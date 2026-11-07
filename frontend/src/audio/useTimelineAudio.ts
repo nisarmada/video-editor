@@ -15,12 +15,17 @@
 
 import { useEffect, useRef, type RefObject } from "react";
 import {
+  CLIP_END_SLACK,
   clipTimelineDuration,
   timelineToSourceSeconds,
   proxyUrlFromSource,
 } from "../timeline/duration";
 import type { TimelineClip, TimelineV2 } from "../timeline/types";
 import { useTimelineStore } from "../store/timelineStore";
+import {
+  ensureMediaElementSource,
+  teardownMediaElementWire,
+} from "./timelineAudioGraph";
 
 const POOL_SIZE = 16;
 const DRIFT_RESYNC_S = 0.08;
@@ -28,7 +33,6 @@ const PRELOAD_AHEAD_S = 2.5;
 
 type Pooled = {
   audio: HTMLAudioElement;
-  mediaSrc: MediaElementAudioSourceNode | null;
   proxyUrl: string | null;
   /** Which timeline voice uses this slot (video:id or audio:id). */
   boundKey: string | null;
@@ -65,14 +69,25 @@ function activeVideoClipAtTime(
     if (d !== 0) return d;
     return a.trackIndex - b.trackIndex;
   });
-  let hit: TimelineClip | null = null;
-  for (const { clip: c } of tagged) {
+  let best: TimelineClip | null = null;
+  let bestKey: [number, number] = [-Infinity, -1];
+  tagged.forEach(({ clip: c }, order) => {
     const dur = clipTimelineDuration(c, "video");
-    if (t >= c.timeline_start - 1e-9 && t < c.timeline_start + dur - 1e-9) {
-      hit = c;
+    const start = c.timeline_start;
+    const end = start + dur;
+    if (t >= start - 1e-9 && t < end + CLIP_END_SLACK) {
+      const key: [number, number] = [start, order];
+      if (
+        best === null ||
+        key[0] > bestKey[0] + 1e-9 ||
+        (Math.abs(key[0] - bestKey[0]) <= 1e-9 && key[1] > bestKey[1])
+      ) {
+        best = c;
+        bestKey = key;
+      }
     }
-  }
-  return hit;
+  });
+  return best;
 }
 
 function activeAudioVoices(
@@ -180,6 +195,7 @@ export function useTimelineAudio(opts: TimelineAudioOptions): void {
   const ctxRef = useRef<AudioContext | null>(null);
   const masterRef = useRef<GainNode | null>(null);
   const poolRef = useRef<Pooled[] | null>(null);
+  const wireErrorSentRef = useRef(false);
 
   useEffect(() => {
     const Ctor =
@@ -197,7 +213,7 @@ export function useTimelineAudio(opts: TimelineAudioOptions): void {
       audio.preload = "auto";
       audio.crossOrigin = "anonymous";
       audio.dataset.poolIdx = String(i);
-      pool.push({ audio, mediaSrc: null, proxyUrl: null, boundKey: null });
+      pool.push({ audio, proxyUrl: null, boundKey: null });
     }
 
     ctxRef.current = ctx;
@@ -215,12 +231,7 @@ export function useTimelineAudio(opts: TimelineAudioOptions): void {
         p.audio.pause();
         p.audio.removeAttribute("src");
         p.audio.load();
-        try {
-          p.mediaSrc?.disconnect();
-        } catch {
-          /* ignore */
-        }
-        p.mediaSrc = null;
+        teardownMediaElementWire(p.audio);
       }
       master.disconnect();
       void ctx.close();
@@ -250,11 +261,19 @@ export function useTimelineAudio(opts: TimelineAudioOptions): void {
 
     const absUrl = (u: string) => new URL(u, window.location.origin).href;
 
-    const ensureWired = (slot: Pooled) => {
-      if (!slot.mediaSrc) {
-        slot.mediaSrc = ctx.createMediaElementSource(slot.audio);
-        slot.mediaSrc.connect(masterGain);
+    const wireSlot = (slot: Pooled): boolean => {
+      const node = ensureMediaElementSource(ctx, masterGain, slot.audio);
+      if (node) {
+        wireErrorSentRef.current = false;
+        return true;
       }
+      if (!wireErrorSentRef.current) {
+        wireErrorSentRef.current = true;
+        useTimelineStore.getState().setUiBannerError(
+          "Preview audio failed to start (Web Audio). Try refreshing the page.",
+        );
+      }
+      return false;
     };
 
     const assignSlot = (
@@ -278,17 +297,10 @@ export function useTimelineAudio(opts: TimelineAudioOptions): void {
         slot.audio.src = proxyUrl;
         slot.audio.load();
         slot.proxyUrl = proxyUrl;
-        if (slot.mediaSrc) {
-          try {
-            slot.mediaSrc.disconnect();
-          } catch {
-            /* ignore */
-          }
-          slot.mediaSrc = null;
-        }
+        /* Do not disconnect MediaElementAudioSourceNode: each <audio> may only be
+         * wired once; changing src is allowed while the same source node is used. */
       }
       slot.boundKey = voiceKey;
-      ensureWired(slot);
       return slot;
     };
 
@@ -316,6 +328,9 @@ export function useTimelineAudio(opts: TimelineAudioOptions): void {
 
       for (const voice of voices) {
         const slot = assignSlot(voice.key, voice.proxyUrl, activeKeys);
+        if (!wireSlot(slot)) {
+          continue;
+        }
         const { clip } = voice;
         const speed = clip.speed && clip.speed > 0 ? clip.speed : 1;
         const cvol = clip.volume !== undefined ? clip.volume : 1;

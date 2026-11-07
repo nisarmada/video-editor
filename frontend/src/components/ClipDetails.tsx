@@ -41,16 +41,19 @@ export default function ClipDetails() {
   const [detailTab, setDetailTab] = useState<"details" | "captions">("details");
   const timeline = useTimelineStore((s) => s.timeline);
   const selectedClipId = useTimelineStore((s) => s.selectedClipId);
+  const selectedClipIds = useTimelineStore((s) => s.selectedClipIds);
   const currentPlanName = useTimelineStore((s) => s.currentPlanName);
   const applyOperation = useTimelineStore((s) => s.applyOperation);
   const applyInProgress = useTimelineStore((s) => s.applyOperationInProgress);
 
   const [error, setError] = useState<string | null>(null);
 
+  const multi = selectedClipIds.length > 1;
+
   const resolved = useMemo(() => {
-    if (!timeline || !selectedClipId) return null;
+    if (!timeline || !selectedClipId || multi) return null;
     return findClip(timeline, selectedClipId);
-  }, [timeline, selectedClipId]);
+  }, [timeline, selectedClipId, multi]);
 
   const clip = resolved?.clip;
   const track = resolved?.track;
@@ -98,10 +101,16 @@ export default function ClipDetails() {
   const duration = clip && track ? clipTimelineDuration(clip, trackType) : 0;
 
   const isVideoTrack = trackType === "video" && clip != null;
+  const setClipPropertyBatch = useTimelineStore((s) => s.setClipPropertyBatch);
+
   async function applyProps(properties: Record<string, unknown>) {
-    if (!clip) return;
     setError(null);
     try {
+      if (multi) {
+        await setClipPropertyBatch(selectedClipIds, properties);
+        return;
+      }
+      if (!clip) return;
       await applyOperation({
         operation: "set_clip_property",
         arguments: { clip_id: clip.id, properties },
@@ -110,6 +119,25 @@ export default function ClipDetails() {
       /* store sets opErrorMessage */
     }
   }
+
+  const multiAllCaption = useMemo(() => {
+    if (!timeline || !multi) return false;
+    return selectedClipIds.every((id) => {
+      const r = findClip(timeline, id);
+      return r?.track.type === "caption";
+    });
+  }, [timeline, multi, selectedClipIds]);
+
+  const mixedSpeed = useMemo(() => {
+    if (!timeline || !multi) return false;
+    const vals = new Set(
+      selectedClipIds.map((id) => {
+        const r = findClip(timeline, id);
+        return r?.clip.speed ?? 1;
+      }),
+    );
+    return vals.size > 1;
+  }, [timeline, multi, selectedClipIds]);
 
   async function submitVideoRenderAndCaption() {
     if (!clip || !isVideoTrack) return;
@@ -174,9 +202,12 @@ export default function ClipDetails() {
   }
 
   const planSummary =
-    !selectedClipId || !resolved || !clip || !track ? (
+    (!selectedClipId && selectedClipIds.length === 0) ||
+    (!multi && (!resolved || !clip || !track)) ? (
       <div className="props-grid">
-        <p className="panel-message">Plan (no clip selected)</p>
+        <p className="panel-message">
+          {multi ? `${selectedClipIds.length} clips selected` : "Plan (no clip selected)"}
+        </p>
         <div className="props-row">
           <label>Name</label>
           <span>{dash(currentPlanName)}</span>
@@ -226,6 +257,61 @@ export default function ClipDetails() {
       {detailTab === "captions" && <CaptionsPanel />}
 
       {detailTab === "details" && planSummary}
+
+      {detailTab === "details" && multi ? (
+        <div className="props-grid">
+          <p className="panel-message">{selectedClipIds.length} clips selected</p>
+          <div className="props-row">
+            <label>speed</label>
+            <input
+              type="text"
+              inputMode="decimal"
+              placeholder={mixedSpeed ? "Mixed" : "1"}
+              value={speedIn}
+              onChange={(e) => setSpeedIn(e.target.value)}
+              disabled={applyInProgress}
+              onBlur={() => {
+                const v = Number(speedIn);
+                if (!Number.isFinite(v)) return;
+                void applyProps({ speed: Math.min(MAX_SPEED, Math.max(MIN_SPEED, v)) });
+              }}
+            />
+          </div>
+          <div className="props-row">
+            <label>volume</label>
+            <input
+              type="text"
+              inputMode="decimal"
+              placeholder="Mixed"
+              value={volIn}
+              onChange={(e) => setVolIn(e.target.value)}
+              disabled={applyInProgress}
+              onBlur={() => {
+                const v = Number(volIn);
+                if (!Number.isFinite(v)) return;
+                void applyProps({ volume: Math.min(MAX_VOLUME, Math.max(MIN_VOLUME, v)) });
+              }}
+            />
+          </div>
+          {multiAllCaption ? (
+            <div className="props-row">
+              <label>text</label>
+              <input
+                type="text"
+                placeholder="Mixed"
+                value={textIn}
+                onChange={(e) => setTextIn(e.target.value)}
+                disabled={applyInProgress}
+                onBlur={() => {
+                  const t = textIn.trim();
+                  if (!t) return;
+                  void applyProps({ text: t });
+                }}
+              />
+            </div>
+          ) : null}
+        </div>
+      ) : null}
 
       {detailTab === "details" && selectedClipId && resolved && clip && track ? (
         <div className="props-grid">

@@ -12,10 +12,12 @@ import { resolveTarget } from "../shortcuts/resolveTarget";
 import { isTooCloseToClipEdgeForSplit } from "../shortcuts/snapTime";
 import {
   copyClipPayload,
-  expandLinkedSelection,
+  copyClipsPayload,
   findClipById,
+  allClipIds,
+  orderedTracks,
   readClipFromClipboard,
-  clipLinkingEnabled,
+  readClipboardPayload,
 } from "../timeline/selection";
 import { timelineEnd, clipTimelineDuration } from "../timeline/duration";
 import { MAX_PX_PER_SEC, MIN_PX_PER_SEC } from "../store/timelineStore";
@@ -172,13 +174,11 @@ export function useShortcuts(): void {
               ? s.timeline.settings.fps
               : 30;
           const t = rt.timeSeconds;
+          const toSplit: string[] = [];
+          let skipSplit = 0;
           for (const cid of rt.clipIds) {
             const hit = findClipById(s.timeline, cid);
             if (!hit) continue;
-            if ((hit.trackType === "caption")) {
-              preventAndRun(() => toast("Cannot split caption clips here."));
-              return;
-            }
             const tr = s.timeline.tracks?.find((x) => x.id === hit.trackId);
             if (tr?.locked) {
               preventAndRun(() => toast("Track is locked."));
@@ -187,15 +187,31 @@ export function useShortcuts(): void {
             const d = clipTimelineDuration(hit.clip, hit.trackType);
             const t0 = hit.clip.timeline_start;
             const t1 = t0 + d;
-            if (isTooCloseToClipEdgeForSplit(t, t0, t1, fps)) {
-              preventAndRun(() =>
-                toast("Too close to clip edge to split (within one frame)."),
-              );
-              return;
+            if (t < t0 - 1e-9 || t >= t1 - 1e-9) {
+              skipSplit += 1;
+              continue;
             }
+            if (isTooCloseToClipEdgeForSplit(t, t0, t1, fps)) {
+              skipSplit += 1;
+              continue;
+            }
+            toSplit.push(cid);
+          }
+          if (toSplit.length === 0) {
+            preventAndRun(() =>
+              toast("No selected clip contains the split time."),
+            );
+            return;
           }
           preventAndRun(() =>
-            runTimelineOp(() => s.splitClipsAtTime(rt.clipIds, t)),
+            runTimelineOp(async () => {
+              await s.splitClipsAtTime(toSplit, t);
+              if (skipSplit > 0) {
+                toast(
+                  `Split ${toSplit.length} of ${rt.clipIds.length}; ${skipSplit} skipped.`,
+                );
+              }
+            }),
           );
           break;
         }
@@ -223,80 +239,128 @@ export function useShortcuts(): void {
         case "copy_clip": {
           if (busy || !s.timeline) return;
           const rt = rtBase("copy_clip");
-          const selList =
+          let selList =
             s.selectedClipIds.length > 0
               ? [...s.selectedClipIds]
               : s.selectedClipId
                 ? [s.selectedClipId]
                 : [];
           const selSet = new Set(selList);
-          let copyId: string | null = null;
           if (rt.useCursorTime && rt.primaryClipId && !selSet.has(rt.primaryClipId)) {
-            copyId = rt.primaryClipId;
-          } else if (selList.length > 0) {
-            copyId = selList[selList.length - 1]!;
-          } else if (rt.primaryClipId) {
-            copyId = rt.primaryClipId;
+            selList = [rt.primaryClipId];
+          } else if (selList.length === 0 && rt.primaryClipId) {
+            selList = [rt.primaryClipId];
           }
-          if (!copyId) {
+          if (selList.length === 0) {
             preventAndRun(() => toast("Nothing to copy."));
             return;
           }
-          const hit = findClipById(s.timeline, copyId);
-          if (!hit) return;
           preventAndRun(() => {
-            copyClipPayload({
-              clip: hit.clip,
-              sourceTrackId: hit.trackId,
-              sourceTrackType: hit.trackType,
-            });
+            const tracks = orderedTracks(s.timeline!);
+            const items = selList
+              .map((id) => {
+                const hit = findClipById(s.timeline!, id);
+                if (!hit) return null;
+                const trackIndex = tracks.findIndex((t) => t.id === hit.trackId);
+                return {
+                  clip: hit.clip,
+                  sourceTrackId: hit.trackId,
+                  sourceTrackType: hit.trackType,
+                  timelineStart: hit.clip.timeline_start,
+                  trackIndex: trackIndex >= 0 ? trackIndex : 0,
+                };
+              })
+              .filter((x): x is NonNullable<typeof x> => x != null);
+            if (items.length === 1) {
+              const one = items[0]!;
+              copyClipPayload({
+                clip: one.clip,
+                sourceTrackId: one.sourceTrackId,
+                sourceTrackType: one.sourceTrackType,
+              });
+            } else {
+              copyClipsPayload(items);
+            }
           });
           break;
         }
 
         case "paste_clip": {
           const tl = s.timeline;
-          const data = readClipFromClipboard();
-          if (busy || !tl || !data) return;
+          const payload = readClipboardPayload();
+          if (busy || !tl || !payload) return;
           const rt = rtBase("paste_clip");
           applyCursorSelection(rt);
           const ph = rt.useCursorTime ? rt.timeSeconds : s.playheadSeconds;
-          let targetTrackId: string | undefined;
-          if (rt.useCursorTime && rt.trackId) {
-            const st = data.sourceTrackType;
-            const hitTrack = tl.tracks?.find((x) => x.id === rt.trackId);
-            if (hitTrack) {
-              if (st === "audio" && hitTrack.type === "audio") targetTrackId = hitTrack.id;
-              else if (st === "caption" && hitTrack.type === "caption") targetTrackId = hitTrack.id;
-              else if ((st === "video" || !st) && hitTrack.type === "video") targetTrackId = hitTrack.id;
-            }
-          }
           preventAndRun(() =>
             runTimelineOp(async () => {
-              const videoTr = tl.tracks.find((x) => x.type === "video");
-              const audioTr = tl.tracks.find((x) => x.type === "audio");
-              const capTr = tl.tracks.find((x) => x.type === "caption");
-              const st = data.sourceTrackType;
-              const targetId =
-                targetTrackId ||
-                (st === "audio" && audioTr
-                  ? audioTr.id
-                  : st === "caption" && capTr
-                    ? capTr.id
-                    : videoTr?.id);
-              const { group_id: _g, id: _i, ...clipRest } = data.clip;
-              const newClip: Record<string, unknown> = {
-                ...clipRest,
-                id: crypto.randomUUID(),
-                timeline_start: ph,
-                created_by: "user",
+              const tracks = orderedTracks(tl);
+              const trackByType = (type: string, index: number) => {
+                const ofType = tracks.filter((t) => t.type === type);
+                return ofType[index] ?? ofType[0];
               };
-              if (st === "video" || (!st && !targetId)) {
-                newClip.audio_source = "embedded";
+              const steps: { operation: string; arguments: Record<string, unknown> }[] = [];
+              if (payload.kind === "single") {
+                const data = payload.item;
+                let targetTrackId: string | undefined;
+                if (rt.useCursorTime && rt.trackId) {
+                  const st = data.sourceTrackType;
+                  const hitTrack = tl.tracks?.find((x) => x.id === rt.trackId);
+                  if (hitTrack) {
+                    if (st === "audio" && hitTrack.type === "audio") targetTrackId = hitTrack.id;
+                    else if (st === "caption" && hitTrack.type === "caption") targetTrackId = hitTrack.id;
+                    else if ((st === "video" || !st) && hitTrack.type === "video") targetTrackId = hitTrack.id;
+                  }
+                }
+                const videoTr = tl.tracks.find((x) => x.type === "video");
+                const audioTr = tl.tracks.find((x) => x.type === "audio");
+                const capTr = tl.tracks.find((x) => x.type === "caption");
+                const st = data.sourceTrackType;
+                const targetId =
+                  targetTrackId ||
+                  (st === "audio" && audioTr
+                    ? audioTr.id
+                    : st === "caption" && capTr
+                      ? capTr.id
+                      : videoTr?.id);
+                const { group_id: _g, id: _i, ...clipRest } = data.clip;
+                const newClip: Record<string, unknown> = {
+                  ...clipRest,
+                  id: crypto.randomUUID(),
+                  timeline_start: ph,
+                  created_by: "user",
+                };
+                if (st === "video" || (!st && !targetId)) {
+                  newClip.audio_source = "embedded";
+                }
+                const args: Record<string, unknown> = { clip: newClip };
+                if (targetId) args.track_id = targetId;
+                steps.push({ operation: "add_clip", arguments: args });
+              } else {
+                for (const item of payload.items) {
+                  const tr = trackByType(item.sourceTrackType, item.trackIndex);
+                  if (!tr) continue;
+                  const { group_id: _g, id: _i, ...clipRest } = item.clip;
+                  const newClip: Record<string, unknown> = {
+                    ...clipRest,
+                    id: crypto.randomUUID(),
+                    timeline_start: ph + (item.timelineStart - payload.anchorTime),
+                    created_by: "user",
+                  };
+                  if (item.sourceTrackType === "video") {
+                    newClip.audio_source = "embedded";
+                  }
+                  steps.push({
+                    operation: "add_clip",
+                    arguments: { clip: newClip, track_id: tr.id },
+                  });
+                }
               }
-              const args: Record<string, unknown> = { clip: newClip };
-              if (targetId) args.track_id = targetId;
-              await s.applyOperation({ operation: "add_clip", arguments: args });
+              if (steps.length === 0) {
+                toast("Nothing to paste.");
+                return;
+              }
+              await s.runBatchOperationSteps(steps);
             }),
           );
           break;
@@ -306,21 +370,29 @@ export function useShortcuts(): void {
           if (busy || !s.timeline) return;
           const rt = rtBase("separate_audio");
           applyCursorSelection(rt);
-          const id = rt.primaryClipId ?? s.selectedClipId;
-          if (!id || rt.fallbackNoClip) {
+          const ids = rt.clipIds.length ? rt.clipIds : [];
+          if (ids.length === 0) {
             preventAndRun(() => toast(rt.message ?? "No video clip."));
             return;
           }
-          const hit = findClipById(s.timeline, id);
-          if (hit?.trackType !== "video") {
-            preventAndRun(() => toast("Separate audio needs a video clip."));
-            return;
-          }
-          if (hit.clip.audio_source === "detached") {
-            preventAndRun(() => toast("Audio already separated."));
-            return;
-          }
-          preventAndRun(() => runTimelineOp(() => s.separateAudioForClip(id)));
+          preventAndRun(() =>
+            runTimelineOp(async () => {
+              const steps: { operation: string; arguments: Record<string, unknown> }[] = [];
+              let skip = 0;
+              for (const id of ids) {
+                const hit = findClipById(s.timeline!, id);
+                if (hit?.trackType === "video" && hit.clip.audio_source !== "detached") {
+                  steps.push({ operation: "separate_audio", arguments: { clip_id: id } });
+                } else skip += 1;
+              }
+              if (steps.length === 0) {
+                toast("No clips with embedded audio in selection.");
+                return;
+              }
+              await s.runBatchOperationSteps(steps);
+              if (skip) toast(`Separated ${steps.length} of ${ids.length}; ${skip} skipped.`);
+            }),
+          );
           break;
         }
 
@@ -328,12 +400,20 @@ export function useShortcuts(): void {
           if (busy || !s.timeline) return;
           const rt = rtBase("reattach_audio");
           applyCursorSelection(rt);
-          const id = rt.primaryClipId ?? s.selectedClipId;
-          if (!id || rt.fallbackNoClip) {
+          const ids = rt.clipIds;
+          if (!ids.length) {
             preventAndRun(() => toast(rt.message ?? "No clip."));
             return;
           }
-          preventAndRun(() => runTimelineOp(() => s.reattachAudioForClip(id)));
+          preventAndRun(() =>
+            runTimelineOp(async () => {
+              const steps: { operation: string; arguments: Record<string, unknown> }[] = [];
+              for (const id of ids) {
+                steps.push({ operation: "reattach_audio", arguments: { clip_id: id } });
+              }
+              await s.runBatchOperationSteps(steps);
+            }),
+          );
           break;
         }
 
@@ -341,12 +421,26 @@ export function useShortcuts(): void {
           if (busy || !s.timeline) return;
           const rt = rtBase("unlink_clips");
           applyCursorSelection(rt);
-          const id = rt.primaryClipId ?? s.selectedClipId;
-          if (!id || rt.fallbackNoClip) {
+          const ids = rt.clipIds;
+          if (!ids.length) {
             preventAndRun(() => toast(rt.message ?? "No clip."));
             return;
           }
-          preventAndRun(() => runTimelineOp(() => s.unlinkClipsForClip(id)));
+          preventAndRun(() =>
+            runTimelineOp(async () => {
+              const steps = ids
+                .filter((id) => findClipById(s.timeline!, id)?.clip.group_id)
+                .map((id) => ({
+                  operation: "unlink_clips",
+                  arguments: { clip_id: id },
+                }));
+              if (!steps.length) {
+                toast("No linked clips in selection.");
+                return;
+              }
+              await s.runBatchOperationSteps(steps);
+            }),
+          );
           break;
         }
 
@@ -390,12 +484,24 @@ export function useShortcuts(): void {
           if (busy || !s.timeline) return;
           const rt = rtBase("mute_clip");
           applyCursorSelection(rt);
-          const id = rt.primaryClipId ?? s.selectedClipId;
-          if (!id || rt.fallbackNoClip) {
+          const ids = rt.clipIds;
+          if (!ids.length) {
             preventAndRun(() => toast(rt.message ?? "No clip."));
             return;
           }
-          preventAndRun(() => runTimelineOp(() => s.muteClipToggleById(id)));
+          preventAndRun(() =>
+            runTimelineOp(async () => {
+              const steps = ids.map((id) => {
+                const hit = findClipById(s.timeline!, id);
+                const vol = hit?.clip.volume !== undefined ? hit.clip.volume : 1;
+                return {
+                  operation: "set_clip_property",
+                  arguments: { clip_id: id, properties: { volume: vol <= 0 ? 1 : 0 } },
+                };
+              });
+              await s.runBatchOperationSteps(steps);
+            }),
+          );
           break;
         }
 
@@ -586,9 +692,7 @@ export function useShortcuts(): void {
           }
           if (ids.length === 0) return;
           preventAndRun(() => {
-            const next =
-              clipLinkingEnabled(tl) ? expandLinkedSelection(tl, ids) : ids;
-            s.setSelectedClipIds(next);
+            s.setSelectedClipIds(allClipIds(tl));
           });
           break;
         }

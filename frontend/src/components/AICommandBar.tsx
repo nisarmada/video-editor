@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { analyzeStyle } from "../api/styles";
 import { useTimelineStore } from "../store/timelineStore";
 
 type FootageScope = "all" | "selected";
@@ -26,6 +27,8 @@ export default function AICommandBar() {
 
   const selectedFootageNames = useTimelineStore((s) => s.selectedFootageNames);
   const runPlannerJob = useTimelineStore((s) => s.runPlannerJob);
+  const styleProfiles = useTimelineStore((s) => s.styleProfiles);
+  const refreshStyleProfiles = useTimelineStore((s) => s.refreshStyleProfiles);
 
   const [brief, setBrief] = useState("");
   const [saveAs, setSaveAs] = useState("");
@@ -34,6 +37,10 @@ export default function AICommandBar() {
     if (typeof window === "undefined") return false;
     return window.localStorage.getItem(PLANNER_BAR_COLLAPSED_KEY) === "1";
   });
+  const [imitateStyleId, setImitateStyleId] = useState("");
+  const [styleUploadBusy, setStyleUploadBusy] = useState(false);
+  const [styleUploadError, setStyleUploadError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (currentPlanName) {
@@ -52,6 +59,7 @@ export default function AICommandBar() {
     Boolean(saveAs.trim()) &&
     !blocked &&
     !plannerRunning &&
+    !styleUploadBusy &&
     (footageScope === "all" || selectedFootageNames.length > 0);
 
   function setCollapsed(next: boolean) {
@@ -60,6 +68,24 @@ export default function AICommandBar() {
       window.localStorage.setItem(PLANNER_BAR_COLLAPSED_KEY, next ? "1" : "0");
     }
   }
+
+  const processStyleFile = async (file: File | undefined) => {
+    if (!file) return;
+    setStyleUploadError(null);
+    setStyleUploadBusy(true);
+    try {
+      const base = file.name.replace(/\.[^/.]+$/, "") || "reference";
+      const res = await analyzeStyle(file, { style_name: base });
+      await refreshStyleProfiles();
+      setImitateStyleId(res.style_id);
+      setStyleUploadError(null);
+    } catch (e) {
+      setStyleUploadError(e instanceof Error ? e.message : "Style analysis failed");
+    } finally {
+      setStyleUploadBusy(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
 
   if (barCollapsed) {
     return (
@@ -154,6 +180,59 @@ export default function AICommandBar() {
                 </button>
               </div>
             </div>
+            <div className="ai-command-bar__styles" role="group" aria-label="Style reference">
+              <label className="ai-command-bar__style-field">
+                <span className="ai-command-bar__label">Imitate style</span>
+                <select
+                  className="ai-command-bar__select"
+                  value={imitateStyleId}
+                  onChange={(e) => setImitateStyleId(e.target.value)}
+                  disabled={plannerRunning || styleUploadBusy}
+                  title="Planner mirrors cut pacing and visuals from this profile"
+                >
+                  <option value="">— None —</option>
+                  {styleProfiles.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div
+                className={`ai-command-bar__dropzone${styleUploadBusy ? " ai-command-bar__dropzone--busy" : ""}`}
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  const f = e.dataTransfer.files?.[0];
+                  void processStyleFile(f);
+                }}
+                onClick={() => fileInputRef.current?.click()}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    fileInputRef.current?.click();
+                  }
+                }}
+                role="button"
+                tabIndex={0}
+                title="Drop a reference MP4 here or click to upload"
+              >
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="video/*"
+                  className="ai-command-bar__file"
+                  aria-hidden
+                  tabIndex={-1}
+                  onChange={(e) => void processStyleFile(e.target.files?.[0])}
+                />
+                {styleUploadBusy ? "Analyzing reference…" : "Drop reference video"}
+              </div>
+            </div>
             <button
               type="button"
               className="btn btn--primary ai-command-bar__submit"
@@ -170,6 +249,7 @@ export default function AICommandBar() {
                     footageScope === "selected"
                       ? selectedFootageNames
                       : undefined,
+                  imitateStyleId: imitateStyleId || null,
                 })
               }
             >
@@ -184,7 +264,10 @@ export default function AICommandBar() {
             </button>
           </div>
         </div>
-        {(plannerRunning || plannerError || plannerSuccessSummary) && (
+        {(plannerRunning ||
+          plannerError ||
+          plannerSuccessSummary ||
+          styleUploadError) && (
           <div className="ai-command-bar__status">
             {plannerRunning && plannerProgressMessage && (
               <span className="ai-command-bar__progress">
@@ -197,9 +280,9 @@ export default function AICommandBar() {
                 indexes.
               </span>
             )}
-            {plannerError && (
+            {(plannerError || styleUploadError) && (
               <span className="ai-command-bar__error" role="alert">
-                {plannerError}
+                {styleUploadError ?? plannerError}
               </span>
             )}
             {!plannerRunning && plannerSuccessSummary && !plannerError && (
@@ -208,6 +291,9 @@ export default function AICommandBar() {
           </div>
         )}
         <p className="ai-command-bar__help">
+          Reference styles are saved under{" "}
+          <code className="ai-command-bar__code">plans/styles/</code> (upload analyzes
+          pacing, speech density, and frames — uses the planner API key).{" "}
           Media bin: Shift+click to pick multiple clips for “Selected”. Undo the
           result with{" "}
           <kbd className="ai-command-bar__kbd">⌘Z</kbd> /{" "}

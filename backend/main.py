@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -29,12 +29,16 @@ if str(_SCRIPTS) not in sys.path:
 
 from backend.app_logging import get_logs, last_index, log_event  # noqa: E402
 from backend.footage_jobs import get_job, schedule_proxy_work  # noqa: E402
+from backend.index_jobs import get_job as get_index_job  # noqa: E402
+from backend.index_jobs import schedule_index_pipeline  # noqa: E402
+from backend.media_catalog import build_media_catalog, list_unanalyzed_for_planning  # noqa: E402
 from backend.waveform_jobs import (  # noqa: E402
     get_job as get_waveform_job,
     schedule_waveform_work,
     waveform_list_status,
 )
 from backend.footage_ops import (  # noqa: E402
+    ffprobe_validate_media,
     ffprobe_validate_video,
     plans_referencing_footage,
     sanitize_upload_basename,
@@ -61,6 +65,7 @@ from backend.settings_store import (  # noqa: E402
     save_raw,
     set_planner_api_key,
 )
+from analyze_style import analyze_reference_video  # noqa: E402
 from plan import generate_plan  # noqa: E402
 from proxy_media import (  # noqa: E402
     ensure_proxy,
@@ -77,6 +82,7 @@ from convert_v1_to_v2 import convert as convert_plan_v1_to_v2  # noqa: E402
 from index_cache import waveform_path  # noqa: E402
 from timeline_format import is_v2, v1_segments_from_data  # noqa: E402
 from timeline_ops import dispatch_operation  # noqa: E402
+from style_profile import list_style_profiles, slug_style_id  # noqa: E402
 from validate_plan import validate_plan_data  # noqa: E402
 from caption_style import validate_caption_style_dict  # noqa: E402
 from caption_style_resolve import list_builtin_presets, resolve_merged_style_for_plan  # noqa: E402
@@ -123,6 +129,14 @@ class PlannerRequest(BaseModel):
     save_as: str = Field(description="Plan filename without path, e.g. draft1")
     # If set, only these footage basenames are sent to the model (merged indexes must exist).
     clip_filenames: list[str] | None = None
+    allow_without_merged_index: bool = Field(
+        default=False,
+        description="If true, run planner even when merged index is missing (not recommended).",
+    )
+    imitate_style_id: str | None = Field(
+        default=None,
+        description="plans/styles/<id>.json profile to mirror in the system prompt",
+    )
 
 
 class RenderRequest(BaseModel):
@@ -159,6 +173,16 @@ class PlanRenameBody(BaseModel):
 
 class PlanDuplicateBody(BaseModel):
     to: str
+
+
+class FootageAnalyzeBody(BaseModel):
+    """Queue full analysis (transcript, silences, optional shots/keyframes, merge index)."""
+
+    names: list[str] | None = Field(
+        default=None,
+        description="Footage basenames to analyze; omit with all=true",
+    )
+    all: bool = Field(default=False, description="Analyze every file in footage/")
 
 
 def _client_host_allowed(request: Request) -> bool:
@@ -463,7 +487,7 @@ async def upload_footage(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
     try:
-        ffprobe_validate_video(dest)
+        ffprobe_validate_media(dest)
     except RuntimeError as e:
         dest.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -479,6 +503,7 @@ async def upload_footage(
         thumbnail_path_for_clip=thumbnail_path_for_clip,
     )
     schedule_waveform_work(paths.root, dest)
+    schedule_index_pipeline(paths.root, dest)
 
     return {"clip": _enrich_footage_clip(paths, dest), "saved_as": final_name}
 
@@ -505,7 +530,68 @@ def rescan_footage(paths: ProjectPaths = Depends(get_paths)) -> dict[str, Any]:
         )
         queued.append(p.name)
         schedule_waveform_work(paths.root, p)
+        schedule_index_pipeline(paths.root, p)
     return {"queued": queued}
+
+
+@app.post("/api/footage/analyze")
+def analyze_footage(
+    body: FootageAnalyzeBody, paths: ProjectPaths = Depends(get_paths)
+) -> dict[str, Any]:
+    """Queue transcript + silences + (for video) shots/keyframes + merged index."""
+    paths.footage.mkdir(parents=True, exist_ok=True)
+    files = list_footage_files(paths.root)
+    if body.all:
+        targets = files
+    elif body.names:
+        want = {Path(n).name for n in body.names if n and str(n).strip()}
+        by_name = {p.name: p for p in files}
+        unknown = sorted(want - set(by_name))
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail="These files are not in footage/: " + ", ".join(unknown),
+            )
+        targets = [by_name[n] for n in sorted(want)]
+    else:
+        raise HTTPException(status_code=400, detail="Set all=true or provide names")
+
+    for p in targets:
+        schedule_index_pipeline(paths.root, p)
+    return {"queued": [p.name for p in targets]}
+
+
+@app.get("/api/media/catalog")
+def get_media_catalog(
+    paths: ProjectPaths = Depends(get_paths),
+    scope: str = "all",
+    names: str | None = None,
+) -> dict[str, Any]:
+    """Unified per-file catalog for UI and debugging."""
+    only = None
+    if names and names.strip():
+        only = [n.strip() for n in names.split(",") if n.strip()]
+    try:
+        entries, warnings = build_media_catalog(
+            paths.root,
+            scope="selected" if only else "all",
+            only_basenames=only,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"entries": entries, "warnings": warnings}
+
+
+@app.get("/api/footage/{name}/index-job")
+def get_index_job_status(name: str) -> dict[str, Any]:
+    """Background index pipeline status (transcript → merge)."""
+    base = Path(name).name
+    if base != name:
+        raise HTTPException(status_code=400, detail="Invalid name")
+    job = get_index_job(base)
+    if job is None:
+        return {"status": "idle"}
+    return job
 
 
 @app.delete("/api/footage/{name}")
@@ -761,21 +847,144 @@ def apply_operation(body: ApplyOpRequest) -> dict[str, Any]:
     return result
 
 
+@app.get("/api/styles")
+def list_styles(paths: ProjectPaths = Depends(get_paths)) -> dict[str, Any]:
+    styles_dir = paths.plans / "styles"
+    return {"styles": list_style_profiles(styles_dir, paths.root)}
+
+
+@app.post("/api/styles/analyze")
+async def analyze_style(
+    request: Request,
+    file: UploadFile = File(...),
+    style_name: str | None = Form(None),
+    style_id: str | None = Form(None),
+    paths: ProjectPaths = Depends(get_paths),
+) -> dict[str, Any]:
+    if not _client_host_allowed(request):
+        raise HTTPException(status_code=403, detail="Localhost only")
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Missing filename")
+    try:
+        base = sanitize_upload_basename(file.filename)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    ref_dir = paths.root / "references"
+    ref_dir.mkdir(parents=True, exist_ok=True)
+    dest = ref_dir / base
+    if dest.is_file():
+        stem = dest.stem
+        ext = dest.suffix
+        n = 2
+        while n < 10000:
+            candidate = ref_dir / f"{stem}_{n}{ext}"
+            if not candidate.is_file():
+                dest = candidate
+                break
+            n += 1
+        else:
+            raise HTTPException(status_code=409, detail="Could not pick a free reference name")
+
+    try:
+        data = await file.read()
+        dest.write_bytes(data)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    try:
+        ffprobe_validate_video(dest)
+    except RuntimeError as e:
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    display_name = (style_name or "").strip() or dest.stem
+    sid = slug_style_id(style_id.strip() if style_id else None, fallback=dest.stem)
+    api_key = effective_planner_api_key(paths.root)
+    with project_cwd(paths):
+        try:
+            profile = analyze_reference_video(
+                dest,
+                style_id=sid,
+                style_name=display_name,
+                api_key=api_key,
+            )
+        except ValueError as e:
+            try:
+                dest.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except Exception as e:
+            try:
+                dest.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise HTTPException(status_code=500, detail=str(e)) from e
+
+    sid = str(profile.get("style_id") or sid)
+    out_path = paths.plans / "styles" / f"{sid}.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        out_path.write_text(
+            json.dumps(profile, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    log_event("info", f"Style profile saved: {out_path.name}")
+    rel = f"references/{dest.name}"
+    return {
+        "style_id": sid,
+        "style_name": profile.get("style_name") or display_name,
+        "file": rel,
+        "profile_path": f"plans/styles/{sid}.json",
+        "profile": profile,
+    }
+
+
 @app.post("/api/planner/run")
 def run_planner(
     body: PlannerRequest,
     paths: ProjectPaths = Depends(get_paths),
 ) -> dict[str, Any]:
     api_key = effective_planner_api_key(paths.root)
+    unanalyzed = list_unanalyzed_for_planning(paths.root, body.clip_filenames)
+    if unanalyzed and not body.allow_without_merged_index:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Analysis required: merged index missing for some files.",
+                "unanalyzed": unanalyzed,
+                "hint": "POST /api/footage/analyze with { names: [...] } or { all: true }",
+            },
+        )
     with project_cwd(paths):
         try:
             plan_v2, group_id, usage = generate_plan(
                 body.brief,
                 api_key=api_key,
                 clip_filenames=body.clip_filenames,
+                imitate_style_id=body.imitate_style_id,
+                require_merged_index=not body.allow_without_merged_index,
             )
+        except FileNotFoundError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         except RuntimeError as e:
-            raise HTTPException(status_code=503, detail=str(e))
+            msg = str(e)
+            if "Merged index missing" in msg:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": msg,
+                        "unanalyzed": unanalyzed,
+                        "hint": "POST /api/footage/analyze with { names: [...] } or { all: true }",
+                    },
+                ) from e
+            raise HTTPException(status_code=503, detail=msg)
         except ValueError as e:
             detail = e.args[0] if e.args and isinstance(e.args[0], list) else str(e)
             raise HTTPException(status_code=400, detail=detail)

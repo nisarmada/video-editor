@@ -78,7 +78,6 @@ def convert(
                     "timeline_start": round(timeline_cursor, 3),
                     "text": text,
                     "created_by": created,
-                    **({"group_id": group} if group else {}),
                 }
             )
 

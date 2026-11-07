@@ -56,9 +56,13 @@ export type TimelineClip = {
   source?: string;
   source_in?: number;
   source_out?: number;
+  /** Caption clips: wall-clock end when source span is omitted (v2 docs). */
+  timeline_end?: number;
   timeline_start: number;
   created_by?: string;
   group_id?: string;
+  /** When `"av_link"`, paired with one video/audio clip (separate_audio); selection/ops may follow. */
+  group_kind?: "av_link";
   /** Video clips: embedded timeline audio vs split to audio track. Default embedded if omitted. */
   audio_source?: VideoAudioSource;
   speed?: number;

@@ -2,6 +2,8 @@
 .env
 footage/*
 !footage/.gitkeep
+references/*
+!references/.gitkeep
 output/*
 !output/.gitkeep
 __pycache__/
@@ -15,3 +17,5 @@ index/*
 !index/.gitkeep
 plans/*
 !plans/.gitkeep
+!plans/styles/
+!plans/styles/.gitkeep

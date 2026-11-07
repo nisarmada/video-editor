@@ -3,13 +3,20 @@ import {
   fetchFootageList,
   rescanFootageFolder,
   type FootageClip,
+  type FootageKind,
 } from "../api/footage";
 import {
   fetchPlan,
   fetchPlanList,
   savePlan as savePlanToServer,
 } from "../api/plans";
-import { runPlanner as callPlanner } from "../api/planner";
+import { fetchMediaCatalog } from "../api/catalog";
+import {
+  PlannerAnalysisRequiredError,
+  requestFootageAnalyze,
+  runPlanner as callPlanner,
+} from "../api/planner";
+import { listStyles, type StyleListItem } from "../api/styles";
 import {
   cancelRenderJob,
   getRenderJob,
@@ -31,6 +38,9 @@ import {
   wrapUndoPayload,
 } from "./timelineMutation";
 import type { CaptionStyle, TimelineV2 } from "../timeline/types";
+import { findClipById, pruneClipIds } from "../timeline/selection";
+import { clipTimelineDuration } from "../timeline/duration";
+import type { GroupMovePlan } from "../timeline/groupMove";
 
 /** Human-readable line after planner succeeds (toast + optional inline). */
 function summarizePlannerTimeline(tl: TimelineV2): string {
@@ -120,6 +130,9 @@ export type RenderStatus = "idle" | "rendering" | "done" | "error";
 /** Upper preview panel: timeline (video track) vs source file from media bin. */
 export type PreviewPanelMode = "timeline" | "source";
 
+/** Media bin list filter (Asset strip). */
+export type MediaBinCategory = "all" | "video" | "audio";
+
 type TimelineViewState = {
   /** Active plan stem (no .json); persisted file is `{currentPlanName}.json`. */
   currentPlanName: string;
@@ -155,10 +168,12 @@ type TimelineViewState = {
   pxPerSecond: number;
   timelinePlaying: boolean;
 
-  /** Selected clip on the timeline (UI); not necessarily validated server-side. */
+  /** Primary clip for details / single-target fallbacks (anchor when set). */
   selectedClipId: string | null;
-  /** Multi-select (shift-click). `selectedClipId` stays the primary (last clicked). */
+  /** Multi-select order (unique). UI-only — not in plan, undo, or dirty. */
   selectedClipIds: string[];
+  /** Last plain-clicked clip; stable primary when toggling with Shift. */
+  selectedClipAnchorId: string | null;
 
   /** Selected item in the media bin (footage filename stem). */
   selectedFootageName: string | null;
@@ -167,6 +182,9 @@ type TimelineViewState = {
   footageClips: FootageClip[];
   footageLoading: boolean;
   footageError: string | null;
+  /** Media vs Audio tab — filters footage list. */
+  mediaBinCategory: MediaBinCategory;
+  setMediaBinCategory: (c: MediaBinCategory) => void;
 
   /** Which preview is shown — only one player mounts at a time. */
   previewPanelMode: PreviewPanelMode;
@@ -201,6 +219,12 @@ type TimelineViewState = {
   /** Shown briefly after success (and in toast). */
   plannerSuccessSummary: string | null;
 
+  /** Saved style profiles (plans/styles/*.json) for AI planner imitate. */
+  styleProfiles: StyleListItem[];
+  styleProfilesLoading: boolean;
+  styleProfilesError: string | null;
+  refreshStyleProfiles: () => Promise<void>;
+
   /** Apply local caption style edits (commits via applyOperation set_timeline_settings). */
   setCaptionStyleDraft: (style: CaptionStyle) => void;
   /** Set per-clip style override draft (commits via set_clip_property). */
@@ -229,6 +253,7 @@ type TimelineViewState = {
     opts?: {
       footageScope?: "all" | "selected";
       clipNames?: string[];
+      imitateStyleId?: string | null;
     },
   ) => Promise<void>;
   /** Save if dirty, then POST /api/render using plan file on disk. */
@@ -249,7 +274,8 @@ type TimelineViewState = {
   setTimelinePlaying: (playing: boolean) => void;
   toggleTimelinePlaying: () => void;
   setSelectedClipId: (id: string | null) => void;
-  setSelectedClipIds: (ids: string[]) => void;
+  setSelectedClipIds: (ids: string[], opts?: { anchorId?: string | null }) => void;
+  toggleClipInSelection: (clipId: string, additive: boolean) => void;
   setDragInProgress: (v: boolean) => void;
   clearOpError: () => void;
   setShortcutToast: (msg: string | null) => void;
@@ -267,11 +293,19 @@ type TimelineViewState = {
   /** Pop redo stack, run via apply_undo, push returned inverse to undo. */
   redo: () => Promise<void>;
 
-  /** Split selected clip at current playhead (delegates to applyOperation). */
+  /** Split selected clip(s) at current playhead — one undo step. */
   splitAtPlayhead: () => Promise<TimelineInverseOp>;
 
-  /** Delete selected clip (delegates to applyOperation). */
+  /** Delete all selected clips — one undo step. */
   deleteSelectedClip: () => Promise<TimelineInverseOp>;
+  moveClipsToPlans: (plans: GroupMovePlan[]) => Promise<TimelineInverseOp>;
+  setClipPropertyBatch: (
+    clipIds: string[],
+    properties: Record<string, unknown>,
+  ) => Promise<TimelineInverseOp | void>;
+  runBatchOperationSteps: (
+    steps: TimelineEditOp[],
+  ) => Promise<TimelineInverseOp | void>;
 
   /** Detach embedded audio to audio track (video clip only). */
   separateAudio: () => Promise<TimelineInverseOp | void>;
@@ -340,11 +374,14 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
   timelinePlaying: false,
   selectedClipId: null,
   selectedClipIds: [],
+  selectedClipAnchorId: null,
   selectedFootageName: null,
   selectedFootageNames: [],
   footageClips: [],
   footageLoading: false,
   footageError: null,
+  mediaBinCategory: "all",
+  setMediaBinCategory: (c: MediaBinCategory) => set({ mediaBinCategory: c }),
   previewPanelMode: "timeline",
   captionPreviewClipOnly: false,
   setCaptionPreviewClipOnly: (v) => set({ captionPreviewClipOnly: v }),
@@ -361,6 +398,24 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
   plannerPhase: "idle",
   plannerProgressMessage: null,
   plannerSuccessSummary: null,
+  styleProfiles: [],
+  styleProfilesLoading: false,
+  styleProfilesError: null,
+
+  refreshStyleProfiles: async () => {
+    set({ styleProfilesLoading: true, styleProfilesError: null });
+    try {
+      const res = await listStyles();
+      set({ styleProfiles: res.styles, styleProfilesLoading: false });
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Failed to list styles";
+      set({
+        styleProfiles: [],
+        styleProfilesLoading: false,
+        styleProfilesError: message,
+      });
+    }
+  },
 
   fetchFootage: async (opts) => {
     const silent = opts?.silent ?? false;
@@ -449,6 +504,7 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
             availablePlans: [DEFAULT_PLAN_NAME],
             plansListError: null,
           });
+          await get().refreshStyleProfiles();
         } catch {
           set({
             availablePlans: [],
@@ -479,6 +535,7 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
       const stem =
         stored && list.includes(stored) ? stored : list[0];
       await get().loadPlan(stem, { skipDirtyConfirm: true });
+      await get().refreshStyleProfiles();
     } catch (e) {
       const message = e instanceof Error ? e.message : "Failed to list plans";
       set({
@@ -859,12 +916,51 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
     set({
       selectedClipId: id,
       selectedClipIds: id ? [id] : [],
+      selectedClipAnchorId: id,
     }),
-  setSelectedClipIds: (ids) =>
-    set({
-      selectedClipIds: ids,
-      selectedClipId: ids.length ? ids[ids.length - 1]! : null,
+  setSelectedClipIds: (ids, opts) =>
+    set((s) => {
+      const uniq: string[] = [];
+      const seen = new Set<string>();
+      for (const id of ids) {
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        uniq.push(id);
+      }
+      const anchor =
+        opts?.anchorId !== undefined
+          ? opts.anchorId
+          : s.selectedClipAnchorId && uniq.includes(s.selectedClipAnchorId)
+            ? s.selectedClipAnchorId
+            : uniq.length
+              ? uniq[uniq.length - 1]!
+              : null;
+      const primary = anchor ?? (uniq.length ? uniq[uniq.length - 1]! : null);
+      return {
+        selectedClipIds: uniq,
+        selectedClipId: primary,
+        selectedClipAnchorId: anchor,
+      };
     }),
+  toggleClipInSelection: (clipId, additive) => {
+    const { timeline, selectedClipIds, selectedClipAnchorId } = get();
+    if (!timeline) return;
+    if (!additive) {
+      get().setSelectedClipIds([clipId], { anchorId: clipId });
+      return;
+    }
+    const cur = new Set(selectedClipIds);
+    if (cur.has(clipId)) cur.delete(clipId);
+    else cur.add(clipId);
+    const next = [...cur];
+    const anchor =
+      selectedClipAnchorId && next.includes(selectedClipAnchorId)
+        ? selectedClipAnchorId
+        : next.length
+          ? clipId
+          : null;
+    get().setSelectedClipIds(next, { anchorId: anchor });
+  },
   setDragInProgress: (v) => set({ dragInProgress: v }),
   clearOpError: () => set({ opErrorMessage: null }),
   setShortcutToast: (msg) => set({ shortcutToast: msg }),
@@ -880,19 +976,50 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
     set({ applyOperationInProgress: true, opErrorMessage: null });
     try {
       const result = await fetchApplyOp(timeline, op.operation, op.arguments ?? {});
-      set((s) => ({
-        timeline: result.timeline,
-        undoStack: [...s.undoStack, result.undo],
-        redoStack: [],
-        isDirty: true,
-        saveStatus: "idle",
-        saveError: null,
-      }));
+      set((s) => {
+        const pruned = pruneClipIds(result.timeline, s.selectedClipIds);
+        const anchor =
+          s.selectedClipAnchorId && pruned.includes(s.selectedClipAnchorId)
+            ? s.selectedClipAnchorId
+            : pruned.length
+              ? pruned[pruned.length - 1]!
+              : null;
+        return {
+          timeline: result.timeline,
+          undoStack: [...s.undoStack, result.undo],
+          redoStack: [],
+          isDirty: true,
+          saveStatus: "idle",
+          saveError: null,
+          selectedClipIds: pruned,
+          selectedClipId: anchor,
+          selectedClipAnchorId: anchor,
+        };
+      });
       return result.undo;
     } catch (e) {
       const msg =
         e instanceof Error ? parseApplyOpErrorMessage(e.message) : "Request failed";
-      set({ opErrorMessage: msg });
+      const missing = /Clip not found:\s*'([^']+)'/i.exec(msg);
+      if (missing) {
+        const bad = missing[1]!;
+        set((s) => {
+          const nextIds = s.selectedClipIds.filter((id) => id !== bad);
+          const anchor = s.selectedClipAnchorId === bad ? null : s.selectedClipAnchorId;
+          const primary =
+            anchor && nextIds.includes(anchor)
+              ? anchor
+              : nextIds.length
+                ? nextIds[nextIds.length - 1]!
+                : null;
+          return {
+            selectedClipIds: nextIds,
+            selectedClipId: primary,
+            selectedClipAnchorId: primary,
+          };
+        });
+      }
+      set({ opErrorMessage: msg, shortcutToast: msg });
       throw e;
     } finally {
       set({ applyOperationInProgress: false });
@@ -911,6 +1038,13 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
         "apply_undo",
         wrapUndoPayload(inverse),
       );
+      const pruned = pruneClipIds(result.timeline, s.selectedClipIds);
+      const anchor =
+        s.selectedClipAnchorId && pruned.includes(s.selectedClipAnchorId)
+          ? s.selectedClipAnchorId
+          : pruned.length
+            ? pruned[pruned.length - 1]!
+            : null;
       set({
         timeline: result.timeline,
         undoStack: s.undoStack.slice(0, -1),
@@ -918,6 +1052,9 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
         isDirty: true,
         saveStatus: "idle",
         saveError: null,
+        selectedClipIds: pruned,
+        selectedClipId: anchor,
+        selectedClipAnchorId: anchor,
       });
     } catch (e) {
       const msg =
@@ -940,6 +1077,13 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
         "apply_undo",
         wrapUndoPayload(inverse),
       );
+      const pruned = pruneClipIds(result.timeline, s.selectedClipIds);
+      const anchor =
+        s.selectedClipAnchorId && pruned.includes(s.selectedClipAnchorId)
+          ? s.selectedClipAnchorId
+          : pruned.length
+            ? pruned[pruned.length - 1]!
+            : null;
       set({
         timeline: result.timeline,
         redoStack: s.redoStack.slice(0, -1),
@@ -947,6 +1091,9 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
         isDirty: true,
         saveStatus: "idle",
         saveError: null,
+        selectedClipIds: pruned,
+        selectedClipId: anchor,
+        selectedClipAnchorId: anchor,
       });
     } catch (e) {
       const msg =
@@ -958,30 +1105,86 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
   },
 
   splitAtPlayhead: async () => {
-    const { selectedClipId, playheadSeconds } = get();
-    if (!selectedClipId) {
+    const { selectedClipIds, playheadSeconds, timeline } = get();
+    const ids = selectedClipIds.length ? selectedClipIds : [];
+    if (ids.length === 0) {
       throw new Error("No clip selected");
     }
+    const toSplit = ids.filter((cid) => {
+      const hit = timeline && findClipById(timeline, cid);
+      if (!hit) return false;
+      const span = clipTimelineDuration(hit.clip, hit.trackType);
+      const t1 = hit.clip.timeline_start + span;
+      return playheadSeconds >= hit.clip.timeline_start - 1e-9 && playheadSeconds < t1 - 1e-9;
+    });
+    if (toSplit.length === 0) {
+      throw new Error("Playhead is not inside any selected clip.");
+    }
+    return get().splitClipsAtTime(toSplit, playheadSeconds);
+  },
+
+  deleteSelectedClip: async () => {
+    const ids = get().selectedClipIds;
+    if (ids.length === 0) {
+      throw new Error("No clip selected");
+    }
+    return get().deleteClipsByIds(ids);
+  },
+
+  moveClipsToPlans: async (plans) => {
+    if (plans.length === 0) throw new Error("No moves");
+    if (plans.length === 1) {
+      const p = plans[0]!;
+      return get().applyOperation({
+        operation: "move_clip",
+        arguments: {
+          clip_id: p.clipId,
+          timeline_start: p.newStart,
+          skip_link_expand: true,
+        },
+      });
+    }
     return get().applyOperation({
-      operation: "split_clip",
+      operation: "batch_operations",
       arguments: {
-        clip_id: selectedClipId,
-        at_timeline_time: playheadSeconds,
+        steps: plans.map((p) => ({
+          operation: "move_clip",
+          arguments: {
+            clip_id: p.clipId,
+            timeline_start: p.newStart,
+            skip_link_expand: true,
+          },
+        })),
       },
     });
   },
 
-  deleteSelectedClip: async () => {
-    const id = get().selectedClipId;
-    if (!id) {
-      throw new Error("No clip selected");
+  setClipPropertyBatch: async (clipIds, properties) => {
+    if (clipIds.length === 0) return;
+    if (clipIds.length === 1) {
+      return get().applyOperation({
+        operation: "set_clip_property",
+        arguments: { clip_id: clipIds[0]!, properties },
+      });
     }
-    const undo = await get().applyOperation({
-      operation: "delete_clip",
-      arguments: { clip_id: id },
+    return get().applyOperation({
+      operation: "batch_operations",
+      arguments: {
+        steps: clipIds.map((cid) => ({
+          operation: "set_clip_property",
+          arguments: { clip_id: cid, properties },
+        })),
+      },
     });
-    set({ selectedClipId: null, selectedClipIds: [] });
-    return undo;
+  },
+
+  runBatchOperationSteps: async (steps) => {
+    if (steps.length === 0) return;
+    if (steps.length === 1) return get().applyOperation(steps[0]!);
+    return get().applyOperation({
+      operation: "batch_operations",
+      arguments: { steps },
+    });
   },
 
   separateAudio: async () => {
@@ -1050,12 +1253,10 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
       });
     }
     return get().applyOperation({
-      operation: "batch_operations",
+      operation: "split_clips_at_time",
       arguments: {
-        steps: clipIds.map((cid) => ({
-          operation: "split_clip",
-          arguments: { clip_id: cid, at_timeline_time: atTimelineTime },
-        })),
+        clip_ids: clipIds,
+        at_timeline_time: atTimelineTime,
       },
     });
   },
@@ -1067,19 +1268,14 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
         operation: "delete_clip",
         arguments: { clip_id: clipIds[0]! },
       });
-      set({ selectedClipId: null, selectedClipIds: [] });
+      set({ selectedClipId: null, selectedClipIds: [], selectedClipAnchorId: null });
       return undo;
     }
     const undo = await get().applyOperation({
-      operation: "batch_operations",
-      arguments: {
-        steps: clipIds.map((cid) => ({
-          operation: "delete_clip",
-          arguments: { clip_id: cid },
-        })),
-      },
+      operation: "delete_clips",
+      arguments: { clip_ids: clipIds },
     });
-    set({ selectedClipId: null, selectedClipIds: [] });
+    set({ selectedClipId: null, selectedClipIds: [], selectedClipAnchorId: null });
     return undo;
   },
 
@@ -1192,6 +1388,7 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
       return;
     }
     const scope = opts?.footageScope ?? "all";
+    const imitateId = opts?.imitateStyleId?.trim() || undefined;
     let clipFilter: string[] | undefined;
     if (scope === "selected") {
       const names = opts?.clipNames ?? get().selectedFootageNames;
@@ -1222,13 +1419,70 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
       plannerPhase: "context",
       plannerProgressMessage: "Gathering media index context…",
     });
+    const sleep = (ms: number) =>
+      new Promise<void>((resolve) => {
+        window.setTimeout(resolve, ms);
+      });
+
+    /** Poll until every catalog entry in scope has merged_index "complete". */
+    async function waitForMergedIndex(scopeNames: string[] | null): Promise<void> {
+      const deadline = Date.now() + 90 * 60 * 1000;
+      while (Date.now() < deadline) {
+        const { entries } = await fetchMediaCatalog(
+          scopeNames?.length
+            ? { names: scopeNames }
+            : undefined,
+        );
+        const pending = entries.filter(
+          (e) => (e.analysis?.merged_index ?? "") !== "complete",
+        );
+        if (pending.length === 0) {
+          return;
+        }
+        await sleep(2500);
+      }
+      throw new Error("Analysis timed out — check logs and try again.");
+    }
+
     try {
       set({ plannerPhase: "planning", plannerProgressMessage: "Sending to planner (Claude)…" });
-      const result = await callPlanner({
-        brief: trimmed,
-        save_as: stem,
-        ...(clipFilter ? { clip_filenames: clipFilter } : {}),
-      });
+      let result: Awaited<ReturnType<typeof callPlanner>>;
+      try {
+        result = await callPlanner({
+          brief: trimmed,
+          save_as: stem,
+          ...(clipFilter ? { clip_filenames: clipFilter } : {}),
+          ...(imitateId ? { imitate_style_id: imitateId } : {}),
+        });
+      } catch (firstErr) {
+        if (firstErr instanceof PlannerAnalysisRequiredError) {
+          const need = firstErr.unanalyzed;
+          if (!need.length) {
+            throw new Error(
+              "Planner needs analyzed media but did not list missing files.",
+            );
+          }
+          set({
+            plannerPhase: "context",
+            plannerProgressMessage: `Analyzing media (${need.length} file(s))…`,
+          });
+          await requestFootageAnalyze({ names: need });
+          const scopeWait = clipFilter?.length ? clipFilter : null;
+          await waitForMergedIndex(scopeWait);
+          set({
+            plannerPhase: "planning",
+            plannerProgressMessage: "Sending to planner (Claude)…",
+          });
+          result = await callPlanner({
+            brief: trimmed,
+            save_as: stem,
+            ...(clipFilter ? { clip_filenames: clipFilter } : {}),
+            ...(imitateId ? { imitate_style_id: imitateId } : {}),
+          });
+        } else {
+          throw firstErr;
+        }
+      }
       await get().refreshAvailablePlans();
       const stemFromFile = normalizePlanStem(result.plan_name);
       const merged = ensureCaptionStyle(result.timeline);

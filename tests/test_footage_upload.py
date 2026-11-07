@@ -37,8 +37,9 @@ def test_upload_streams_and_validates(client: TestClient, tmp_path: Path, monkey
     def noop_schedule(*args, **kwargs) -> None:
         return None
 
-    monkeypatch.setattr("backend.main.ffprobe_validate_video", fake_probe)
+    monkeypatch.setattr("backend.main.ffprobe_validate_media", fake_probe)
     monkeypatch.setattr("backend.main.schedule_proxy_work", noop_schedule)
+    monkeypatch.setattr("backend.main.schedule_index_pipeline", noop_schedule)
     monkeypatch.setattr(
         "backend.main.footage_entry",
         lambda root, clip_path: {

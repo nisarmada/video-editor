@@ -2,9 +2,15 @@ export type FootageProcessStatus = "ready" | "processing" | "pending" | "failed"
 
 import { parseFastApiErrorBody } from "./httpError";
 
+export type FootageKind = "video" | "audio";
+
 export type FootageClip = {
   name: string;
   source: string;
+  /** From API: video vs standalone audio (legacy responses omit → treat as video). */
+  kind?: FootageKind;
+  has_video?: boolean;
+  has_audio?: boolean | null;
   duration_seconds: number | null;
   has_proxy: boolean;
   has_thumbnail: boolean;

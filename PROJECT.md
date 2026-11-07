@@ -20,8 +20,10 @@ editing style.
 
 ## Pipeline (one script per stage, each reads/writes JSON)
 1. ingest: per clip, make proxy, transcript with word timestamps,
-   silence markers, shot cuts, keyframes + AI captions -> index/<clip>.json
-2. plan: send indexes + brief to Claude, get back a timeline JSON
+   silence markers, shot cuts (video), keyframes + AI captions (video) -> index/<clip>.json
+   merged `index/<stem>.json`; audio-only files get transcript + silences (no shots/keyframes).
+   Upload/rescan triggers background analysis (`POST /api/footage/analyze` for manual queue).
+2. plan: unified **media catalog** (all footage types) + brief to Claude -> schema v2 timeline JSON
 3. validate: check the timeline (times exist, length is right, no overlaps)
 4. render: timeline JSON -> video via FFmpeg
 5. review: extract frames from the draft, Claude critiques, optional revision

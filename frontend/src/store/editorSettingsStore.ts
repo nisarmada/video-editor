@@ -6,6 +6,8 @@ const LS = "video-editor-ui-settings";
 
 export type ShortcutTargetingPolicy = "cursor" | "playhead" | "cursor_else_playhead";
 
+export type MarqueeOverlapMode = "touch" | "inside";
+
 export type EditorUiSettings = {
   shortcutTargeting: ShortcutTargetingPolicy;
   /** When true, snap playhead/cursor time to ~6px grid in timeline coords when shortcuts use timeline time. */
@@ -13,6 +15,10 @@ export type EditorUiSettings = {
   showCursorTimelineGuide: boolean;
   /** When true, clicking a clip under the cursor applies selection before the action. */
   cursorActionSelectsClip: boolean;
+  /** Marquee selects clips that touch the box vs must be fully inside. */
+  marqueeOverlapMode: MarqueeOverlapMode;
+  /** When true, clicking one separated A/V clip also selects its partner. */
+  selectLinkedClipsTogether: boolean;
 };
 
 const defaults: EditorUiSettings = {
@@ -20,6 +26,8 @@ const defaults: EditorUiSettings = {
   timelineSnapEnabled: true,
   showCursorTimelineGuide: true,
   cursorActionSelectsClip: false,
+  marqueeOverlapMode: "touch",
+  selectLinkedClipsTogether: true,
 };
 
 export type PerActionTargetOverrideMap = Partial<Record<string, TargetMode>>;
@@ -55,6 +63,12 @@ function readLocal(): { ui: EditorUiSettings; perActionTargetMode: PerActionTarg
       ...(typeof o.cursorActionSelectsClip === "boolean"
         ? { cursorActionSelectsClip: o.cursorActionSelectsClip }
         : {}),
+      ...(o.marqueeOverlapMode === "touch" || o.marqueeOverlapMode === "inside"
+        ? { marqueeOverlapMode: o.marqueeOverlapMode }
+        : {}),
+      ...(typeof o.selectLinkedClipsTogether === "boolean"
+        ? { selectLinkedClipsTogether: o.selectLinkedClipsTogether }
+        : {}),
     };
     const pam =
       o.perActionTargetMode && typeof o.perActionTargetMode === "object" && !Array.isArray(o.perActionTargetMode)
@@ -75,6 +89,8 @@ function writeLocal(s: State): void {
         timelineSnapEnabled: s.timelineSnapEnabled,
         showCursorTimelineGuide: s.showCursorTimelineGuide,
         cursorActionSelectsClip: s.cursorActionSelectsClip,
+        marqueeOverlapMode: s.marqueeOverlapMode,
+        selectLinkedClipsTogether: s.selectLinkedClipsTogether,
         perActionTargetMode: s.perActionTargetMode,
       }),
     );
@@ -95,6 +111,8 @@ function schedulePersist(s: State): void {
         timelineSnapEnabled: s.timelineSnapEnabled,
         showCursorTimelineGuide: s.showCursorTimelineGuide,
         cursorActionSelectsClip: s.cursorActionSelectsClip,
+        marqueeOverlapMode: s.marqueeOverlapMode,
+        selectLinkedClipsTogether: s.selectLinkedClipsTogether,
         perActionTargetMode: s.perActionTargetMode,
       },
     }).catch(() => {});

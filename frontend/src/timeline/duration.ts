@@ -1,5 +1,8 @@
 import type { TimelineClip, TimelineV2 } from "./types";
 
+/** Extend clip end slightly so float error cannot leave a gap after the previous segment's end. */
+export const CLIP_END_SLACK = 1e-4;
+
 export function clipTimelineDuration(
   clip: TimelineClip,
   trackType: string,
@@ -7,9 +10,19 @@ export function clipTimelineDuration(
   const speed = clip.speed && clip.speed > 0 ? clip.speed : 1;
   const srcIn = clip.source_in ?? 0;
   const srcOut = clip.source_out ?? srcIn;
-  const base = srcOut - srcIn;
+  let base = srcOut - srcIn;
   if (trackType === "caption") {
-    return Math.max(0, base);
+    if (
+      typeof clip.timeline_end === "number" &&
+      clip.timeline_end > clip.timeline_start + 1e-9
+    ) {
+      return clip.timeline_end - clip.timeline_start;
+    }
+    if (base <= 1e-9 && clip.text?.trim()) {
+      const est = Math.max(0.5, Math.min(24, clip.text.trim().length * 0.045));
+      return est;
+    }
+    return Math.max(base, 0.25);
   }
   return Math.max(0, base / speed);
 }
@@ -67,23 +80,39 @@ export function getSortedVideoClips(timeline: TimelineV2 | null): TimelineClip[]
 
 /**
  * Active video clip at timeline time t, or null in a gap.
- * Clips are half-open [start, end) so adjacent clips meet at boundaries.
- * If two video clips overlap (different tracks), the clip on the later track wins (top layer).
+ * Intended half-open [start, end), but after a split, float math can leave a sliver of time
+ * where neither strict interval matches — the preview then clears the video (black). We use
+ * a tiny slack only on the **end** so float error cannot leave a dead gap between adjacent split clips.
+ * If multiple clips match (overlays), pick the one with the largest `timeline_start`, then the
+ * latest in `clips` order (same start → later video track from getSortedVideoClips).
  */
 export function activeVideoClipAt(
   clips: TimelineClip[],
   t: number,
 ): TimelineClip | null {
-  let hit: TimelineClip | null = null;
-  for (const clip of clips) {
+  let best: TimelineClip | null = null;
+  let bestIdx = -1;
+  clips.forEach((clip, idx) => {
     const dur = clipTimelineDuration(clip, "video");
     const start = clip.timeline_start;
     const end = start + dur;
-    if (t >= start - 1e-9 && t < end - 1e-9) {
-      hit = clip;
+    if (t >= start - 1e-9 && t < end + CLIP_END_SLACK) {
+      if (best === null) {
+        best = clip;
+        bestIdx = idx;
+        return;
+      }
+      const preferThis =
+        clip.timeline_start > best!.timeline_start + 1e-9 ||
+        (Math.abs(clip.timeline_start - best!.timeline_start) <= 1e-9 &&
+          idx > bestIdx);
+      if (preferThis) {
+        best = clip;
+        bestIdx = idx;
+      }
     }
-  }
-  return hit;
+  });
+  return best;
 }
 
 /** Map timeline time to source media time (seconds). */

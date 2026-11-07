@@ -191,6 +191,9 @@ def test_planner_run_mock(client: TestClient, monkeypatch):
     def fake_plan(brief: str, **kwargs):
         return tl, "group-1", {"input_tokens": 1, "output_tokens": 2}
 
+    monkeypatch.setattr(
+        "backend.main.list_unanalyzed_for_planning", lambda root, cf: []
+    )
     monkeypatch.setattr("backend.main.generate_plan", fake_plan)
     r = client.post(
         "/api/planner/run",
@@ -199,6 +202,51 @@ def test_planner_run_mock(client: TestClient, monkeypatch):
     assert r.status_code == 200
     assert r.json()["group_id"] == "group-1"
     assert r.json()["plan_name"] == "auto.json"
+
+
+def test_planner_run_passes_style_ids(client: TestClient, monkeypatch, tmp_path: Path):
+    tl = _minimal_v2()
+    captured: dict = {}
+
+    def fake_plan(brief: str, **kwargs):
+        captured.update(kwargs)
+        return tl, "g", {}
+
+    monkeypatch.setattr(
+        "backend.main.list_unanalyzed_for_planning", lambda root, cf: []
+    )
+    monkeypatch.setattr("backend.main.generate_plan", fake_plan)
+    r = client.post(
+        "/api/planner/run",
+        json={
+            "brief": "10s",
+            "save_as": "with_style",
+            "imitate_style_id": "a",
+        },
+    )
+    assert r.status_code == 200
+    assert captured.get("imitate_style_id") == "a"
+
+
+def test_list_styles_empty(client: TestClient):
+    r = client.get("/api/styles")
+    assert r.status_code == 200
+    assert r.json() == {"styles": []}
+
+
+def test_list_styles_one(client: TestClient, tmp_path: Path):
+    styles = tmp_path / "plans" / "styles"
+    styles.mkdir(parents=True)
+    (styles / "demo.json").write_text(
+        '{"schema_version": 1, "style_id": "demo", "style_name": "Demo Ref"}\n',
+        encoding="utf-8",
+    )
+    r = client.get("/api/styles")
+    assert r.status_code == 200
+    data = r.json()["styles"]
+    assert len(data) == 1
+    assert data[0]["id"] == "demo"
+    assert data[0]["name"] == "Demo Ref"
 
 
 def test_render_mock(client: TestClient, monkeypatch):

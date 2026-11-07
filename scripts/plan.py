@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Ask Claude to build a timeline plan from clip indexes and a creative brief.
+Ask Claude to build a timeline plan from a unified media catalog and a creative brief.
 Usage: python scripts/plan.py --brief "30s reel, hook in first 2 seconds" --out plans/draft1.json
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -15,13 +17,18 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _SCRIPTS_DIR.parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from convert_v1_to_v2 import convert as v1_to_v2  # noqa: E402
-from index_cache import load_json, merged_index_path  # noqa: E402
+from style_profile import format_style_for_prompt, load_style_profile  # noqa: E402
 from timeline_format import get_track, is_v2  # noqa: E402
 from validate_plan import validate_plan_data, validate_segments  # noqa: E402
+
+from backend.media_catalog import build_media_catalog  # noqa: E402
 
 DEFAULT_MODEL = "claude-sonnet-4-5-20250514"
 # User-facing default name; override with ANTHROPIC_PLAN_MODEL (e.g. claude-sonnet-5-5)
@@ -31,35 +38,76 @@ DEFAULT_MODEL_ENV = "claude-sonnet-5-5"
 INPUT_USD_PER_TOKEN = 3.0 / 1_000_000
 OUTPUT_USD_PER_TOKEN = 15.0 / 1_000_000
 
-SYSTEM_PROMPT = """You are a short-form vertical video editor (1080x1920, social reels).
+BASE_SYSTEM_PROMPT = """You help build a timeline for a local video editor. Output area is typically 1080x1920 at 30 fps unless settings say otherwise.
 
-You receive text summaries of raw clips (transcripts, silences, visual captions). You cannot see video.
+You receive a JSON **media catalog**: one object per file in footage/. Each entry includes kind (video or audio), duration, stream flags, analysis status, transcript segments (or a note), silences, and for video files shots / keyframes / optional AI frame captions. Entries marked "not analyzed" for some fields mean that data was not produced yet — still use what is available.
 
-Output ONLY valid JSON (no markdown fences) with this shape:
-{
-  "name": "short_slug",
-  "brief": "<repeat the user brief>",
-  "target_length_seconds": <number>,
-  "segments": [
-    {
-      "source": "footage/<exact_filename_from_summaries>",
-      "start": <seconds>,
-      "end": <seconds>,
-      "caption": "<short on-screen caption idea>",
-      "reason": "<one line: why this cut is in the edit>"
-    }
-  ]
-}
+You cannot see pixels or waveforms directly; rely on the catalog text and numbers.
 
-Rules:
-- Use ONLY source filenames and time ranges that exist in the summaries.
-- Each segment must be at least 0.3 seconds (end > start).
-- Prefer cuts on speech boundaries (word/phrase starts and ends from transcripts).
-- First segment must deliver a strong hook within the first ~2 seconds of the OUTPUT timeline.
-- Total duration of all segments should match the brief's target length (within ~2 seconds).
-- Mix clips for variety; avoid repeating the same quote twice unless the brief demands it.
-- source paths must be exactly footage/<filename> as listed.
-"""
+## Timeline capabilities (schema version 2)
+
+The project uses **multi-track** timelines:
+
+- Any number of tracks of type `video`, `audio`, and `caption`.
+- Each **clip** uses:
+  - `id` (string, unique)
+  - `source` — exactly `footage/<filename>` from the catalog
+  - `source_in`, `source_out` — trim range in the source file (seconds)
+  - `timeline_start` — where the clip begins on the timeline (seconds)
+  - `created_by` — use `"ai"`
+  - Optional: `group_id` (string) to link related clips
+  - Optional: `speed`, `volume`, `zoom` (video)
+  - Optional on **video** clips: `audio_source` — `"embedded"` (default) or `"detached"`:
+    - `embedded`: mix the clip's own audio in the usual way.
+    - `detached`: mute embedded audio for that video segment (use when audio comes only from another track).
+  - Optional: `caption` on video clips as a short editorial note (not necessarily burned-in text)
+
+**Caption track** clips need `text` (on-screen string) plus timing fields like video/audio.
+
+**Gaps**: Leave timeline holes by advancing `timeline_start` so clips do not always touch; the renderer fills gaps with black + silence where needed.
+
+**Audio-only files** (kind `audio` in the catalog): place them on **audio** tracks with `source` / trims / `timeline_start` / optional `speed` / `volume`. They can run under different video than their file name suggests, or alone.
+
+**Video without audio**: valid; use `audio_source: detached` or rely on separate audio-track clips under the same timeline region.
+
+You decide which files to use, how to trim them, and how to layer them. Omit files that do not fit the brief.
+
+## Output format
+
+Return **only** valid JSON (no markdown fences) with:
+
+- `schema_version`: 2
+- `name`: short slug
+- `brief`: repeat the user's brief
+- `target_length_seconds`: number (total timeline length you intend)
+- `settings`: include at least `"width": 1080, "height": 1920, "fps": 30` unless the brief implies otherwise
+- `tracks`: array of tracks, each with `id`, `type` (`video` | `audio` | `caption`), `label` (optional), `muted` (optional, for audio/video tracks), `clips` array
+
+Validation rules you must satisfy:
+- At least one clip on a **video** track (required for export).
+- Every clip: valid `source` from the catalog, `source_in` < `source_out`, minimum segment length ~0.3s, times within file duration.
+- Use only `footage/<filename>` sources present in the catalog.
+
+Do not output legacy `segments`-only plans unless you cannot represent the edit otherwise; prefer full `schema_version` 2."""
+
+DEFAULT_SETTINGS = {"width": 1080, "height": 1920, "fps": 30}
+
+
+def build_system_prompt(
+    *,
+    imitate_profile: dict | None,
+) -> str:
+    """Anthropic system string: base rules plus optional reference-style blocks."""
+    parts: list[str] = [BASE_SYSTEM_PROMPT]
+    if imitate_profile is not None:
+        parts.append(format_style_for_prompt("IMITATE", imitate_profile))
+        parts.append(
+            "Style mode — IMITATE: The user chose a reference profile. "
+            "When it fits the brief, reflect similar pacing and structure; still use only "
+            "catalog sources and valid times. Do not treat any track type as mandatory beyond "
+            "what the export requires (at least one video clip)."
+        )
+    return "\n\n".join(parts)
 
 
 def parse_target_seconds(brief: str) -> float | None:
@@ -72,125 +120,31 @@ def parse_target_seconds(brief: str) -> float | None:
     return None
 
 
-def footage_clips() -> list[Path]:
-    root = Path.cwd() / "footage"
-    if not root.is_dir():
-        return []
-    exts = {".mp4", ".mov", ".m4v", ".mkv", ".webm"}
-    return sorted(p for p in root.iterdir() if p.suffix.lower() in exts and p.is_file())
-
-
-def load_indexes(only_basenames: list[str] | None = None) -> list[tuple[Path, dict]]:
-    """Merged index/<stem>.json for each file in footage/ (or only the given basenames)."""
-    all_clips = footage_clips()
-    if only_basenames is not None:
-        want = {Path(n).name for n in only_basenames if n and str(n).strip()}
-        if not want:
-            raise ValueError("No clip names provided for selected-clips planning.")
-        by_name = {p.name: p for p in all_clips}
-        clips: list[Path] = []
-        unknown: list[str] = []
-        for name in sorted(want):
-            p = by_name.get(name)
-            if p is None:
-                unknown.append(name)
-            else:
-                clips.append(p)
-        if unknown:
-            raise ValueError(
-                "These files are not in footage/: " + ", ".join(unknown)
-            )
-        if not clips:
-            raise ValueError("No matching footage files for the selected clips.")
-    else:
-        clips = all_clips
-    loaded: list[tuple[Path, dict]] = []
-    missing: list[str] = []
-    for clip in clips:
-        path = merged_index_path(clip)
-        data = load_json(path)
-        if data is None:
-            missing.append(clip.name)
-            continue
-        loaded.append((clip, data))
-    if missing:
-        print(
-            "Warning: no merged index for: "
-            + ", ".join(missing)
-            + " (run index_clip.py on those clips).",
-            file=sys.stderr,
-        )
-    return loaded
-
-
-def format_transcript(transcript: dict) -> str:
-    lines: list[str] = []
-    for seg in transcript.get("segments") or []:
-        start = seg.get("start", "?")
-        end = seg.get("end", "?")
-        text = (seg.get("text") or "").strip()
-        if text:
-            lines.append(f"  [{start}-{end}s] {text}")
-    return "\n".join(lines) if lines else "  (no speech detected)"
-
-
-def format_silences(index: dict) -> str:
-    silences = index.get("silences")
-    if silences is None:
-        return "  (silence data not in index)"
-    if not silences:
-        return "  (no long silences detected)"
-    return "\n".join(
-        f"  [{s['start']}-{s['end']}s]" for s in silences if "start" in s
-    )
-
-
-def format_visual_captions(index: dict) -> str:
-    caps = index.get("captions") or {}
-    frames = caps.get("frames") if isinstance(caps, dict) else None
-    if not frames:
-        return "  (no AI frame captions — run caption_frames.py)"
-    lines = []
-    for f in frames:
-        t = f.get("time_seconds", f.get("time", "?"))
-        desc = f.get("description", "")
-        stype = f.get("shot_type", "")
-        mood = f.get("mood", "")
-        subj = f.get("main_subject", "")
-        lines.append(f"  [{t}s] {desc} | type={stype} | subject={subj} | mood={mood}")
-    return "\n".join(lines)
-
-
-def summarize_clip(clip_path: Path, index: dict) -> str:
-    name = clip_path.name
-    duration = index.get("duration_seconds", "?")
-    source = f"footage/{name}"
-    parts = [
-        f"=== {name} ===",
-        f"source path for timeline: {source}",
-        f"duration: {duration}s",
-        "Transcript:",
-        format_transcript(index.get("transcript") or {}),
-        "Silences:",
-        format_silences(index),
-        "Visual keyframe captions:",
-        format_visual_captions(index),
-    ]
-    return "\n".join(parts)
-
-
-def build_user_prompt(brief: str, summaries: list[str]) -> str:
+def build_user_prompt(
+    brief: str,
+    catalog: list[dict],
+    catalog_warnings: list[str],
+) -> str:
     target = parse_target_seconds(brief)
     target_line = (
-        f"Target length: about {target} seconds total."
+        f"Target length: about {target} seconds total (timeline end)."
         if target
-        else "Infer a sensible target length from the brief."
+        else "Infer a sensible target_length_seconds from the brief."
     )
+    warn_block = (
+        "\nCatalog warnings:\n"
+        + "\n".join(f"- {w}" for w in catalog_warnings)
+        + "\n"
+        if catalog_warnings
+        else ""
+    )
+    catalog_json = json.dumps(catalog, indent=2, ensure_ascii=False)
     return (
-        f"Brief:\n{brief}\n\n{target_line}\n\n"
-        "Available clips:\n\n"
-        + "\n\n".join(summaries)
-        + "\n\nReturn the timeline JSON only."
+        f"User brief:\n{brief}\n\n{target_line}\n"
+        f"{warn_block}\n"
+        "Media catalog (JSON):\n"
+        f"{catalog_json}\n\n"
+        "Return the timeline JSON object only (schema_version 2, see system instructions)."
     )
 
 
@@ -200,9 +154,86 @@ def parse_plan_json(text: str) -> dict:
     if fence:
         text = fence.group(1).strip()
     data = json.loads(text)
-    if not isinstance(data, dict) or "segments" not in data:
-        raise ValueError("Plan must be an object with a 'segments' array")
-    return data
+    if not isinstance(data, dict):
+        raise ValueError("Plan must be a JSON object")
+    if isinstance(data.get("tracks"), list) and data.get("schema_version") != 2:
+        data = dict(data)
+        data["schema_version"] = 2
+    if data.get("schema_version") == 2:
+        return data
+    if "segments" in data:
+        return data
+    raise ValueError("Plan must have schema_version 2 or a legacy 'segments' array")
+
+
+def ensure_ai_v2_plan(plan: dict, brief: str, run_group_id: str) -> dict:
+    """Normalize model v2 output: defaults, created_by, group_id."""
+    out = json.loads(json.dumps(plan))  # deep copy via JSON
+    out["schema_version"] = 2
+    out.setdefault("brief", brief)
+    out.setdefault("name", "ai_plan")
+    out.setdefault("settings", dict(DEFAULT_SETTINGS))
+    if isinstance(out["settings"], dict):
+        for k, v in DEFAULT_SETTINGS.items():
+            out["settings"].setdefault(k, v)
+
+    tracks = out.get("tracks")
+    if not isinstance(tracks, list):
+        raise ValueError("v2 plan needs tracks array")
+
+    for track in tracks:
+        if not isinstance(track, dict):
+            continue
+        for clip in track.get("clips") or []:
+            if not isinstance(clip, dict):
+                continue
+            clip.setdefault("created_by", "ai")
+    return out
+
+
+def finalize_v2_from_segments(v1_plan: dict, brief: str, run_group_id: str) -> dict:
+    """Legacy path: v1 segments → validate → convert to v2."""
+    v1_plan = dict(v1_plan)
+    v1_plan.setdefault("brief", brief)
+    target_hint = parse_target_seconds(brief)
+    if target_hint is not None:
+        v1_plan.setdefault("target_length_seconds", target_hint)
+
+    target = v1_plan.get("target_length_seconds")
+    target = float(target) if isinstance(target, (int, float)) else None
+
+    errors = validate_segments(v1_plan.get("segments") or [], target)
+    if errors:
+        raise ValueError(errors)
+
+    v2 = v1_to_v2(v1_plan, created_by="ai", group_id=run_group_id)
+    v2_errors, _v2_warnings = validate_plan_data(v2, target)
+    if v2_errors:
+        raise ValueError(v2_errors)
+    return v2
+
+
+# Backward-compatible name (tests import finalize_v2_plan)
+finalize_v2_plan = finalize_v2_from_segments
+
+
+def finalize_v2_direct(plan: dict, brief: str, run_group_id: str) -> dict:
+    """Validate Claude v2 output."""
+    plan = ensure_ai_v2_plan(plan, brief, run_group_id)
+    target = plan.get("target_length_seconds")
+    target = float(target) if isinstance(target, (int, float)) else None
+    errors, _warn = validate_plan_data(plan, target)
+    if errors:
+        raise ValueError(errors)
+    return plan
+
+
+def validate_plan_parsed(plan: dict, brief: str, target: float | None) -> list[str]:
+    """Unified validation errors for fix-pass."""
+    if is_v2(plan):
+        errs, _ = validate_plan_data(plan, target)
+        return errs
+    return validate_segments(plan.get("segments") or [], target)
 
 
 def call_claude(
@@ -238,62 +269,68 @@ def print_usage(usage: object, model: str) -> None:
     print(f"Tokens ({model}): input={inp} output={out}  (~${est:.4f} estimated)")
 
 
-def finalize_v2_plan(v1_plan: dict, brief: str, run_group_id: str) -> dict:
-    """Validate v1 segments from Claude, then convert to schema v2."""
-    v1_plan.setdefault("brief", brief)
-    target_hint = parse_target_seconds(brief)
-    if target_hint is not None:
-        v1_plan.setdefault("target_length_seconds", target_hint)
-
-    target = v1_plan.get("target_length_seconds")
-    target = float(target) if isinstance(target, (int, float)) else None
-
-    errors = validate_segments(v1_plan.get("segments") or [], target)
-    if errors:
-        raise ValueError(errors)
-
-    v2 = v1_to_v2(v1_plan, created_by="ai", group_id=run_group_id)
-    v2_errors, _v2_warnings = validate_plan_data(v2, target)
-    if v2_errors:
-        raise ValueError(v2_errors)
-    return v2
-
-
 def generate_plan(
     brief: str,
     *,
     api_key: str | None = None,
     clip_filenames: list[str] | None = None,
+    imitate_style_id: str | None = None,
+    require_merged_index: bool = True,
 ) -> tuple[dict, str, dict]:
     """
     Call Claude, validate, return v2 plan, group_id, and token usage tallies.
     Requires cwd = project root (footage/, index/).
-    If clip_filenames is set, only those footage basenames are summarized for the model.
+    If clip_filenames is set, only those footage basenames are in the catalog.
     """
     load_dotenv()
 
-    indexes = load_indexes(only_basenames=clip_filenames)
-    if not indexes:
+    root = Path.cwd()
+    imitate_profile: dict | None = None
+    if imitate_style_id:
+        imitate_profile = load_style_profile(root, imitate_style_id)
+
+    system_prompt = build_system_prompt(imitate_profile=imitate_profile)
+
+    scope = "selected" if clip_filenames else "all"
+    catalog, cat_warnings = build_media_catalog(
+        root,
+        scope=scope,
+        only_basenames=clip_filenames,
+    )
+    if not catalog:
         raise RuntimeError(
-            "No merged indexes found. Add clips to footage/ and run index_clip.py."
+            "No media files in footage/. Add clips (video and/or audio), then run analysis."
         )
 
-    summaries = [summarize_clip(clip, data) for clip, data in indexes]
-    user_prompt = build_user_prompt(brief, summaries)
+    if require_merged_index:
+        missing_merged = [
+            e["id"]
+            for e in catalog
+            if (e.get("analysis") or {}).get("merged_index") != "complete"
+        ]
+        if missing_merged:
+            joined = ", ".join(missing_merged)
+            raise RuntimeError(
+                "Merged index missing for: "
+                f"{joined}. Run POST /api/footage/analyze with these names, "
+                "or wait for analysis to finish."
+            )
+
+    user_prompt = build_user_prompt(brief, catalog, cat_warnings)
 
     requested = os.environ.get("ANTHROPIC_PLAN_MODEL", DEFAULT_MODEL_ENV)
     model_candidates = [requested]
     if requested == DEFAULT_MODEL_ENV and DEFAULT_MODEL not in model_candidates:
         model_candidates.append(DEFAULT_MODEL)
 
-    total_usage = {"input_tokens": 0, "output_tokens": 0}
+    total_usage: dict = {"input_tokens": 0, "output_tokens": 0}
     text: str | None = None
     model_used = requested
 
     for i, current_model in enumerate(model_candidates):
         try:
             text, usage = call_claude(
-                current_model, SYSTEM_PROMPT, user_prompt, api_key=api_key
+                current_model, system_prompt, user_prompt, api_key=api_key
             )
             model_used = current_model
             break
@@ -316,7 +353,7 @@ def generate_plan(
     target = parse_target_seconds(brief) or plan.get("target_length_seconds")
     target = float(target) if isinstance(target, (int, float)) else None
 
-    errors = validate_segments(plan.get("segments") or [], target)
+    errors = validate_plan_parsed(plan, brief, target)
     if errors:
         fix_prompt = (
             user_prompt
@@ -326,7 +363,7 @@ def generate_plan(
         )
         try:
             text, usage2 = call_claude(
-                model_used, SYSTEM_PROMPT, fix_prompt, api_key=api_key
+                model_used, system_prompt, fix_prompt, api_key=api_key
             )
         except Exception as e:
             raise RuntimeError(f"Planner API error on fix pass: {e}") from e
@@ -337,11 +374,15 @@ def generate_plan(
             plan = parse_plan_json(text)
         except (json.JSONDecodeError, ValueError) as e:
             raise ValueError(f"Invalid fixed plan JSON: {e}") from e
-        errors = validate_segments(plan.get("segments") or [], target)
+        errors = validate_plan_parsed(plan, brief, target)
         if errors:
             raise ValueError(errors)
 
-    plan_v2 = finalize_v2_plan(plan, brief, run_group_id)
+    if is_v2(plan):
+        plan_v2 = finalize_v2_direct(plan, brief, run_group_id)
+    else:
+        plan_v2 = finalize_v2_from_segments(plan, brief, run_group_id)
+
     total_usage["model"] = model_used
     return plan_v2, run_group_id, total_usage
 
@@ -356,13 +397,17 @@ def print_summary(plan: dict) -> None:
         total = sum(
             float(c["source_out"]) - float(c["source_in"]) for c in clips
         )
-        print(f"\nPlan summary: {len(clips)} clips, {total:.2f}s source span")
+        print(f"\nPlan summary: {len(clips)} video clips, {total:.2f}s source span")
         for i, clip in enumerate(clips):
             reason = clip.get("caption") or "(no reason)"
             src = Path(clip.get("source", "?")).name
             start = clip.get("source_in")
             end = clip.get("source_out")
             print(f"  {i + 1}. {src} [{start}-{end}s] — {reason}")
+        audio_tracks = [t for t in plan.get("tracks") or [] if t.get("type") == "audio"]
+        ac = sum(len(t.get("clips") or []) for t in audio_tracks)
+        if ac:
+            print(f"  Audio clips (all audio tracks): {ac}")
         return
 
     segments = plan.get("segments") or []
@@ -386,10 +431,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate edit plan with Claude")
     parser.add_argument("--brief", required=True, help="Creative brief for the reel")
     parser.add_argument("--out", required=True, type=Path, help="Output plan JSON path")
+    parser.add_argument(
+        "--imitate-style",
+        dest="imitate_style_id",
+        default=None,
+        help="Style profile id under plans/styles/<id>.json to mirror",
+    )
     args = parser.parse_args()
 
     try:
-        plan_v2, run_group_id, total_usage = generate_plan(args.brief)
+        plan_v2, run_group_id, total_usage = generate_plan(
+            args.brief,
+            imitate_style_id=args.imitate_style_id,
+        )
     except RuntimeError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

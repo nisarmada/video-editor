@@ -81,6 +81,7 @@ describe("timeline undo/redo", () => {
       redoStack: [],
       selectedClipId: null,
       selectedClipIds: [],
+      selectedClipAnchorId: null,
       playheadSeconds: 0.5,
       applyOperationInProgress: false,
       dragInProgress: false,

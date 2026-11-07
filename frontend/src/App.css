@@ -1,4 +1,28 @@
 /* ========== App shell (CapCut-inspired) ========== */
+.panel-error-boundary {
+  padding: 12px;
+  border-radius: 8px;
+  background: rgba(180, 60, 60, 0.12);
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: flex-start;
+  min-height: 80px;
+  justify-content: center;
+}
+
+.panel-error-boundary__text {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.4;
+}
+
+.panel-error-boundary__retry {
+  flex-shrink: 0;
+}
+
 .app {
   display: flex;
   flex-direction: column;
@@ -302,6 +326,78 @@
   box-shadow: 0 0 20px rgba(0, 194, 203, 0.22);
 }
 
+.ai-command-bar__styles {
+  flex: 1 1 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 10px 12px;
+}
+
+.ai-command-bar__style-field {
+  flex: 1 1 160px;
+  min-width: 140px;
+  max-width: 220px;
+}
+
+.ai-command-bar__select {
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.ai-command-bar__dropzone {
+  position: relative;
+  flex: 1 1 180px;
+  min-height: 40px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px dashed rgba(0, 194, 203, 0.35);
+  background: rgba(0, 194, 203, 0.06);
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.ai-command-bar__dropzone:hover,
+.ai-command-bar__dropzone:focus {
+  outline: none;
+  border-color: rgba(0, 194, 203, 0.55);
+  background: rgba(0, 194, 203, 0.1);
+  color: var(--text-primary);
+}
+
+.ai-command-bar__dropzone--busy {
+  opacity: 0.75;
+  pointer-events: none;
+}
+
+.ai-command-bar__file {
+  position: absolute;
+  width: 0;
+  height: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.ai-command-bar__code {
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
 .ai-command-bar__spinner {
   width: 14px;
   height: 14px;
@@ -420,6 +516,13 @@
   font-size: 12px;
   color: var(--text-muted);
   border: 1px solid transparent;
+  background: transparent;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.asset-strip__item:disabled {
+  cursor: default;
 }
 
 .asset-strip__item--active {
@@ -860,6 +963,14 @@
   justify-content: flex-start;
 }
 
+.track-label__caption-hint {
+  margin: 4px 0 0;
+  font-size: 9px;
+  line-height: 1.3;
+  color: var(--text-muted);
+  max-width: 72px;
+}
+
 .track-label__title {
   font-size: 11px;
   color: var(--text-muted);
@@ -927,13 +1038,24 @@
 }
 
 .tl-clip--selected {
-  box-shadow: 0 0 0 2px var(--accent);
+  box-shadow: 0 0 0 2px var(--accent), 0 2px 6px rgba(0, 0, 0, 0.35);
   z-index: 2;
+  transform: translateY(-1px);
 }
 
-.tl-clip--linked-peer-hover {
-  box-shadow: 0 0 0 1px rgba(120, 180, 255, 0.75);
-  z-index: 1;
+.timeline-marquee-rect {
+  position: absolute;
+  border: 1px solid rgba(120, 180, 255, 0.95);
+  background: rgba(80, 140, 255, 0.18);
+  pointer-events: none;
+  z-index: 5;
+}
+
+.timeline-toolbar__selection-badge {
+  font-size: 11px;
+  color: var(--text-muted);
+  padding: 0 8px;
+  align-self: center;
 }
 
 .tl-clip__row {

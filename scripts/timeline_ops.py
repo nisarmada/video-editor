@@ -148,13 +148,19 @@ def _assert_no_overlaps(track: dict, *, ignore_clip_id: str | None = None) -> No
             )
 
 
-def _source_split_time(clip: dict, at_timeline_time: float) -> float:
+def _source_split_time(
+    clip: dict, at_timeline_time: float, *, track_type: str | None = None
+) -> float:
+    t0 = float(clip["timeline_start"])
+    offset = at_timeline_time - t0
+    if track_type == "caption" and (
+        "source_in" not in clip or "source_out" not in clip
+    ):
+        return offset
     speed = float(clip.get("speed") or 1.0)
     if speed <= 0:
         speed = 1.0
-    t0 = float(clip["timeline_start"])
     src_in = float(clip["source_in"])
-    offset = at_timeline_time - t0
     return src_in + offset * speed
 
 
@@ -171,26 +177,50 @@ def _clip_linking_enabled(timeline: dict) -> bool:
     return True if v is None else bool(v)
 
 
+def _av_members_with_group_id(timeline: dict, group_id: str) -> list[tuple[str, str, dict]]:
+    """(clip_id, track_type, clip) for video/audio only."""
+    out: list[tuple[str, str, dict]] = []
+    for tr in timeline.get("tracks") or []:
+        ttype = _track_type(tr)
+        if ttype not in ("video", "audio"):
+            continue
+        for c in tr.get("clips") or []:
+            if c.get("group_id") == group_id and c.get("id"):
+                out.append((str(c["id"]), ttype, c))
+    return out
+
+
+def _is_explicit_av_link_group(members: list[tuple[str, str, dict]]) -> bool:
+    if len(members) != 2:
+        return False
+    kinds = {m[2].get("group_kind") for m in members}
+    if "av_link" in kinds:
+        return True
+    types = {m[1] for m in members}
+    if types != {"video", "audio"}:
+        return False
+    vid = next(m for m in members if m[1] == "video")
+    return vid[2].get("audio_source") == "detached"
+
+
 def _expand_linked_clip_ids(timeline: dict, clip_id: str) -> list[str]:
+    """Ops expansion: at most one explicit A/V partner; never caption; never planner mega-groups."""
     if not _clip_linking_enabled(timeline):
         return [clip_id]
     try:
-        _track, clip, _i = _find_clip(timeline, clip_id)
+        tr, clip, _i = _find_clip(timeline, clip_id)
     except ValueError:
+        return [clip_id]
+    if _track_type(tr) == "caption":
         return [clip_id]
     gid = clip.get("group_id")
     if not isinstance(gid, str) or not gid.strip():
         return [clip_id]
-    out: list[str] = []
-    for tr in timeline.get("tracks") or []:
-        if tr.get("type") not in ("video", "audio"):
-            continue
-        for c in tr.get("clips") or []:
-            if c.get("group_id") == gid and c.get("id"):
-                cid = str(c["id"])
-                if cid not in out:
-                    out.append(cid)
-    return out if len(out) > 1 else [clip_id]
+    members = _av_members_with_group_id(timeline, gid.strip())
+    if not _is_explicit_av_link_group(members):
+        return [clip_id]
+    ids = [m[0] for m in members]
+    return ids if clip_id in ids and len(ids) > 1 else [clip_id]
 
 
 def _source_path_for_probe(raw: str) -> Path:
@@ -261,6 +291,26 @@ def _linked_partner_id(timeline: dict, clip_id: str) -> str | None:
             if c.get("group_id") == gid and c.get("id") and str(c["id"]) != clip_id:
                 return str(c["id"])
     return None
+
+
+def _expand_unique_from_selection(timeline: dict, clip_ids: list[str]) -> list[str]:
+    """De-duplicate selection ids; expand each linked group once when linking is on."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in clip_ids:
+        if raw is None:
+            continue
+        cid = str(raw)
+        ids = (
+            _expand_linked_clip_ids(timeline, cid)
+            if _clip_linking_enabled(timeline)
+            else [cid]
+        )
+        for x in ids:
+            if x not in seen:
+                seen.add(x)
+                out.append(x)
+    return out
 
 
 def _delete_clips_by_ids(timeline: dict, clip_ids: list[str]) -> list[tuple[str, dict]]:
@@ -339,23 +389,45 @@ def _split_clip_one(
             f"clip timeline span ({t0:.3f}s, {t1:.3f}s)."
         )
 
-    src_split = _source_split_time(clip, at_timeline_time)
-    src_in = float(clip["source_in"])
-    src_out = float(clip["source_out"])
-    if src_split <= src_in + EPS or src_split >= src_out - EPS:
-        raise ValueError("Split maps to invalid source time.")
+    if ttype == "caption" and (
+        "source_in" not in clip or "source_out" not in clip
+    ):
+        left = _copy_clip_fields(clip)
+        right = _copy_clip_fields(clip)
+        right_id = str(uuid.uuid4())
+        right["id"] = right_id
+        right["timeline_start"] = at_timeline_time
+        try:
+            tend = float(clip["timeline_end"]) if clip.get("timeline_end") is not None else t1
+        except (TypeError, ValueError):
+            tend = t1
+        left_dur = at_timeline_time - t0
+        right_dur = tend - at_timeline_time
+        left["source_in"] = 0.0
+        left["source_out"] = left_dur
+        right["source_in"] = left_dur
+        right["source_out"] = left_dur + right_dur
+        if clip.get("timeline_end") is not None:
+            left["timeline_end"] = at_timeline_time
+            right["timeline_end"] = tend
+    else:
+        src_split = _source_split_time(clip, at_timeline_time, track_type=ttype)
+        src_in = float(clip["source_in"])
+        src_out = float(clip["source_out"])
+        if src_split <= src_in + EPS or src_split >= src_out - EPS:
+            raise ValueError("Split maps to invalid source time.")
 
-    left = _copy_clip_fields(clip)
-    right = _copy_clip_fields(clip)
-    right_id = str(uuid.uuid4())
+        left = _copy_clip_fields(clip)
+        right = _copy_clip_fields(clip)
+        right_id = str(uuid.uuid4())
 
-    left["source_out"] = src_split
-    right["id"] = right_id
-    right["source_in"] = src_split
-    right["timeline_start"] = at_timeline_time
+        left["source_out"] = src_split
+        right["id"] = right_id
+        right["source_in"] = src_split
+        right["timeline_start"] = at_timeline_time
 
-    _check_min_source_span(left, "Left split part")
-    _check_min_source_span(right, "Right split part")
+        _check_min_source_span(left, "Left split part")
+        _check_min_source_span(right, "Right split part")
 
     clips = list(track.get("clips") or [])
     clips[idx : idx + 1] = [left, right]
@@ -683,6 +755,147 @@ def delete_clip(timeline: dict, *, clip_id: str) -> TimelineOpResult:
     }
 
 
+def delete_clips(timeline: dict, *, clip_ids: list[str]) -> TimelineOpResult:
+    """Remove many clips in one step; expand linked partners once; skip missing ids."""
+    if not isinstance(clip_ids, list) or len(clip_ids) == 0:
+        raise ValueError("delete_clips: non-empty clip_ids list required.")
+    tl = _clone(timeline)
+    to_remove = _expand_unique_from_selection(tl, [str(x) for x in clip_ids])
+    snapshots: list[tuple[str, dict]] = []
+    for cid in to_remove:
+        try:
+            track, clip, idx = _find_clip(tl, cid)
+        except ValueError:
+            continue
+        snapshots.append((str(track["id"]), copy.deepcopy(clip)))
+        _delete_clip_one(tl, clip_id=cid)
+
+    if not snapshots:
+        raise ValueError("delete_clips: no matching clips found on the timeline.")
+
+    if len(snapshots) == 1:
+        tid, snap = snapshots[0]
+        return {
+            "timeline": tl,
+            "undo": {"op": "add_clip", "track_id": tid, "clip": snap},
+        }
+
+    steps = [
+        {"op": "add_clip", "track_id": tid, "clip": snap} for tid, snap in snapshots
+    ]
+    return {
+        "timeline": tl,
+        "undo": {"op": "sequence", "steps": list(reversed(steps))},
+    }
+
+
+def _split_linked_group_at_time(
+    tl: dict, *, clip_ids: list[str], at_timeline_time: float
+) -> list[dict[str, Any]]:
+    """Split every id in clip_ids at the same time (linked group); returns undo steps."""
+    merge_undos: list[dict[str, Any]] = []
+    for cid in sorted(
+        clip_ids,
+        key=lambda c: (
+            0 if _track_type(_find_clip(tl, c)[0]) == "video" else 1,
+            c,
+        ),
+    ):
+        tr, cl, _i = _find_clip(tl, cid)
+        ttype = _track_type(tr)
+        t0 = float(cl["timeline_start"])
+        t1 = _clip_end(cl, ttype)
+        if at_timeline_time <= t0 + EPS or at_timeline_time >= t1 - EPS:
+            raise ValueError(
+                f"Split time must be inside every linked clip; "
+                f"clip {cid!r} spans ({t0:.3f}s, {t1:.3f}s)."
+            )
+        one = _split_clip_one(tl, clip_id=cid, at_timeline_time=at_timeline_time)
+        merge_undos.append(one["undo"])
+
+    g_left = str(uuid.uuid4())
+    g_right = str(uuid.uuid4())
+    for step in merge_undos:
+        assert step.get("op") == "merge_clips"
+        _, left_c, _ = _find_clip(tl, str(step["clip_id_a"]))
+        _, right_c, _ = _find_clip(tl, str(step["clip_id_b"]))
+        left_c["group_id"] = g_left
+        right_c["group_id"] = g_right
+    return merge_undos
+
+
+def _partition_clip_ids_for_batch(timeline: dict, clip_ids: list[str]) -> list[list[str]]:
+    """Split selection into unlinked singletons and linked groups (by group_id)."""
+    expanded = _expand_unique_from_selection(timeline, clip_ids)
+    if not _clip_linking_enabled(timeline):
+        return [[cid] for cid in expanded]
+
+    by_gid: dict[str, list[str]] = {}
+    singles: list[list[str]] = []
+    for cid in expanded:
+        try:
+            _tr, clip, _i = _find_clip(timeline, cid)
+        except ValueError:
+            continue
+        gid = clip.get("group_id")
+        if isinstance(gid, str) and gid.strip():
+            members = _av_members_with_group_id(timeline, gid.strip())
+            if _is_explicit_av_link_group(members) and len(members) == 2:
+                by_gid.setdefault(gid.strip(), [])
+                if cid not in by_gid[gid.strip()]:
+                    by_gid[gid.strip()].append(cid)
+            else:
+                singles.append([cid])
+        else:
+            singles.append([cid])
+
+    groups: list[list[str]] = [sorted(v, key=lambda x: x) for v in by_gid.values()]
+    groups.extend(singles)
+    return groups
+
+
+def split_clips_at_time(
+    timeline: dict, *, clip_ids: list[str], at_timeline_time: float
+) -> TimelineOpResult:
+    """Split many clips at one timeline time — one undo; handles linked groups once."""
+    if not isinstance(clip_ids, list) or len(clip_ids) == 0:
+        raise ValueError("split_clips_at_time: non-empty clip_ids list required.")
+    tl = _clone(timeline)
+    groups = _partition_clip_ids_for_batch(tl, [str(x) for x in clip_ids])
+    if not groups:
+        raise ValueError("split_clips_at_time: no matching clips on the timeline.")
+
+    undo_steps: list[dict[str, Any]] = []
+    for g in groups:
+        try:
+            if len(g) > 1 and _clip_linking_enabled(tl):
+                undo_steps.extend(
+                    _split_linked_group_at_time(
+                        tl, clip_ids=g, at_timeline_time=at_timeline_time
+                    )
+                )
+            else:
+                cid = g[0]
+                one = _split_clip_one(
+                    tl, clip_id=cid, at_timeline_time=at_timeline_time
+                )
+                undo_steps.append(one["undo"])
+        except ValueError:
+            continue
+
+    if not undo_steps:
+        raise ValueError(
+            "split_clips_at_time: split time is not inside any selected clip."
+        )
+
+    if len(undo_steps) == 1:
+        return {"timeline": tl, "undo": undo_steps[0]}
+    return {
+        "timeline": tl,
+        "undo": {"op": "sequence", "steps": list(reversed(undo_steps))},
+    }
+
+
 def add_clip(
     timeline: dict,
     *,
@@ -969,10 +1182,12 @@ def separate_audio(timeline: dict, *, clip_id: str) -> TimelineOpResult:
         "timeline_start": t0,
         "created_by": "user",
         "group_id": gid,
+        "group_kind": "av_link",
         "speed": float(clip.get("speed") or 1.0) or 1.0,
         "volume": float(clip.get("volume") if clip.get("volume") is not None else 1.0),
     }
     clip["group_id"] = gid
+    clip["group_kind"] = "av_link"
     clip["audio_source"] = "detached"
     audio_track.setdefault("clips", []).append(aud)
     _assert_no_overlaps(audio_track)
@@ -1273,7 +1488,9 @@ OPERATIONS = {
     "trim_timeline_edge": trim_timeline_edge,
     "move_clip": move_clip,
     "delete_clip": delete_clip,
+    "delete_clips": delete_clips,
     "delete_clip_solo": delete_clip_solo,
+    "split_clips_at_time": split_clips_at_time,
     "add_clip": add_clip,
     "remove_track": remove_track,
     "restore_track": restore_track,

@@ -51,6 +51,10 @@ python scripts/render.py plans/my_clip_tight.json output/my_clip_tight.mp4
 python scripts/tighten.py footage/my_clip.mp4
 ```
 
+## Media bin — video and audio
+
+The editor treats **`footage/`** as the library. You can import **video** (`.mp4`, `.mov`, …) or **standalone audio** (`.mp3`, `.wav`, `.m4a`, `.aac`, `.flac`, `.ogg`, …). Audio-only files get a **black silent-video proxy** for preview and the same waveform cache as video. The AI planner (`plan.py`) still indexes **video-only** clips for merged `index/` context.
+
 ## Milestone 4 — index (no API key)
 
 ```bash
@@ -107,6 +111,18 @@ python scripts/render.py plans/draft1.json output/draft1.mp4 --captions
 `plan.py` saves **schema v2** (Claude still returns v1 segments; conversion runs after validation). Hand-written v1 plans: `convert_v1_to_v2.py`.
 
 Set `ANTHROPIC_PLAN_MODEL` in `.env` (default `claude-sonnet-5-5`).
+
+### Reference style for the planner
+
+Put a reference video under `references/` (not under `footage/`, which stays read-only for originals), then build a profile the UI can use:
+
+```bash
+python scripts/analyze_style.py references/my_ref.mp4 --name "Fast Vlog Reference" --out plans/styles/fast_vlog.json
+```
+
+Or use **AI Assistant → Drop reference video** in the web UI (saves `references/…` and `plans/styles/<id>.json`). Dropping or choosing **Imitate style** passes that profile into `plan.py`.
+
+Optional: set `ANTHROPIC_STYLE_VISION_MODEL` (default matches `caption_frames`: Haiku vision).
 
 ## Cursor as planner (manual test)
 

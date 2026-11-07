@@ -10,6 +10,7 @@ import SettingsPanel from "./components/SettingsPanel";
 import SourcePreview from "./components/SourcePreview";
 import TimelineVideoPreview from "./components/TimelineVideoPreview";
 import TimelinePanel from "./components/TimelinePanel";
+import EditorPanelErrorBoundary from "./components/EditorPanelErrorBoundary";
 import KeyboardShortcutsPanel from "./components/KeyboardShortcutsPanel";
 import ShortcutCheatSheet from "./components/ShortcutCheatSheet";
 import { updateCursorContextPartial } from "./store/cursorContextStore";
@@ -319,11 +320,13 @@ export default function App() {
               </div>
             </div>
             <div className="panel__body panel__body--preview">
-              {previewPanelMode === "timeline" ? (
-                <TimelineVideoPreview />
-              ) : (
-                <SourcePreview />
-              )}
+              <EditorPanelErrorBoundary name="Player">
+                {previewPanelMode === "timeline" ? (
+                  <TimelineVideoPreview />
+                ) : (
+                  <SourcePreview />
+                )}
+              </EditorPanelErrorBoundary>
             </div>
             </section>
             <section
@@ -343,12 +346,16 @@ export default function App() {
             >
             <div className="panel__header">Details</div>
             <div className="panel__body panel__body--details">
-              <ClipDetails />
+              <EditorPanelErrorBoundary name="Details">
+                <ClipDetails />
+              </EditorPanelErrorBoundary>
             </div>
             </section>
           </div>
 
-          <TimelinePanel />
+          <EditorPanelErrorBoundary name="Timeline">
+            <TimelinePanel />
+          </EditorPanelErrorBoundary>
         </div>
 
         <LogsPanel
