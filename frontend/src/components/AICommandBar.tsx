@@ -1,5 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import { requestFootageAnalyze } from "../api/planner";
+import {
+  estimatePlanner,
+  formatPlannerEstimate,
+  formatPlannerEstimateNotes,
+  requestFootageAnalyze,
+  type PlannerEstimate,
+} from "../api/planner";
 import { analyzeStyle } from "../api/styles";
 import { useTimelineStore } from "../store/timelineStore";
 import { nextAutoPlanStem } from "../utils/planStem";
@@ -47,12 +53,67 @@ export default function AICommandBar() {
   const [imitateStyleId, setImitateStyleId] = useState("");
   const [styleUploadBusy, setStyleUploadBusy] = useState(false);
   const [styleUploadError, setStyleUploadError] = useState<string | null>(null);
+  const [liveEstimate, setLiveEstimate] = useState<PlannerEstimate | null>(null);
+  const [liveEstimateLoading, setLiveEstimateLoading] = useState(false);
+  const [liveEstimateError, setLiveEstimateError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (saveAsTouched) return;
     setSaveAs(nextAutoPlanStem(availablePlans));
   }, [availablePlans, saveAsTouched]);
+
+  useEffect(() => {
+    if (plannerMode !== "draft") {
+      setLiveEstimate(null);
+      setLiveEstimateError("Estimates are for Draft mode only.");
+      return;
+    }
+    if (footageScope === "selected" && selectedFootageNames.length === 0) {
+      setLiveEstimate(null);
+      setLiveEstimateError(
+        "Select clips in the media bin (Shift+click) to see an estimate.",
+      );
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      setLiveEstimateLoading(true);
+      setLiveEstimateError(null);
+      void estimatePlanner({
+        brief,
+        ...(footageScope === "selected"
+          ? { clip_filenames: selectedFootageNames }
+          : {}),
+        ...(imitateStyleId ? { imitate_style_id: imitateStyleId } : {}),
+      })
+        .then((est) => {
+          if (cancelled) return;
+          setLiveEstimate(est);
+          setLiveEstimateError(null);
+        })
+        .catch((e: unknown) => {
+          if (cancelled) return;
+          setLiveEstimate(null);
+          setLiveEstimateError(
+            e instanceof Error ? e.message : "Could not estimate planner cost.",
+          );
+        })
+        .finally(() => {
+          if (!cancelled) setLiveEstimateLoading(false);
+        });
+    }, 350);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [
+    brief,
+    footageScope,
+    selectedFootageNames,
+    imitateStyleId,
+    plannerMode,
+  ]);
 
   const blocked =
     timelineLoading ||
@@ -133,18 +194,45 @@ export default function AICommandBar() {
       </div>
       <div className="ai-command-bar__inner">
         <div className="ai-command-bar__row">
-          <label className="ai-command-bar__prompt">
-            <input
-              type="text"
-              className="ai-command-bar__input"
-              placeholder='Describe the edit you want to build... e.g., "Create a 30-second fast-paced highlight reel with background music and captions"'
-              value={brief}
-              onChange={(e) => setBrief(e.target.value)}
-              disabled={plannerRunning}
-              autoComplete="off"
-              aria-label="Edit brief"
-            />
-          </label>
+          <div className="ai-command-bar__prompt-block">
+            <label className="ai-command-bar__prompt">
+              <input
+                type="text"
+                className="ai-command-bar__input"
+                placeholder='Describe the edit you want to build... e.g., "Create a 30-second fast-paced highlight reel with background music and captions"'
+                value={brief}
+                onChange={(e) => setBrief(e.target.value)}
+                disabled={plannerRunning}
+                autoComplete="off"
+                aria-label="Edit brief"
+              />
+            </label>
+            <div
+              className="ai-command-bar__estimate"
+              aria-live="polite"
+              data-loading={liveEstimateLoading ? "1" : undefined}
+            >
+              {liveEstimateLoading && !liveEstimate && !liveEstimateError && (
+                <span className="ai-command-bar__hint">Estimating catalog…</span>
+              )}
+              {liveEstimateError && (
+                <span className="ai-command-bar__hint">{liveEstimateError}</span>
+              )}
+              {liveEstimate && (
+                <>
+                  <span className="ai-command-bar__estimate-main">
+                    {formatPlannerEstimate(liveEstimate)}
+                    {liveEstimate.model ? ` · ${liveEstimate.model}` : ""}
+                  </span>
+                  {formatPlannerEstimateNotes(liveEstimate).map((line) => (
+                    <span key={line} className="ai-command-bar__hint">
+                      {line}
+                    </span>
+                  ))}
+                </>
+              )}
+            </div>
+          </div>
           <div className="ai-command-bar__secondary">
             <label className="ai-command-bar__save">
               <span className="ai-command-bar__label">Save as</span>

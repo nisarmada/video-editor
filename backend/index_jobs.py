@@ -14,6 +14,7 @@ _SCRIPTS = _REPO_ROOT / "scripts"
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
+from index_cache import shots_path  # noqa: E402
 from index_clip import build_merged_index  # noqa: E402
 
 try:
@@ -56,7 +57,13 @@ def get_job(name: str) -> dict[str, Any] | None:
         return dict(j) if j else None
 
 
-def schedule_index_pipeline(root: Path, clip_path: Path) -> None:
+def schedule_index_pipeline(
+    root: Path,
+    clip_path: Path,
+    *,
+    include_frame_captions: bool = True,
+    captions_only: bool = False,
+) -> None:
     """Run analysis scripts in order in a daemon thread."""
     name = clip_path.name
     existing = get_job(name)
@@ -87,46 +94,62 @@ def schedule_index_pipeline(root: Path, clip_path: Path) -> None:
 
     mark_processing(name)
 
+    def run_captions_branch() -> None:
+        if not shots_path(src).is_file():
+            run_script("shots.py", [], "shots")
+        run_script("keyframes.py", [], "keyframes")
+        if include_frame_captions:
+            run_script("caption_frames.py", [], "caption_frames")
+        build_merged_index(src, force=True)
+        try:
+            run_script("text_embeddings.py", [], "text_embeddings")
+        except RuntimeError:
+            mark_step(name, "text_embeddings skipped")
+
     def run() -> None:
         try:
-            # Order matches PROJECT.md pipeline (caption_frames needs keyframes)
-            run_script("transcribe.py", [], "transcribe")
-            run_script("silences.py", [], "silences")
-            try:
-                run_script("audio_perception.py", [], "audio_perception")
-            except RuntimeError:
-                mark_step(name, "audio_perception skipped")
-            try:
-                run_script("takes.py", [], "takes")
-            except RuntimeError:
-                mark_step(name, "takes skipped")
             ext = src.suffix.lower()
             from footage_exts import AUDIO_EXTS, VIDEO_EXTS  # noqa: PLC0415
 
-            if ext in AUDIO_EXTS:
-                pass
-            elif ext in VIDEO_EXTS:
-                run_script("shots.py", [], "shots")
-                try:
-                    run_script("video_perception.py", [], "video_perception")
-                except RuntimeError:
-                    mark_step(name, "video_perception skipped")
-                run_script("keyframes.py", [], "keyframes")
-                try:
-                    run_script("caption_frames.py", [], "caption_frames")
-                except RuntimeError:
-                    mark_step(name, "caption_frames skipped (API or vision failed)")
+            if captions_only:
+                if ext not in VIDEO_EXTS:
+                    raise RuntimeError("Frame captions apply to video files only")
+                run_captions_branch()
             else:
-                raise RuntimeError(f"Unsupported footage extension: {ext}")
+                # Order matches PROJECT.md pipeline (caption_frames needs keyframes)
+                run_script("transcribe.py", [], "transcribe")
+                run_script("silences.py", [], "silences")
+                try:
+                    run_script("audio_perception.py", [], "audio_perception")
+                except RuntimeError:
+                    mark_step(name, "audio_perception skipped")
+                try:
+                    run_script("takes.py", [], "takes")
+                except RuntimeError:
+                    mark_step(name, "takes skipped")
 
-            build_merged_index(src, force=True)
+                if ext in AUDIO_EXTS:
+                    pass
+                elif ext in VIDEO_EXTS:
+                    run_script("shots.py", [], "shots")
+                    try:
+                        run_script("video_perception.py", [], "video_perception")
+                    except RuntimeError:
+                        mark_step(name, "video_perception skipped")
+                    run_script("keyframes.py", [], "keyframes")
+                    if include_frame_captions:
+                        run_script("caption_frames.py", [], "caption_frames")
+                else:
+                    raise RuntimeError(f"Unsupported footage extension: {ext}")
 
-            try:
-                run_script("text_embeddings.py", [], "text_embeddings")
-            except RuntimeError:
-                mark_step(name, "text_embeddings skipped")
+                build_merged_index(src, force=True)
 
-            if schedule_waveform_work is not None:
+                try:
+                    run_script("text_embeddings.py", [], "text_embeddings")
+                except RuntimeError:
+                    mark_step(name, "text_embeddings skipped")
+
+            if schedule_waveform_work is not None and not captions_only:
                 try:
                     schedule_waveform_work(root, clip_path)
                 except Exception:

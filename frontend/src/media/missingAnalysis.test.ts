@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { filesMissingAnalysis, missingAnalysisFields } from "./missingAnalysis";
+import {
+  filesMissingAnalysis,
+  filesMissingFreeAnalysis,
+  missingAnalysisFields,
+  missingFreeAnalysisFields,
+} from "./missingAnalysis";
 
 describe("missingAnalysisFields", () => {
   it("ignores fields that do not apply to audio files", () => {
@@ -18,6 +23,47 @@ describe("missingAnalysisFields", () => {
         },
       }),
     ).toEqual(["transcript", "audio_perception", "takes"]);
+  });
+
+  it("free missing omits paid frame captions", () => {
+    expect(
+      missingFreeAnalysisFields({
+        id: "v.mp4",
+        kind: "video",
+        analysis: {
+          merged_index: "complete",
+          transcript: "complete",
+          silences: "complete",
+          audio_perception: "complete",
+          takes: "complete",
+          shots: "complete",
+          video_perception: "complete",
+          keyframes: "complete",
+          ai_frame_captions: "not analyzed",
+          waveform_peaks: { status: "complete" },
+        },
+      }),
+    ).toEqual([]);
+    expect(
+      filesMissingFreeAnalysis([
+        {
+          id: "v.mp4",
+          kind: "video",
+          analysis: {
+            merged_index: "complete",
+            transcript: "complete",
+            silences: "complete",
+            audio_perception: "complete",
+            takes: "complete",
+            shots: "complete",
+            video_perception: "complete",
+            keyframes: "complete",
+            ai_frame_captions: "not analyzed",
+            waveform_peaks: { status: "complete" },
+          },
+        },
+      ]),
+    ).toEqual([]);
   });
 
   it("lists every incomplete video field", () => {

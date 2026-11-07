@@ -67,6 +67,10 @@ export const EMBEDDING_DEFAULTS: EmbeddingSettings = {
   model_name: "all-MiniLM-L6-v2",
 };
 
+export type AnalysisSettings = {
+  remember_missing_mode: "all" | "free_only" | null;
+};
+
 export type PublicSettings = {
   planner_api_key_configured: boolean;
   paths: { footage: string; plans: string; output: string };
@@ -82,6 +86,7 @@ export type PublicSettings = {
   planner?: PlannerSettings;
   transcription?: TranscriptionSettings;
   embedding?: EmbeddingSettings;
+  analysis?: AnalysisSettings;
 };
 
 export async function fetchSettings(): Promise<PublicSettings> {
@@ -104,6 +109,7 @@ export async function putSettings(body: {
   planner?: Partial<PlannerSettings> | null;
   transcription?: Partial<TranscriptionSettings> | null;
   embedding?: Partial<EmbeddingSettings> | null;
+  analysis?: { remember_missing_mode?: "all" | "free_only" | null } | null;
 }): Promise<PublicSettings> {
   const res = await apiRequest("/api/settings", {
     method: "PUT",

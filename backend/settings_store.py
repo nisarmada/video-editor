@@ -83,6 +83,12 @@ def get_public_settings(root: Path) -> dict[str, Any]:
         name = str(embedding.get("model_name") or "all-MiniLM-L6-v2").strip()
         if name:
             embedding_public["model_name"] = name
+    analysis = raw.get("analysis")
+    analysis_public: dict[str, Any] = {"remember_missing_mode": None}
+    if isinstance(analysis, dict):
+        mode = analysis.get("remember_missing_mode")
+        if mode in ("all", "free_only"):
+            analysis_public["remember_missing_mode"] = mode
     return {
         "planner_api_key_configured": configured,
         "paths": {
@@ -104,6 +110,7 @@ def get_public_settings(root: Path) -> dict[str, Any]:
         "planner": _public_planner(root),
         "transcription": transcription_public,
         "embedding": embedding_public,
+        "analysis": analysis_public,
     }
 
 
@@ -214,6 +221,20 @@ def merge_settings(root: Path, body: dict[str, Any]) -> dict[str, Any]:
             if name:
                 merged_emb["model_name"] = name
         raw["embedding"] = merged_emb
+    if "analysis" in body:
+        ac = body["analysis"]
+        if ac is None:
+            raw.pop("analysis", None)
+        elif isinstance(ac, dict):
+            prev = raw.get("analysis") if isinstance(raw.get("analysis"), dict) else {}
+            merged_a = {**prev}
+            if "remember_missing_mode" in ac:
+                v = ac["remember_missing_mode"]
+                if v is None or v == "":
+                    merged_a.pop("remember_missing_mode", None)
+                elif v in ("all", "free_only"):
+                    merged_a["remember_missing_mode"] = v
+            raw["analysis"] = merged_a
     save_raw(root, raw)
     return get_public_settings(root)
 

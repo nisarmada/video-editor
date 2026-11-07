@@ -29,6 +29,7 @@ if str(_SCRIPTS) not in sys.path:
 
 from backend.app_logging import get_logs, last_index, log_event  # noqa: E402
 from backend.footage_jobs import get_job, schedule_proxy_work  # noqa: E402
+from backend.analyze_preflight import build_analyze_preflight  # noqa: E402
 from backend.index_jobs import get_job as get_index_job  # noqa: E402
 from backend.index_jobs import schedule_index_pipeline  # noqa: E402
 from backend.media_catalog import build_media_catalog  # noqa: E402
@@ -207,6 +208,15 @@ class FootageAnalyzeBody(BaseModel):
         description="Footage basenames to analyze; omit with all=true",
     )
     all: bool = Field(default=False, description="Analyze every file in footage/")
+    include_frame_captions: bool = Field(
+        default=True,
+        description="When false, skip paid caption_frames (local steps still run).",
+    )
+
+
+class FootageAnalyzePreflightBody(BaseModel):
+    names: list[str] | None = None
+    all: bool = False
 
 
 def _client_host_allowed(request: Request) -> bool:
@@ -216,17 +226,20 @@ def _client_host_allowed(request: Request) -> bool:
 
 def _merge_footage_job(entry: dict[str, Any]) -> dict[str, Any]:
     name = entry["name"]
-    job = get_job(name)
     out = dict(entry)
-    if job:
+    for job in (get_index_job(name), get_job(name)):
+        if not job:
+            continue
         st = job.get("status")
         err = job.get("error")
         if st == "processing":
             out["process_status"] = "processing"
             out["process_error"] = None
+            if job.get("step"):
+                out["process_step"] = job.get("step")
         elif st == "failed":
             out["process_status"] = "failed"
-            out["process_error"] = err
+            out["process_error"] = err or "Processing failed"
     return out
 
 
@@ -566,16 +579,12 @@ def rescan_footage(paths: ProjectPaths = Depends(get_paths)) -> dict[str, Any]:
     return {"queued": queued}
 
 
-@app.post("/api/footage/analyze")
-def analyze_footage(
-    body: FootageAnalyzeBody, paths: ProjectPaths = Depends(get_paths)
-) -> dict[str, Any]:
-    """Queue transcript + silences + (for video) shots/keyframes + merged index."""
+def _footage_targets(body: FootageAnalyzeBody | FootageAnalyzePreflightBody, paths: ProjectPaths) -> list[Path]:
     paths.footage.mkdir(parents=True, exist_ok=True)
     files = list_footage_files(paths.root)
     if body.all:
-        targets = files
-    elif body.names:
+        return files
+    if body.names:
         want = {Path(n).name for n in body.names if n and str(n).strip()}
         by_name = {p.name: p for p in files}
         unknown = sorted(want - set(by_name))
@@ -584,13 +593,54 @@ def analyze_footage(
                 status_code=400,
                 detail="These files are not in footage/: " + ", ".join(unknown),
             )
-        targets = [by_name[n] for n in sorted(want)]
-    else:
-        raise HTTPException(status_code=400, detail="Set all=true or provide names")
+        return [by_name[n] for n in sorted(want)]
+    raise HTTPException(status_code=400, detail="Set all=true or provide names")
+
+
+@app.post("/api/footage/analyze-preflight")
+def analyze_footage_preflight(
+    body: FootageAnalyzePreflightBody, paths: ProjectPaths = Depends(get_paths)
+) -> dict[str, Any]:
+    """Counts missing local steps and paid caption work for a analyze queue."""
+    targets = _footage_targets(body, paths)
+    return build_analyze_preflight(
+        paths.root,
+        basenames=[p.name for p in targets],
+    )
+
+
+@app.post("/api/footage/analyze")
+def analyze_footage(
+    body: FootageAnalyzeBody, paths: ProjectPaths = Depends(get_paths)
+) -> dict[str, Any]:
+    """Queue transcript + silences + (for video) shots/keyframes + merged index."""
+    targets = _footage_targets(body, paths)
 
     for p in targets:
-        schedule_index_pipeline(paths.root, p)
+        schedule_index_pipeline(
+            paths.root,
+            p,
+            include_frame_captions=body.include_frame_captions,
+        )
     return {"queued": [p.name for p in targets]}
+
+
+@app.post("/api/footage/{name}/frame-captions")
+def queue_frame_captions(name: str, paths: ProjectPaths = Depends(get_paths)) -> dict[str, Any]:
+    """Paid caption_frames only (runs local keyframes first if needed)."""
+    base = Path(name).name
+    if not base or base != name:
+        raise HTTPException(status_code=400, detail="Invalid name")
+    clip_path = paths.footage / base
+    if not clip_path.is_file():
+        raise HTTPException(status_code=404, detail=f"Not in footage/: {base}")
+    schedule_index_pipeline(
+        paths.root,
+        clip_path,
+        include_frame_captions=True,
+        captions_only=True,
+    )
+    return {"queued": base}
 
 
 @app.post("/api/footage/{name}/retranscribe")

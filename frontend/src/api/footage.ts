@@ -16,6 +16,7 @@ export type FootageClip = {
   has_thumbnail: boolean;
   process_status?: FootageProcessStatus;
   process_error?: string | null;
+  process_step?: string | null;
   /** none = no audio in file; pending | processing | ready | failed */
   waveform_status?: string;
   waveform_error?: string | null;
@@ -37,6 +38,81 @@ export async function fetchFootageList(): Promise<FootageClip[]> {
   }
   const data = (await res.json()) as FootageListResponse;
   return data.clips ?? [];
+}
+
+export type FootageAnalyzePreflight = {
+  files: {
+    id: string;
+    missing_free: string[];
+    needs_paid_captions: boolean;
+    keyframe_count: number;
+  }[];
+  free_missing_file_count: number;
+  paid_caption_file_count: number;
+  total_keyframes: number;
+  haiku_calls: number;
+  est_cost_usd: number;
+  caption_model: string;
+  remember_missing_mode: "all" | "free_only" | null;
+};
+
+export async function fetchFootageAnalyzePreflight(body: {
+  names: string[];
+}): Promise<FootageAnalyzePreflight> {
+  const res = await fetch("/api/footage/analyze-preflight", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ names: body.names }),
+  });
+  const t = await res.text();
+  if (!res.ok) {
+    throw new Error(
+      parseFastApiErrorBody(t) || `Preflight failed (${res.status})`,
+    );
+  }
+  return JSON.parse(t) as FootageAnalyzePreflight;
+}
+
+export async function requestFootageAnalyze(body: {
+  names?: string[];
+  all?: boolean;
+  include_frame_captions?: boolean;
+}): Promise<{ queued: string[] }> {
+  const res = await fetch("/api/footage/analyze", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(
+      body.all
+        ? { all: true, include_frame_captions: body.include_frame_captions ?? true }
+        : {
+            names: body.names ?? [],
+            include_frame_captions: body.include_frame_captions ?? true,
+          },
+    ),
+  });
+  const t = await res.text();
+  if (!res.ok) {
+    throw new Error(
+      parseFastApiErrorBody(t) || `Analyze failed (${res.status})`,
+    );
+  }
+  return JSON.parse(t) as { queued: string[] };
+}
+
+export async function requestFrameCaptions(
+  name: string,
+): Promise<{ queued: string }> {
+  const res = await fetch(
+    `/api/footage/${encodeURIComponent(name)}/frame-captions`,
+    { method: "POST" },
+  );
+  const t = await res.text();
+  if (!res.ok) {
+    throw new Error(
+      parseFastApiErrorBody(t) || `Frame captions failed (${res.status})`,
+    );
+  }
+  return JSON.parse(t) as { queued: string };
 }
 
 export async function requestFootageRetranscribe(

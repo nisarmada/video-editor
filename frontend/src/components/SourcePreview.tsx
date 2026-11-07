@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTimelineStore } from "../store/timelineStore";
-import { requestFootageRetranscribe } from "../api/footage";
+import { fetchMediaCatalog } from "../api/catalog";
+import { requestFootageRetranscribe, requestFrameCaptions } from "../api/footage";
 import SourceTakesPanel from "./SourceTakesPanel";
 import { formatDuration, formatTimecode } from "../utils/timeFormat";
 
@@ -20,9 +21,31 @@ export default function SourcePreview() {
   const [mediaDuration, setMediaDuration] = useState<number | null>(null);
   const [retranscribeBusy, setRetranscribeBusy] = useState(false);
   const [retranscribeMsg, setRetranscribeMsg] = useState<string | null>(null);
+  const [captionsBusy, setCaptionsBusy] = useState(false);
+  const [captionsStatus, setCaptionsStatus] = useState<string | null>(null);
   const fetchFootage = useTimelineStore((s) => s.fetchFootage);
 
   const displayDuration = mediaDuration ?? clip?.duration_seconds ?? null;
+
+  useEffect(() => {
+    if (!clip?.name || clip.kind === "audio") {
+      setCaptionsStatus(null);
+      return;
+    }
+    let cancelled = false;
+    void fetchMediaCatalog({ names: [clip.name] })
+      .then(({ entries }) => {
+        if (cancelled) return;
+        const row = entries[0];
+        setCaptionsStatus(row?.analysis?.ai_frame_captions ?? null);
+      })
+      .catch(() => {
+        if (!cancelled) setCaptionsStatus(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [clip?.name, clip?.kind]);
 
   useEffect(() => {
     setPlaying(false);
@@ -119,6 +142,31 @@ export default function SourcePreview() {
         <span className="source-preview__duration">
           {formatDuration(displayDuration)}
         </span>
+        {clip.kind !== "audio" && captionsStatus === "not analyzed" && (
+          <button
+            type="button"
+            className="btn btn--ghost source-preview__retranscribe"
+            disabled={captionsBusy}
+            title="Run paid Haiku frame captions (uses cached keyframes when present)"
+            onClick={() => {
+              setCaptionsBusy(true);
+              setRetranscribeMsg(null);
+              void requestFrameCaptions(clip.name)
+                .then(() => {
+                  setRetranscribeMsg("Queued frame captions.");
+                  void fetchFootage({ silent: true });
+                })
+                .catch((e: unknown) => {
+                  setRetranscribeMsg(
+                    e instanceof Error ? e.message : "Frame captions failed",
+                  );
+                })
+                .finally(() => setCaptionsBusy(false));
+            }}
+          >
+            {captionsBusy ? "Queuing…" : "Generate captions"}
+          </button>
+        )}
         {(clip.has_audio ?? true) && (
           <button
             type="button"

@@ -57,6 +57,22 @@ export function formatPlannerEstimate(est: PlannerEstimate): string {
   return `${est.file_count} files, ${formatTokenCount(est.input_tokens)} input tokens, est. $${dollars}`;
 }
 
+/** Extra lines for the live estimate strip (budget-omitted count + unanalyzed names). */
+export function formatPlannerEstimateNotes(est: PlannerEstimate): string[] {
+  const lines: string[] = [];
+  if (est.omitted_count > 0) {
+    lines.push(
+      `${est.omitted_count} analyzed file(s) omitted from the catalog (token budget)`,
+    );
+  }
+  if (est.unanalyzed.length > 0) {
+    lines.push(
+      `Excluded (no merged index): ${est.unanalyzed.join(", ")}`,
+    );
+  }
+  return lines;
+}
+
 export function readStringList(value: unknown): string[] | null {
   if (!Array.isArray(value)) return null;
   return value.filter((item): item is string => typeof item === "string");
@@ -155,26 +171,5 @@ export async function estimatePlanner(body: {
   return JSON.parse(text) as PlannerEstimate;
 }
 
-/**
- * Queue full analysis pipeline for the given basenames (or every file when all=true).
- */
-export async function requestFootageAnalyze(body: {
-  names?: string[];
-  all?: boolean;
-}): Promise<{ queued: string[] }> {
-  const res = await fetch("/api/footage/analyze", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(
-      body.all ? { all: true } : { names: body.names ?? [] },
-    ),
-  });
-  const t = await res.text();
-  if (!res.ok) {
-    throw new Error(
-      parseFastApiErrorBody(t) || `Analyze failed (${res.status})`,
-    );
-  }
-  return JSON.parse(t) as { queued: string[] };
-}
+export { requestFootageAnalyze } from "./footage";
 

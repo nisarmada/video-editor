@@ -538,6 +538,40 @@ export default function SettingsPanel({
             </section>
 
             <section className="settings-block">
+              <h3>Analyze all missing</h3>
+              <p className="settings-hint">
+                Remember my choice skips the paid-caption dialog on the next
+                &ldquo;Analyze all missing&rdquo; run. Reset to ask every time.
+              </p>
+              <p className="settings-hint">
+                Saved choice:{" "}
+                <strong>
+                  {s?.analysis?.remember_missing_mode === "free_only"
+                    ? "Free steps only"
+                    : s?.analysis?.remember_missing_mode === "all"
+                      ? "Include paid captions"
+                      : "None (ask each time)"}
+                </strong>
+              </p>
+              <button
+                type="button"
+                className="btn btn--ghost"
+                disabled={loading || !s?.analysis?.remember_missing_mode}
+                onClick={() => {
+                  void putSettings({ analysis: { remember_missing_mode: null } })
+                    .then(setS)
+                    .catch((e: unknown) =>
+                      setUiBannerError(
+                        e instanceof Error ? e.message : "Reset failed",
+                      ),
+                    );
+                }}
+              >
+                Reset remembered choice
+              </button>
+            </section>
+
+            <section className="settings-block">
               <h3>Catalog embedding</h3>
               <p className="settings-hint">
                 Used to rank files when the planner catalog is over token budget.

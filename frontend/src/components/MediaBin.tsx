@@ -2,11 +2,25 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { fetchMediaCatalog } from "../api/catalog";
 import {
   deleteFootageFile,
+  fetchFootageAnalyzePreflight,
   FootageInUseError,
+  requestFootageAnalyze,
   uploadFootageFile,
 } from "../api/footage";
-import { requestFootageAnalyze } from "../api/planner";
-import { filesMissingAnalysis } from "../media/missingAnalysis";
+import { putSettings } from "../api/settings";
+import AnalyzeMissingDialog from "./AnalyzeMissingDialog";
+import {
+  type AnalyzeMissingChoice,
+  computeBatchProgress,
+  includeFrameCaptionsForChoice,
+  namesToQueue,
+  rememberModeForChoice,
+  shouldShowAnalyzeMissingDialog,
+} from "../media/analyzeMissingFlow";
+import {
+  entryNeedsPaidCaptions,
+  filesMissingFreeAnalysis,
+} from "../media/missingAnalysis";
 import {
   FOOTAGE_DRAG_MIME,
   FOOTAGE_DRAG_TEXT_TYPE,
@@ -54,6 +68,15 @@ export default function MediaBin() {
   const [analyzeBusy, setAnalyzeBusy] = useState(false);
   const [analyzeMessage, setAnalyzeMessage] = useState<string | null>(null);
   const [analyzeIsError, setAnalyzeIsError] = useState(false);
+  const [batchNames, setBatchNames] = useState<string[] | null>(null);
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [dialogPreflight, setDialogPreflight] = useState<
+    Awaited<ReturnType<typeof fetchFootageAnalyzePreflight>> | null
+  >(null);
+  const [dialogEntries, setDialogEntries] = useState<
+    Awaited<ReturnType<typeof fetchMediaCatalog>>["entries"]
+  >([]);
+  const [rememberChoice, setRememberChoice] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [uploads, setUploads] = useState<UploadRow[]>([]);
   const [deleteBusy, setDeleteBusy] = useState<string | null>(null);
@@ -67,10 +90,12 @@ export default function MediaBin() {
     return clips.filter((c) => clipFootageKind(c) === mediaBinCategory);
   }, [clips, mediaBinCategory]);
 
-  const needsPoll = clips.some((c) => {
-    const st = c.process_status ?? "ready";
-    return st === "processing" || st === "pending" || st === "failed";
-  });
+  const needsPoll =
+    Boolean(batchNames?.length) ||
+    clips.some((c) => {
+      const st = c.process_status ?? "ready";
+      return st === "processing" || st === "pending" || st === "failed";
+    });
 
   useEffect(() => {
     if (!needsPoll) return;
@@ -79,6 +104,136 @@ export default function MediaBin() {
     }, 1200);
     return () => window.clearInterval(id);
   }, [needsPoll, fetchFootage]);
+
+  const batchProgress = useMemo(() => {
+    if (!batchNames?.length) return null;
+    return computeBatchProgress(batchNames, clips);
+  }, [batchNames, clips]);
+
+  useEffect(() => {
+    if (!batchNames?.length || !batchProgress) return;
+    if (batchProgress.done < batchProgress.total) return;
+    if (batchProgress.failed.length > 0) {
+      setAnalyzeIsError(true);
+      setAnalyzeMessage(
+        `Analysis finished: ${batchProgress.done}/${batchProgress.total}. ` +
+          batchProgress.failed
+            .map((f) => `${f.name}: ${f.error}`)
+            .join(" · "),
+      );
+    } else {
+      setAnalyzeMessage(
+        `Analysis finished: ${batchProgress.done}/${batchProgress.total} file(s).`,
+      );
+    }
+    setBatchNames(null);
+  }, [batchNames, batchProgress]);
+
+  useEffect(() => {
+    if (!batchProgress || !batchNames?.length) return;
+    if (batchProgress.done < batchProgress.total) {
+      const failNote =
+        batchProgress.failed.length > 0
+          ? ` · ${batchProgress.failed.length} failed`
+          : "";
+      setAnalyzeMessage(
+        `Analyzing ${batchProgress.done}/${batchProgress.total}${failNote}…`,
+      );
+      setAnalyzeIsError(batchProgress.failed.length > 0);
+    }
+  }, [batchProgress, batchNames]);
+
+  async function queueAnalysis(
+    names: string[],
+    includeFrameCaptions: boolean,
+  ) {
+    if (names.length === 0) {
+      setAnalyzeMessage(
+        "Nothing to queue — local analysis is already complete (use Generate captions on a clip for paid captions only).",
+      );
+      return;
+    }
+    const queued = await requestFootageAnalyze({
+      names,
+      include_frame_captions: includeFrameCaptions,
+    });
+    setBatchNames(queued.queued);
+    setAnalyzeMessage(`Queued analysis for ${queued.queued.length} file(s)…`);
+    await fetchFootage({ silent: true });
+  }
+
+  async function startAnalyzeMissing() {
+    setAnalyzeBusy(true);
+    setAnalyzeMessage(null);
+    setAnalyzeIsError(false);
+    try {
+      const { entries } = await fetchMediaCatalog();
+      const freeMissing = filesMissingFreeAnalysis(entries);
+      const paidCount = entries.filter((e) => entryNeedsPaidCaptions(e)).length;
+      if (freeMissing.length === 0 && paidCount === 0) {
+        setAnalyzeMessage(
+          "Every file in the library already has its analysis files.",
+        );
+        return;
+      }
+      const queueNames = namesToQueue(entries, true);
+      const preflight = await fetchFootageAnalyzePreflight({
+        names: queueNames,
+      });
+      const remembered = preflight.remember_missing_mode;
+      const showDialog = shouldShowAnalyzeMissingDialog(
+        remembered,
+        preflight.paid_caption_file_count,
+        preflight.free_missing_file_count,
+      );
+      if (showDialog) {
+        setDialogEntries(entries);
+        setDialogPreflight(preflight);
+        setRememberChoice(false);
+        setDialogOpen(true);
+        return;
+      }
+      const mode = remembered ?? "all";
+      const include = mode === "all";
+      await queueAnalysis(namesToQueue(entries, include), include);
+    } catch (e) {
+      setAnalyzeIsError(true);
+      setAnalyzeMessage(
+        e instanceof Error ? e.message : "Could not queue analysis.",
+      );
+    } finally {
+      setAnalyzeBusy(false);
+    }
+  }
+
+  async function onDialogChoice(choice: AnalyzeMissingChoice) {
+    setDialogOpen(false);
+    if (choice === "cancel") {
+      setAnalyzeMessage("Analyze all missing was cancelled.");
+      return;
+    }
+    setAnalyzeBusy(true);
+    try {
+      const include = includeFrameCaptionsForChoice(choice);
+      if (include === null) return;
+      if (rememberChoice) {
+        const mode = rememberModeForChoice(choice);
+        if (mode) {
+          await putSettings({ analysis: { remember_missing_mode: mode } });
+        }
+      }
+      await queueAnalysis(namesToQueue(dialogEntries, include), include);
+    } catch (e) {
+      setAnalyzeIsError(true);
+      setAnalyzeMessage(
+        e instanceof Error ? e.message : "Could not queue analysis.",
+      );
+    } finally {
+      setAnalyzeBusy(false);
+      setDialogPreflight(null);
+      setDialogEntries([]);
+    }
+  }
 
   async function runUploads(files: FileList | File[]) {
     const list = Array.from(files);
@@ -112,47 +267,6 @@ export default function MediaBin() {
 
   function onImportClick() {
     fileInputRef.current?.click();
-  }
-
-  async function onAnalyzeMissing() {
-    setAnalyzeBusy(true);
-    setAnalyzeMessage(null);
-    setAnalyzeIsError(false);
-    try {
-      const { entries } = await fetchMediaCatalog();
-      const missing = filesMissingAnalysis(entries);
-      if (missing.length === 0) {
-        setAnalyzeMessage("Every file in the library already has its analysis files.");
-        return;
-      }
-      const needsCaptions = missing.filter((row) =>
-        row.missing.includes("ai_frame_captions"),
-      );
-      if (needsCaptions.length > 0) {
-        const ok = window.confirm(
-          `${needsCaptions.length} video file(s) are missing frame captions. ` +
-            "Queuing them can call the paid caption API when those captions are not cached. Continue?",
-        );
-        if (!ok) {
-          setAnalyzeMessage("Analyze all missing was cancelled.");
-          return;
-        }
-      }
-      const queued = await requestFootageAnalyze({
-        names: missing.map((row) => row.id),
-      });
-      setAnalyzeMessage(
-        `Queued analysis for ${queued.queued.length} file(s).`,
-      );
-      await fetchFootage({ silent: true });
-    } catch (e) {
-      setAnalyzeIsError(true);
-      setAnalyzeMessage(
-        e instanceof Error ? e.message : "Could not queue analysis.",
-      );
-    } finally {
-      setAnalyzeBusy(false);
-    }
   }
 
   async function onDelete(name: string) {
@@ -202,6 +316,15 @@ export default function MediaBin() {
         if (e.dataTransfer.files?.length) void runUploads(e.dataTransfer.files);
       }}
     >
+      {dialogOpen && dialogPreflight && (
+        <AnalyzeMissingDialog
+          open={dialogOpen}
+          preflight={dialogPreflight}
+          rememberChecked={rememberChoice}
+          onRememberChange={setRememberChoice}
+          onChoice={(c) => void onDialogChoice(c)}
+        />
+      )}
       <div className="media-bin-toolbar">
         <input
           ref={fileInputRef}
@@ -231,7 +354,7 @@ export default function MediaBin() {
           className="btn btn--ghost"
           disabled={analyzeBusy || clips.length === 0}
           title="Queue analysis for files that are missing a transcript, silences, shots, keyframes, captions, or a merged index"
-          onClick={() => void onAnalyzeMissing()}
+          onClick={() => void startAnalyzeMissing()}
         >
           {analyzeBusy ? "Queuing…" : "Analyze all missing"}
         </button>
