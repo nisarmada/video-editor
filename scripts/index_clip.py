@@ -30,6 +30,7 @@ from index_cache import (  # noqa: E402
     save_json,
     silences_path,
     shots_path,
+    speech_units_path,
     transcript_path,
 )
 from media import clip_metadata  # noqa: E402
@@ -73,6 +74,7 @@ def build_merged_index(clip_path: Path, *, force: bool = False) -> dict:
     perception = load_json(perception_path(clip_path))
     audio_perception = load_json(audio_perception_path(clip_path))
     takes_doc = load_json(takes_path(clip_path))
+    speech_units_doc = load_json(speech_units_path(clip_path))
 
     duration, has_audio, rotation = clip_metadata(clip_path)
 
@@ -116,6 +118,8 @@ def build_merged_index(clip_path: Path, *, force: bool = False) -> dict:
         payload["audio_perception"] = audio_perception
     if takes_doc is not None:
         payload["takes"] = takes_doc
+    if speech_units_doc is not None:
+        payload["speech_units"] = speech_units_doc
 
     save_json(out_path, payload)
     return payload

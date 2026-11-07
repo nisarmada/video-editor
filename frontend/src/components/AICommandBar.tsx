@@ -207,6 +207,11 @@ export default function AICommandBar() {
                 aria-label="Edit brief"
               />
             </label>
+            <p className="ai-command-bar__hint">
+              Draft builds from analyzed files in{" "}
+              <code className="media-bin-code">footage/</code> (Use: All clips or
+              bin selection). An empty timeline is fine.
+            </p>
             <div
               className="ai-command-bar__estimate"
               aria-live="polite"

@@ -29,6 +29,7 @@ from convert_v1_to_v2 import convert as v1_to_v2  # noqa: E402
 from style_profile import format_style_for_prompt, load_style_profile  # noqa: E402
 from timeline_format import get_track, is_v2  # noqa: E402
 from audio_cut_refine import load_settings, refine_timeline_audio_cuts  # noqa: E402
+from speech_layout import build_speech_layout, detect_and_normalize_edl  # noqa: E402
 from validate_plan import validate_plan_data, validate_segments  # noqa: E402
 
 from backend.media_catalog import build_media_catalog  # noqa: E402
@@ -73,7 +74,7 @@ The project uses **multi-track** timelines:
   - `id` (string, unique)
   - `source` — exactly `footage/<filename>` from the catalog
   - `source_in`, `source_out` — trim range in the source file (seconds)
-  - `timeline_start` — where the clip begins on the timeline (seconds)
+  - `timeline_start` — where the clip begins on the timeline (seconds); **do not set on speech EDL clips** (see below)
   - `created_by` — use `"ai"`
   - Optional: `group_id` (string) to link related clips
   - Optional: `speed`, `volume`, `zoom` (video)
@@ -89,13 +90,64 @@ The project uses **multi-track** timelines:
 
 **Caption track** clips need `text` (on-screen string) plus timing fields like video/audio.
 
-**Gaps**: Leave timeline holes by advancing `timeline_start` so clips do not always touch; the renderer fills gaps with black + silence where needed.
+**Video gaps**: You may leave picture holes on **video** tracks by advancing `timeline_start` where the brief needs them.
 
-**Audio-only files** (kind `audio` in the catalog): place them on **audio** tracks with `source` / trims / `timeline_start` / optional `speed` / `volume`. They can run under different video than their file name suggests, or alone.
+## Speech editing (code-owned layout — read carefully)
 
-**Video without audio**: valid; use `audio_source: detached` or rely on separate audio-track clips under the same timeline region.
+### EDL output only (no timeline math on voice)
 
-You decide which files to use, how to trim them, and how to layer them. Omit files that do not fit the brief.
+On the primary **speech / voiceover** audio track you output an **edit decision list (EDL)** only:
+
+- Set `"speech_layout_mode": "edl"` on that track.
+- List clips **in final playback order** in the `clips` array (sentences, phrases, or word groups — whatever unit serves the brief).
+- Each unit must include: `id`, `source`, `source_in`, `source_out`, `created_by: "ai"`, plus:
+  - `cut_intent`: `{ "start": "complete"|"fragment", "end": "complete"|"fragment"|"abrupt"|"fade", "reason": "<why>" }`
+  - optional top-level `reason` if clearer than nesting in `cut_intent`.
+- **Forbidden on speech EDL clips:** `timeline_start`, `timeline_end`, or any field that encodes cumulative timeline position. Layout is computed locally (`build_speech_layout`) after energy-based trim refinement.
+- Do **not** shorten `source_out` / pull `source_in` to create silence between lines — that is never pacing.
+
+**Video / captions tied to speech:** `speech_bind: "<speech_clip_id>"` so picture/captions ripple with speech. Independent b-roll and music/sfx keep normal `timeline_start` on their own tracks.
+
+**Music / sfx / non-voice audio:** use ordinary clips with `timeline_start` on separate tracks (not EDL).
+
+### Self-correction and false-start exclusion (strict)
+
+Before choosing spans, scan transcripts for speaker **flubs** and **do not use** those ranges in any clip:
+
+- Mid-sentence restarts, stuttered re-takes, aborted lines, retracted statements.
+- Phrases like: "Wait, no…", "Let me rephrase…", "Actually—", "I was— I mean…", "Sorry, scratch that", "Hang on".
+- The **first** false attempt in a pair — keep only the **final clean** wording the speaker settled on.
+- Apply the same rule when picking **synced video** (`speech_bind`): video must match the clean speech unit, not the botched take.
+
+If the only material in a file is false starts, omit that file.
+
+### Pacing via `gap_after` only
+
+Express breath / beat **only** with `gap_after` on each speech clip except the last:
+
+- `{ "mode": "continuous" }` — hard join (default).
+- `{ "mode": "pause", "duration_s": <seconds>, "fill": "room_tone"|"silence" }` — intentional pause.
+
+Never invent pacing with mystery timeline holes or by trimming word tails.
+
+### What the codebase handles (do not duplicate)
+
+After your EDL is accepted, local code automatically:
+
+- Refines `source_in` / `source_out` on **word boundaries** and **acoustic energy** (decay tails, not just Whisper `word.end`).
+- Applies short speech-safe fades and optional join crossfades.
+- Lays clips **contiguously** (plus approved `gap_after` pauses only).
+- Validates that accidental gaps are not introduced by trims.
+
+You still choose **which words** and **source times** from the catalog; pick coarse spans on word boundaries. Do not cut inside a word.
+
+`target_length_seconds` is a **soft** hint — prefer a readable cut; add `length_note` if you stretch far from the brief.
+
+**Video gaps (picture only):** you may leave holes on **video** tracks with `timeline_start` where the brief needs them.
+
+**Video without audio:** valid; use `audio_source: detached` or separate audio-track clips.
+
+You decide which files to use and how to layer them. Omit files that do not fit the brief.
 
 ## Output format
 
@@ -104,7 +156,8 @@ Return **only** valid JSON (no markdown fences) with:
 - `schema_version`: 2
 - `name`: short slug
 - `brief`: repeat the user's brief
-- `target_length_seconds`: number (total timeline length you intend)
+- `target_length_seconds`: number (soft length hint for the edit)
+- `length_note`: optional string when you intentionally miss the brief length
 - `settings`: include at least `"width": 1080, "height": 1920, "fps": 30` unless the brief implies otherwise
 - `tracks`: array of tracks, each with `id`, `type` (`video` | `audio` | `caption`), `label` (optional), `muted` (optional, for audio/video tracks), `clips` array
 
@@ -152,9 +205,9 @@ def build_user_prompt(
 ) -> str:
     target = parse_target_seconds(brief)
     target_line = (
-        f"Target length: about {target} seconds total (timeline end)."
+        f"Target length hint: about {target} seconds (soft — prioritize how the edit reads)."
         if target
-        else "Infer a sensible target_length_seconds from the brief."
+        else "Pick target_length_seconds as a soft hint from the brief."
     )
     warn_block = (
         "\nCatalog warnings:\n"
@@ -346,8 +399,10 @@ def finalize_v2_from_segments(v1_plan: dict, brief: str, run_group_id: str) -> d
 
     v2 = v1_to_v2(v1_plan, created_by="ai", group_id=run_group_id)
     acfg = load_settings(Path.cwd())
+    detect_and_normalize_edl(v2)
     if acfg.get("enabled", True):
         v2, _report = refine_timeline_audio_cuts(v2, settings=acfg)
+    build_speech_layout(v2)
     v2_errors, _v2_warnings = validate_plan_data(v2, target)
     if v2_errors:
         raise ValueError(v2_errors)
@@ -363,9 +418,11 @@ def finalize_v2_direct(plan: dict, brief: str, run_group_id: str) -> dict:
     plan = ensure_ai_v2_plan(plan, brief, run_group_id)
     target = plan.get("target_length_seconds")
     target = float(target) if isinstance(target, (int, float)) else None
+    detect_and_normalize_edl(plan)
     acfg = load_settings(Path.cwd())
     if acfg.get("enabled", True):
         plan, _report = refine_timeline_audio_cuts(plan, settings=acfg)
+    build_speech_layout(plan)
     errors, _warn = validate_plan_data(plan, target)
     if errors:
         raise ValueError(errors)
@@ -567,9 +624,9 @@ def prepare_planner_context(
         cat_text += "\nCatalog warnings:\n" + "\n".join(f"- {w}" for w in cat_warnings)
     target = parse_target_seconds(brief)
     target_line = (
-        f"Target length: about {target} seconds total (timeline end)."
+        f"Target length hint: about {target} seconds (soft — prioritize how the edit reads)."
         if target
-        else "Infer a sensible target_length_seconds from the brief."
+        else "Pick target_length_seconds as a soft hint from the brief."
     )
     brief_text = (
         f"User brief:\n{brief}\n\n{target_line}\n\n"

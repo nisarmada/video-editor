@@ -538,6 +538,26 @@ export default function SettingsPanel({
             </section>
 
             <section className="settings-block">
+              <h3>Speech read-back judge</h3>
+              <p className="settings-hint">
+                After planning, one cheap-model pass can review assembled speech (no catalog).
+                Off by default for paid calls — the API defaults to mock unless you confirm.
+              </p>
+              <label className="settings-inline">
+                <input
+                  type="checkbox"
+                  checked={s?.speech_readback?.enabled ?? true}
+                  onChange={(e) => {
+                    void putSettings({
+                      speech_readback: { enabled: e.target.checked },
+                    }).then(setS);
+                  }}
+                />
+                Enable read-back judge (still requires confirm_paid per run)
+              </label>
+            </section>
+
+            <section className="settings-block">
               <h3>Analyze all missing</h3>
               <p className="settings-hint">
                 Remember my choice skips the paid-caption dialog on the next

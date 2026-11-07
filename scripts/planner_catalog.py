@@ -13,6 +13,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from speech_units import compact_speech_digest  # noqa: E402
 from text_embeddings import (
     ensure_file_embedding,
     hash_embed,
@@ -150,6 +151,9 @@ def to_compact(entry: dict) -> dict[str, Any]:
         },
         "analysis": _analysis_status(entry),
         "transcript_digest": _digest(entry),
+        "speech_digest": compact_speech_digest(entry.get("speech_units") or {})
+        if isinstance(entry.get("speech_units"), dict)
+        else [],
     }
 
 
@@ -182,9 +186,41 @@ def detail_slice(
         if end is not None and w0 > end:
             continue
         words_out.append(word)
+    su = entry.get("speech_units") if isinstance(entry.get("speech_units"), dict) else {}
+    phrase_slice: list[dict] = []
+    for u in su.get("phrases") or []:
+        if not isinstance(u, dict):
+            continue
+        try:
+            u0 = float(u["start"])
+            u1 = float(u["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if start is not None and u1 < start:
+            continue
+        if end is not None and u0 > end:
+            continue
+        phrase_slice.append(u)
+    word_slice: list[dict] = []
+    for u in su.get("words") or []:
+        if not isinstance(u, dict):
+            continue
+        try:
+            u0 = float(u["start"])
+            u1 = float(u["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if start is not None and u1 < start:
+            continue
+        if end is not None and u0 > end:
+            continue
+        word_slice.append(u)
+
     return {
         "id": entry.get("id"),
         "transcript_words": words_out,
+        "speech_phrases": phrase_slice,
+        "speech_words": word_slice,
         "shots": entry.get("shots") or [],
         "keyframes": entry.get("keyframes") or [],
         "ai_frame_captions": entry.get("ai_frame_captions") or [],

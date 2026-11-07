@@ -63,6 +63,9 @@ import {
 import { timelineViewportElRef, useEditorSettingsStore } from "../store/editorSettingsStore";
 import { useTimelineMarquee } from "../hooks/useTimelineMarquee";
 import { validateGroupMove } from "../timeline/groupMove";
+import CutCheckModal from "./CutCheckModal";
+import { clipHasCutWarning } from "../timeline/cutWarnings";
+import type { SpeechBoundary } from "../api/speechCuts";
 
 const LABEL_WIDTH = TIMELINE_LABEL_WIDTH;
 const RULER_HEIGHT = TIMELINE_RULER_HEIGHT;
@@ -146,6 +149,7 @@ export default function TimelinePanel() {
   const redo = useTimelineStore((s) => s.redo);
   const splitAtPlayhead = useTimelineStore((s) => s.splitAtPlayhead);
   const refineSelectedAudioCuts = useTimelineStore((s) => s.refineSelectedAudioCuts);
+  const relayoutSelectedSpeech = useTimelineStore((s) => s.relayoutSelectedSpeech);
   const deleteSelectedClip = useTimelineStore((s) => s.deleteSelectedClip);
   const toggleClipLinking = useTimelineStore((s) => s.toggleClipLinking);
   const applyOperation = useTimelineStore((s) => s.applyOperation);
@@ -153,6 +157,8 @@ export default function TimelinePanel() {
   const runBatchOperationSteps = useTimelineStore((s) => s.runBatchOperationSteps);
   const shortcutToast = useTimelineStore((s) => s.shortcutToast);
   const setShortcutToast = useTimelineStore((s) => s.setShortcutToast);
+  const speechCutAudit = useTimelineStore((s) => s.speechCutAudit);
+  const [cutCheckOpen, setCutCheckOpen] = useState(false);
 
   const rulerRef = useRef<HTMLDivElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -974,6 +980,24 @@ export default function TimelinePanel() {
           >
             Refine cuts
           </button>
+          <button
+            type="button"
+            className="timeline-toolbar__tool timeline-toolbar__tool--text"
+            disabled={busy || selectionCount === 0}
+            onClick={() => void relayoutSelectedSpeech().catch(() => {})}
+            title="Refine + pack speech clips on the timeline; ripples linked video (one undo)"
+          >
+            Re-layout speech
+          </button>
+          <button
+            type="button"
+            className="timeline-toolbar__tool timeline-toolbar__tool--text"
+            disabled={busy || !timeline}
+            onClick={() => setCutCheckOpen(true)}
+            title="Audition speech cuts and nudge trims"
+          >
+            Check cuts
+          </button>
         </div>
         <div className="timeline-toolbar__right">
           <span className="timeline-toolbar__stub" title="Not implemented">
@@ -1243,6 +1267,13 @@ export default function TimelinePanel() {
                       onPointerDown={onLanePointerDown}
                     >
                       {(track.clips ?? []).map((clip) => {
+                        const auditOut: SpeechBoundary | undefined =
+                          speechCutAudit?.boundaries.find(
+                            (b) => b.clip_id === clip.id && b.edge === "out",
+                          );
+                        const cutWarn =
+                          track.type === "audio" &&
+                          clipHasCutWarning(clip, auditOut);
                         const start = clip.timeline_start;
                         const dur = clipTimelineDuration(clip, track.type);
                         const left = start * pxPerSecond;
@@ -1354,6 +1385,17 @@ export default function TimelinePanel() {
                               <span className="tl-clip__name">
                                 {clipDisplayName(clip, track.type)}
                               </span>
+                              {cutWarn ? (
+                                <span
+                                  className="tl-clip__cut-warn"
+                                  title={
+                                    auditOut?.problems?.join(", ") ??
+                                    "Cut quality warning"
+                                  }
+                                >
+                                  ⚠
+                                </span>
+                              ) : null}
                             </span>
                           </div>
                         );
@@ -1500,6 +1542,7 @@ export default function TimelinePanel() {
             : []
         }
       />
+      <CutCheckModal open={cutCheckOpen} onClose={() => setCutCheckOpen(false)} />
     </div>
   );
 }

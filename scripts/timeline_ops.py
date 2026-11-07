@@ -1327,27 +1327,81 @@ def replace_timeline(timeline: dict, *, timeline_data: dict) -> TimelineOpResult
     """Swap the entire v2 timeline (e.g. AI planner output); undo restores the previous tree."""
     old_snap = copy.deepcopy(timeline)
     new_tl = copy.deepcopy(timeline_data)
+    refinement_report = None
     try:
         from audio_cut_refine import load_settings, refine_timeline_audio_cuts
+        from speech_layout import build_speech_layout, detect_and_normalize_edl
 
+        detect_and_normalize_edl(new_tl)
         acfg = load_settings()
         if acfg.get("enabled", True):
             new_tl, report = refine_timeline_audio_cuts(new_tl, settings=acfg)
             if report.moves:
-                return {
-                    "timeline": new_tl,
-                    "undo": {"op": "replace_timeline", "previous_timeline": old_snap},
-                    "refinement_report": {
-                        "moves": [m.as_dict() for m in report.moves],
-                        "summary": report.summary_line(),
-                    },
+                refinement_report = {
+                    "moves": [m.as_dict() for m in report.moves],
+                    "summary": report.summary_line(),
+                    "quality": [q.as_dict() for q in report.quality],
                 }
+        build_speech_layout(new_tl)
     except Exception:
         pass
-    return {
+    out: TimelineOpResult = {
         "timeline": new_tl,
         "undo": {"op": "replace_timeline", "previous_timeline": old_snap},
     }
+    if refinement_report:
+        out["refinement_report"] = refinement_report
+    return out
+
+
+def apply_speech_suggestion(
+    timeline: dict,
+    *,
+    clip_id: str,
+    source_in: float | None = None,
+    source_out: float | None = None,
+    cut_intent: dict | None = None,
+) -> TimelineOpResult:
+    """Apply one judge/mechanical trim suggestion (single undo)."""
+    if not clip_id:
+        raise ValueError("apply_speech_suggestion: clip_id required")
+    tl = _clone(timeline)
+    found = False
+    for track in tl.get("tracks") or []:
+        for clip in track.get("clips") or []:
+            if not isinstance(clip, dict) or clip.get("id") != clip_id:
+                continue
+            if source_in is not None:
+                clip["source_in"] = round(float(source_in), 4)
+            if source_out is not None:
+                clip["source_out"] = round(float(source_out), 4)
+            if isinstance(cut_intent, dict):
+                clip["cut_intent"] = cut_intent
+            found = True
+            break
+        if found:
+            break
+    if not found:
+        raise ValueError(f"apply_speech_suggestion: clip {clip_id!r} not found")
+    return TimelineOpResult(timeline=tl, undo={"op": "apply_speech_suggestion", "clip_id": clip_id})
+
+
+def apply_speech_judge_revision(
+    timeline: dict,
+    *,
+    suggestions: list[dict[str, Any]],
+) -> TimelineOpResult:
+    """Apply multiple speech suggestions as one undo step."""
+    if not suggestions:
+        raise ValueError("apply_speech_judge_revision: suggestions required")
+    tl = timeline
+    for step in suggestions:
+        res = apply_speech_suggestion(tl, **step)
+        tl = res.timeline
+    return TimelineOpResult(
+        timeline=tl,
+        undo={"op": "apply_speech_judge_revision", "count": len(suggestions)},
+    )
 
 
 def refine_audio_cuts(
@@ -1378,10 +1432,14 @@ def refine_audio_cuts(
                     }
                 )
 
+    from speech_layout import build_speech_layout, snapshot_timeline_starts
+
+    before_starts = snapshot_timeline_starts(timeline)
     acfg = load_settings()
     new_tl, report = refine_timeline_audio_cuts(
         timeline, settings=acfg, clip_ids=want
     )
+    build_speech_layout(new_tl)
     undo_steps = [
         {
             "op": "trim_clip",
@@ -1402,14 +1460,113 @@ def refine_audio_cuts(
                 },
             }
         )
+    undo_steps.append({"op": "relayout_speech", "starts": before_starts})
     out: TimelineOpResult = {
         "timeline": new_tl,
         "undo": {"op": "sequence", "steps": undo_steps},
     }
-    if report.moves:
+    if report.moves or report.quality:
         out["refinement_report"] = {
             "moves": [m.as_dict() for m in report.moves],
             "summary": report.summary_line(),
+            "quality": [q.as_dict() for q in report.quality],
+        }
+    return out
+
+
+def _enable_speech_layout_on_track(track: dict) -> None:
+    """Legacy timelines: opt into contiguous speech layout for re-layout."""
+    from speech_layout import DEFAULT_GAP_AFTER, SPEECH_LAYOUT_CONTIGUOUS, ordered_speech_clips
+
+    if track.get("type") != "audio":
+        return
+    if track.get("speech_layout_mode") is not None:
+        return
+    clips = ordered_speech_clips(track)
+    if not clips:
+        return
+    track["speech_layout_mode"] = SPEECH_LAYOUT_CONTIGUOUS
+    for i, clip in enumerate(clips):
+        if isinstance(clip, dict):
+            clip["speech_order"] = i
+            if i + 1 < len(clips) and "gap_after" not in clip:
+                clip["gap_after"] = dict(DEFAULT_GAP_AFTER)
+
+
+def nudge_speech_cut(
+    timeline: dict,
+    *,
+    clip_id: str,
+    edge: str,
+    delta_ms: float = 10.0,
+) -> TimelineOpResult:
+    """Nudge speech in/out by delta_ms then re-pack speech layout (one undo)."""
+    from speech_layout import build_speech_layout, snapshot_timeline_starts
+
+    if edge not in ("in", "out"):
+        raise ValueError("nudge_speech_cut: edge must be 'in' or 'out'.")
+    tl = _clone(timeline)
+    track, clip, _ = _find_clip(tl, clip_id)
+    if track.get("type") != "audio":
+        raise ValueError("nudge_speech_cut: clip must be on an audio track.")
+    ds = float(delta_ms) / 1000.0
+    old_in = float(clip["source_in"])
+    old_out = float(clip["source_out"])
+    before_starts = snapshot_timeline_starts(tl)
+    if edge == "in":
+        clip["source_in"] = round(old_in + ds, 4)
+    else:
+        clip["source_out"] = round(old_out + ds, 4)
+    if float(clip["source_in"]) >= float(clip["source_out"]):
+        raise ValueError("nudge_speech_cut: trims crossed after nudge.")
+    _check_min_source_span(clip, "Nudged clip")
+    tid = str(track.get("id"))
+    build_speech_layout(tl, track_id=tid)
+    return {
+        "timeline": tl,
+        "undo": {
+            "op": "nudge_speech_cut",
+            "clip_id": clip_id,
+            "source_in": old_in,
+            "source_out": old_out,
+            "starts": before_starts,
+        },
+    }
+
+
+def relayout_speech(
+    timeline: dict,
+    *,
+    track_id: str | None = None,
+    clip_ids: list[str] | None = None,
+    refine: bool = True,
+) -> TimelineOpResult:
+    """Re-run speech refine (optional) + deterministic layout; single undo step."""
+    from audio_cut_refine import load_settings, refine_timeline_audio_cuts
+    from speech_layout import build_speech_layout, snapshot_timeline_starts
+
+    before = snapshot_timeline_starts(timeline)
+    tl = _clone(timeline)
+    for tr in tl.get("tracks") or []:
+        if track_id is not None and str(tr.get("id")) != track_id:
+            continue
+        if tr.get("type") == "audio":
+            _enable_speech_layout_on_track(tr)
+    report = None
+    if refine:
+        want = {str(c) for c in (clip_ids or []) if c} or None
+        acfg = load_settings()
+        tl, report = refine_timeline_audio_cuts(tl, settings=acfg, clip_ids=want)
+    build_speech_layout(tl, track_id=track_id)
+    out: TimelineOpResult = {
+        "timeline": tl,
+        "undo": {"op": "relayout_speech", "starts": before},
+    }
+    if report and (report.moves or report.quality):
+        out["refinement_report"] = {
+            "moves": [m.as_dict() for m in report.moves],
+            "summary": report.summary_line(),
+            "quality": [q.as_dict() for q in report.quality],
         }
     return out
 
@@ -1568,6 +1725,41 @@ def apply_undo(timeline: dict, undo: dict) -> TimelineOpResult:
             "timeline": copy.deepcopy(prev),
             "undo": {"op": "replace_timeline", "previous_timeline": cur_snap},
         }
+    if op == "relayout_speech":
+        from speech_layout import apply_timeline_starts, snapshot_timeline_starts
+
+        starts = undo.get("starts")
+        if not isinstance(starts, dict):
+            raise ValueError("relayout_speech undo: missing starts map.")
+        tl = _clone(timeline)
+        current = snapshot_timeline_starts(tl)
+        apply_timeline_starts(tl, {str(k): float(v) for k, v in starts.items()})
+        return {
+            "timeline": tl,
+            "undo": {"op": "relayout_speech", "starts": current},
+        }
+    if op == "nudge_speech_cut":
+        from speech_layout import apply_timeline_starts, snapshot_timeline_starts
+
+        tl = _clone(timeline)
+        _, clip, _ = _find_clip(tl, str(undo["clip_id"]))
+        cur_in = float(clip["source_in"])
+        cur_out = float(clip["source_out"])
+        current_starts = snapshot_timeline_starts(tl)
+        clip["source_in"] = float(undo["source_in"])
+        clip["source_out"] = float(undo["source_out"])
+        prior_starts = undo.get("starts") or {}
+        apply_timeline_starts(tl, {str(k): float(v) for k, v in prior_starts.items()})
+        return {
+            "timeline": tl,
+            "undo": {
+                "op": "nudge_speech_cut",
+                "clip_id": undo["clip_id"],
+                "source_in": cur_in,
+                "source_out": cur_out,
+                "starts": current_starts,
+            },
+        }
     raise ValueError(f"Unknown undo op: {op!r}.")
 
 
@@ -1597,6 +1789,10 @@ OPERATIONS = {
     "reattach_audio": reattach_audio,
     "unlink_clips": unlink_clips,
     "refine_audio_cuts": refine_audio_cuts,
+    "relayout_speech": relayout_speech,
+    "nudge_speech_cut": nudge_speech_cut,
+    "apply_speech_suggestion": apply_speech_suggestion,
+    "apply_speech_judge_revision": apply_speech_judge_revision,
     "apply_undo": apply_undo_op,
 }
 

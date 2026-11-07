@@ -359,3 +359,29 @@ def test_render_mock(client: TestClient, monkeypatch):
         time.sleep(0.05)
     else:
         raise AssertionError("render job did not finish")
+
+
+def test_speech_cut_audit_lists_boundaries(client: TestClient):
+    tl = _minimal_v2()
+    tl["tracks"].append(
+        {
+            "id": "A1",
+            "type": "audio",
+            "clips": [
+                {
+                    "id": "n1",
+                    "source": "footage/x.m4a",
+                    "source_in": 0,
+                    "source_out": 1,
+                    "timeline_start": 0,
+                    "created_by": "user",
+                }
+            ],
+        }
+    )
+    r = client.post("/api/timeline/speech-cut-audit", json={"timeline": tl})
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data.get("boundaries") or []) >= 2
+    edges = {b["edge"] for b in data["boundaries"] if b["clip_id"] == "n1"}
+    assert edges == {"in", "out"}

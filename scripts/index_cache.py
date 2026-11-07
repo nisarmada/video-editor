@@ -68,6 +68,11 @@ def takes_path(video: Path) -> Path:
     return index_dir() / f"{video.stem}_takes.json"
 
 
+def speech_units_path(video: Path) -> Path:
+    """Sentences, phrases, and words with cut-friendly measurements."""
+    return index_dir() / f"{video.stem}_speech_units.json"
+
+
 def perception_dir(video: Path) -> Path:
     return index_dir() / "perception" / video.stem
 

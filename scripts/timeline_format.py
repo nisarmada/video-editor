@@ -196,12 +196,19 @@ def validate_v2_clips_on_track(
     ttype = track.get("type")
     tid = track.get("id", ttype)
     clips = track.get("clips") or []
+    speech_edl = (
+        ttype == "audio"
+        and track.get("speech_layout_mode") == "edl"
+    )
 
     intervals: list[tuple[float, float, str]] = []
 
     for i, clip in enumerate(clips):
         label = f"Track {tid} clip {i}"
-        for field in ("id", "timeline_start", "created_by"):
+        required = ("id", "created_by")
+        if not speech_edl:
+            required = ("id", "timeline_start", "created_by")
+        for field in required:
             if field not in clip:
                 errors.append(f"{label}: missing '{field}'.")
         if clip.get("created_by") not in CREATED_BY:
@@ -255,6 +262,8 @@ def validate_v2_clips_on_track(
                 except (TypeError, ValueError):
                     errors.append(f"{label}: invalid source_in/source_out.")
 
+        if speech_edl:
+            continue
         try:
             start = float(clip["timeline_start"])
             dur = clip_timeline_duration(clip, ttype or "video")
@@ -367,6 +376,13 @@ def validate_v2_data(
         for c in tr.get("clips") or []:
             audio_index.append(c)
 
+    try:
+        from speech_layout import validate_timeline_speech_layout
+
+        errors.extend(validate_timeline_speech_layout(data))
+    except ImportError:
+        pass
+
     for track in tracks:
         if track.get("type") != "video":
             continue
@@ -402,8 +418,9 @@ def validate_v2_data(
 
     total = v2_timeline_duration(data)
     if max_length is not None and total > max_length + 0.05:
-        errors.append(
-            f"Timeline duration {total:.2f}s exceeds max {max_length:.2f}s."
+        warnings.append(
+            f"Timeline duration {total:.2f}s is over brief hint {max_length:.2f}s "
+            "(soft target — not blocking)."
         )
 
     return errors, warnings

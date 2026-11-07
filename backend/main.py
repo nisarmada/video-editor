@@ -156,6 +156,13 @@ class PlannerEstimateRequest(BaseModel):
     imitate_style_id: str | None = None
 
 
+class SpeechReadbackRequest(BaseModel):
+    brief: str
+    timeline: dict[str, Any]
+    mock: bool = True
+    confirm_paid: bool = False
+
+
 class RenderRequest(BaseModel):
     plan_name: str | None = None
     timeline: dict[str, Any] | None = None
@@ -1038,6 +1045,21 @@ def apply_operation(
     return result
 
 
+class SpeechCutAuditRequest(BaseModel):
+    timeline: dict[str, Any]
+
+
+@app.post("/api/timeline/speech-cut-audit")
+def speech_cut_audit(
+    body: SpeechCutAuditRequest,
+    paths: ProjectPaths = Depends(get_paths),
+) -> dict[str, Any]:
+    with project_cwd(paths):
+        from speech_cut_audit import audit_timeline_speech_cuts
+
+        return audit_timeline_speech_cuts(body.timeline)
+
+
 @app.get("/api/styles")
 def list_styles(paths: ProjectPaths = Depends(get_paths)) -> dict[str, Any]:
     styles_dir = paths.plans / "styles"
@@ -1188,15 +1210,52 @@ def run_planner(
     log_event("info", f"Planner wrote {path.name}")
     with project_cwd(paths):
         from audio_cut_refine import check_word_clipped_at_cuts
+        from speech_edit_quality import assemble_readback, mechanical_speech_warnings
 
         cut_warnings = check_word_clipped_at_cuts(plan_v2, root=paths.root)
+        speech_warnings = mechanical_speech_warnings(plan_v2, root=paths.root)
+        readback_blocks = assemble_readback(plan_v2, root=paths.root)
     return {
         "plan_name": path.name,
         "group_id": group_id,
         "usage": usage,
         "timeline": plan_v2,
         "cut_quality_warnings": cut_warnings,
+        "speech_edit_warnings": speech_warnings,
+        "speech_readback_preview": readback_blocks,
     }
+
+
+@app.post("/api/planner/speech-readback")
+def planner_speech_readback(
+    body: SpeechReadbackRequest,
+    paths: ProjectPaths = Depends(get_paths),
+) -> dict[str, Any]:
+    """Read-back judge: brief + assembled speech only (no catalog). Defaults to mock."""
+    from speech_edit_quality import assemble_readback, readback_script_text
+    from speech_readback_judge import call_readback_judge
+
+    with project_cwd(paths):
+        blocks = assemble_readback(body.timeline, root=paths.root)
+        script = readback_script_text(blocks)
+        raw = load_raw(paths.root)
+        sr = raw.get("speech_readback") if isinstance(raw.get("speech_readback"), dict) else {}
+        enabled = bool(sr.get("enabled", True))
+        use_mock = body.mock or not enabled
+        if not use_mock and not body.confirm_paid:
+            raise HTTPException(
+                status_code=400,
+                detail="Set confirm_paid=true to run the paid read-back judge.",
+            )
+        api_key = effective_planner_api_key(paths.root)
+        verdict = call_readback_judge(
+            brief=body.brief,
+            readback_text=script,
+            root=paths.root,
+            api_key=api_key,
+            mock=use_mock,
+        )
+    return {"readback": blocks, "script": script, "verdict": verdict}
 
 
 def _run_render_job(
@@ -1281,12 +1340,26 @@ def _run_render_job(
 
     rel = str(out_path.relative_to(paths.root))
     url = f"/api/output/{out_path.name}"
+    export_cut_quality: dict[str, Any] | None = None
+    try:
+        plan_data: dict[str, Any] | None = body.timeline
+        if plan_data is None and body.plan_name:
+            plan_path = paths.plan_file(body.plan_name)
+            if plan_path.is_file():
+                plan_data = json.loads(plan_path.read_text())
+        if plan_data and out_path.is_file():
+            from verify_export import verify_export_file
+
+            export_cut_quality = verify_export_file(plan_data, out_path)
+    except Exception as exc:
+        export_cut_quality = {"error": str(exc), "summary": "", "boundaries": []}
     update_job(
         job_id,
         state="done",
         percent=100.0,
         output=rel,
         url=url,
+        export_cut_quality=export_cut_quality,
     )
     log_event("info", f"Render job {job_id} done -> {out_path.name}")
 

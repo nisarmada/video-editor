@@ -9,6 +9,13 @@ export type RenderPlanRequest = {
   video_crf?: number;
 };
 
+export type ExportCutQuality = {
+  boundaries?: unknown[];
+  problem_count?: number;
+  summary?: string;
+  error?: string;
+};
+
 export type RenderJobPublic = {
   id: string;
   state: string;
@@ -17,6 +24,7 @@ export type RenderJobPublic = {
   log: string;
   output: string | null;
   url: string | null;
+  export_cut_quality?: ExportCutQuality | null;
 };
 
 async function readError(res: Response): Promise<never> {

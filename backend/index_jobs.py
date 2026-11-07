@@ -127,6 +127,10 @@ def schedule_index_pipeline(
                     run_script("takes.py", [], "takes")
                 except RuntimeError:
                     mark_step(name, "takes skipped")
+                try:
+                    run_script("speech_units.py", [], "speech_units")
+                except RuntimeError:
+                    mark_step(name, "speech_units skipped")
 
                 if ext in AUDIO_EXTS:
                     pass

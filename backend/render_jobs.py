@@ -58,6 +58,7 @@ def update_job(
     log_append: str | None = None,
     output: str | None = None,
     url: str | None = None,
+    export_cut_quality: dict[str, Any] | None = None,
 ) -> None:
     with _lock:
         j = _jobs.get(job_id)
@@ -76,6 +77,8 @@ def update_job(
             j["output"] = output
         if url is not None:
             j["url"] = url
+        if export_cut_quality is not None:
+            j["export_cut_quality"] = export_cut_quality
 
 
 def get_job_public(job_id: str) -> dict[str, Any] | None:
@@ -83,7 +86,7 @@ def get_job_public(job_id: str) -> dict[str, Any] | None:
         j = _jobs.get(job_id)
         if not j:
             return None
-        return {
+        out: dict[str, Any] = {
             "id": job_id,
             "state": j["state"],
             "percent": j.get("percent"),
@@ -92,6 +95,9 @@ def get_job_public(job_id: str) -> dict[str, Any] | None:
             "output": j.get("output"),
             "url": j.get("url"),
         }
+        if j.get("export_cut_quality") is not None:
+            out["export_cut_quality"] = j["export_cut_quality"]
+        return out
 
 
 def request_cancel(job_id: str) -> bool:

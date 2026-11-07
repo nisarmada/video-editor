@@ -98,6 +98,10 @@ export type TimelineClip = {
   text?: string;
   caption?: string;
   style_override?: Partial<CaptionStyle>;
+  cut_intent?: { start?: string; end?: string; reason?: string };
+  speech_cut_quality?: Record<string, number | boolean>;
+  speech_transition_tight?: boolean;
+  cut_warning_flags?: string[];
 };
 
 export type TimelineTrack = {

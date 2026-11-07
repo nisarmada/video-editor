@@ -53,6 +53,7 @@ import type { GroupMovePlan } from "../timeline/groupMove";
 function summarizePlannerTimeline(
   tl: TimelineV2,
   cutWarnings?: string[],
+  speechWarnings?: { message: string }[],
 ): string {
   let videoClips = 0;
   let audioTracksWithClips = 0;
@@ -68,6 +69,10 @@ function summarizePlannerTimeline(
   if (cutWarnings?.length) {
     out += ` Cut check: ${cutWarnings[0]}`;
     if (cutWarnings.length > 1) out += ` (+${cutWarnings.length - 1} more)`;
+  }
+  if (speechWarnings?.length) {
+    out += ` Speech: ${speechWarnings[0]?.message ?? "review suggested"}`;
+    if (speechWarnings.length > 1) out += ` (+${speechWarnings.length - 1} more)`;
   }
   return out;
 }
@@ -98,6 +103,15 @@ function ensureCaptionStyle(tl: TimelineV2): TimelineV2 {
     };
   }
   return next;
+}
+
+/** Backend PUT /api/plans rejects v2 timelines with no video clips. */
+export function timelineCanPersist(timeline: TimelineV2 | null | undefined): boolean {
+  if (!timeline || timeline.schema_version !== 2) return false;
+  for (const tr of timeline.tracks ?? []) {
+    if (tr.type === "video" && (tr.clips?.length ?? 0) > 0) return true;
+  }
+  return false;
 }
 
 export function newEmptyTimelineV2(): TimelineV2 {
@@ -239,6 +253,11 @@ type TimelineViewState = {
   /** Ephemeral hint for keyboard shortcuts (no-op, split refused, etc.). */
   shortcutToast: string | null;
 
+  speechCutAudit: import("../api/speechCuts").SpeechCutAudit | null;
+  setSpeechCutAudit: (
+    audit: import("../api/speechCuts").SpeechCutAudit | null,
+  ) => void;
+
   /** POST /api/planner/run in flight. */
   plannerRunning: boolean;
   plannerError: string | null;
@@ -340,6 +359,7 @@ type TimelineViewState = {
   deleteSelectedClip: () => Promise<TimelineInverseOp>;
   /** Word-safe narration trim on selected audio clips (one undo). */
   refineSelectedAudioCuts: () => Promise<TimelineInverseOp | void>;
+  relayoutSelectedSpeech: () => Promise<TimelineInverseOp | void>;
   moveClipsToPlans: (plans: GroupMovePlan[]) => Promise<TimelineInverseOp>;
   setClipPropertyBatch: (
     clipIds: string[],
@@ -446,6 +466,7 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
   redoStack: [],
   opErrorMessage: null,
   shortcutToast: null,
+  speechCutAudit: null,
   plannerRunning: false,
   plannerError: null,
   plannerPhase: "idle",
@@ -775,6 +796,11 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
         if (j.state === "done") {
           const basename =
             (j.output && j.output.split(/[/\\]/).pop()) || `${outputStem}.mp4`;
+          const eq = j.export_cut_quality;
+          const toast =
+            eq?.summary && (eq.problem_count ?? 0) > 0
+              ? eq.summary
+              : null;
           set({
             renderStatus: "done",
             renderError: null,
@@ -782,6 +808,17 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
             outputDownloadUrl: j.url,
             renderJobId: jobId,
           });
+          if (eq && eq.boundaries) {
+            get().setSpeechCutAudit({
+              boundaries: eq.boundaries as import("../api/speechCuts").SpeechBoundary[],
+              problem_count: eq.problem_count ?? 0,
+              summary: eq.summary ?? "",
+            });
+          }
+          if (toast) {
+            get().setShortcutToast(toast);
+            window.setTimeout(() => get().setShortcutToast(null), 9000);
+          }
           break;
         }
         if (j.state === "failed" || j.state === "cancelled") {
@@ -1021,6 +1058,7 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
   setDragInProgress: (v) => set({ dragInProgress: v }),
   clearOpError: () => set({ opErrorMessage: null }),
   setShortcutToast: (msg) => set({ shortcutToast: msg }),
+  setSpeechCutAudit: (audit) => set({ speechCutAudit: audit }),
 
   applyOperation: async (op) => {
     const { timeline } = get();
@@ -1210,6 +1248,31 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
     return get().applyOperation({
       operation: "refine_audio_cuts",
       arguments: { clip_ids: [...audioIds] },
+    });
+  },
+
+  relayoutSelectedSpeech: async () => {
+    const { timeline, selectedClipIds } = get();
+    if (!timeline || selectedClipIds.length === 0) {
+      throw new Error("Select narration (audio) clips first.");
+    }
+    const audioIds: string[] = [];
+    let trackId: string | undefined;
+    for (const tr of timeline.tracks ?? []) {
+      if (tr.type !== "audio") continue;
+      for (const c of tr.clips ?? []) {
+        if (c.id && selectedClipIds.includes(c.id)) {
+          audioIds.push(c.id);
+          trackId = tr.id;
+        }
+      }
+    }
+    if (audioIds.length === 0) {
+      throw new Error("Re-layout speech applies to audio-track clips only.");
+    }
+    return get().applyOperation({
+      operation: "relayout_speech",
+      arguments: { clip_ids: audioIds, track_id: trackId, refine: true },
     });
   },
 
@@ -1492,14 +1555,19 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
     } else if (get().isDirty) {
       const active = normalizePlanStem(get().currentPlanName);
       if (active && active !== stem) {
-        await get().savePlan();
-        if (get().saveStatus === "error") {
-          set({
-            plannerError:
-              get().saveError ||
-              "Could not save the current plan before generating a new one.",
-          });
-          return;
+        if (timelineCanPersist(get().timeline)) {
+          await get().savePlan();
+          if (get().saveStatus === "error") {
+            set({
+              plannerError:
+                get().saveError ||
+                "Could not save the current plan before generating a new one.",
+            });
+            return;
+          }
+        } else {
+          // Empty or non-exportable timeline — skip save; planner writes save_as.
+          set({ isDirty: false, saveStatus: "idle", saveError: null });
         }
       }
     }
@@ -1600,7 +1668,11 @@ export const useTimelineStore = create<TimelineViewState>((set, get) => ({
         set({ plannerPhase: "saving", plannerProgressMessage: "Saving plan file…" });
         await savePlanToServer(stemFromFile, get().timeline!);
         const doneTl = get().timeline!;
-        const sum = summarizePlannerTimeline(doneTl, result.cut_quality_warnings);
+        const sum = summarizePlannerTimeline(
+          doneTl,
+          result.cut_quality_warnings,
+          result.speech_edit_warnings,
+        );
         const usageLine = formatPlannerUsage(result.usage);
         const fromRun = readStringList(result.usage?.unanalyzed);
         set({

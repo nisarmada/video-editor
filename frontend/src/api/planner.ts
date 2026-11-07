@@ -110,6 +110,13 @@ export type RunPlannerResponse = {
   usage: Record<string, unknown>;
   timeline: TimelineV2;
   cut_quality_warnings?: string[];
+  speech_edit_warnings?: {
+    code: string;
+    severity: string;
+    clip_id?: string | null;
+    message: string;
+    suggested_source_out?: number;
+  }[];
 };
 
 /**
@@ -172,4 +179,37 @@ export async function estimatePlanner(body: {
 }
 
 export { requestFootageAnalyze } from "./footage";
+
+export async function requestSpeechReadback(body: {
+  brief: string;
+  timeline: TimelineV2;
+  mock?: boolean;
+  confirm_paid?: boolean;
+}): Promise<{
+  readback: unknown[];
+  script: string;
+  verdict: Record<string, unknown>;
+}> {
+  const res = await fetch("/api/planner/speech-readback", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      brief: body.brief,
+      timeline: body.timeline,
+      mock: body.mock ?? true,
+      confirm_paid: body.confirm_paid ?? false,
+    }),
+  });
+  const t = await res.text();
+  if (!res.ok) {
+    throw new Error(
+      parseFastApiErrorBody(t) || `Speech read-back failed (${res.status})`,
+    );
+  }
+  return JSON.parse(t) as {
+    readback: unknown[];
+    script: string;
+    verdict: Record<string, unknown>;
+  };
+}
 

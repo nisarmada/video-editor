@@ -89,6 +89,10 @@ def get_public_settings(root: Path) -> dict[str, Any]:
         mode = analysis.get("remember_missing_mode")
         if mode in ("all", "free_only"):
             analysis_public["remember_missing_mode"] = mode
+    sr = raw.get("speech_readback")
+    speech_readback_public = {"enabled": True}
+    if isinstance(sr, dict) and "enabled" in sr:
+        speech_readback_public["enabled"] = bool(sr.get("enabled"))
     return {
         "planner_api_key_configured": configured,
         "paths": {
@@ -111,6 +115,7 @@ def get_public_settings(root: Path) -> dict[str, Any]:
         "transcription": transcription_public,
         "embedding": embedding_public,
         "analysis": analysis_public,
+        "speech_readback": speech_readback_public,
     }
 
 
@@ -235,6 +240,16 @@ def merge_settings(root: Path, body: dict[str, Any]) -> dict[str, Any]:
                 elif v in ("all", "free_only"):
                     merged_a["remember_missing_mode"] = v
             raw["analysis"] = merged_a
+    if "speech_readback" in body:
+        sr = body["speech_readback"]
+        if sr is None:
+            raw.pop("speech_readback", None)
+        elif isinstance(sr, dict):
+            prev = raw.get("speech_readback") if isinstance(raw.get("speech_readback"), dict) else {}
+            merged_sr = {**prev}
+            if "enabled" in sr:
+                merged_sr["enabled"] = bool(sr["enabled"])
+            raw["speech_readback"] = merged_sr
     save_raw(root, raw)
     return get_public_settings(root)
 

@@ -87,6 +87,7 @@ export type PublicSettings = {
   transcription?: TranscriptionSettings;
   embedding?: EmbeddingSettings;
   analysis?: AnalysisSettings;
+  speech_readback?: { enabled: boolean };
 };
 
 export async function fetchSettings(): Promise<PublicSettings> {
@@ -110,6 +111,7 @@ export async function putSettings(body: {
   transcription?: Partial<TranscriptionSettings> | null;
   embedding?: Partial<EmbeddingSettings> | null;
   analysis?: { remember_missing_mode?: "all" | "free_only" | null } | null;
+  speech_readback?: { enabled?: boolean } | null;
 }): Promise<PublicSettings> {
   const res = await apiRequest("/api/settings", {
     method: "PUT",

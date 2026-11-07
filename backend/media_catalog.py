@@ -24,6 +24,7 @@ from index_cache import (  # noqa: E402
     perception_path,
     silences_path,
     shots_path,
+    speech_units_path,
     takes_path,
     transcript_path,
     waveform_path,
@@ -276,6 +277,17 @@ def build_media_catalog(
             takes_doc = load_json(takes_path(clip_path))
         takes_summary = _takes_summary(takes_doc if isinstance(takes_doc, dict) else None)
 
+        speech_doc = merged_data.get("speech_units") if merged_data else None
+        if speech_doc is None and has_audio:
+            speech_doc = load_json(speech_units_path(clip_path))
+            if speech_doc is None and tr_status == COMPLETE:
+                try:
+                    from speech_units import build_speech_units  # noqa: PLC0415
+
+                    speech_doc = build_speech_units(clip_path)
+                except Exception:
+                    speech_doc = None
+
         transcript_segments: list[Any]
         transcript_words: list[dict[str, Any]] = []
         if tr_status == COMPLETE:
@@ -374,6 +386,7 @@ def build_media_catalog(
             )
             if has_audio
             else [],
+            "speech_units": speech_doc if isinstance(speech_doc, dict) else None,
         }
         entries.append(entry)
 
